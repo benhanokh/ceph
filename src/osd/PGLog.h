@@ -154,7 +154,6 @@ public:
     // recovery pointers
     std::list<pg_log_entry_t>::iterator complete_to; // not inclusive of referenced item
     version_t last_requested = 0;               // last object requested by primary
-
     //
   private:
     mutable __u16 indexed_data = 0;
@@ -634,7 +633,7 @@ public:
       CephContext* cct,
       eversion_t s,
       std::set<eversion_t> *trimmed,
-      std::set<std::string>* trimmed_dups,
+      std::set<eversion_t>* trimmed_dups,
       eversion_t *write_from_dups);
 
     std::ostream& print(std::ostream& out) const;
@@ -654,7 +653,8 @@ protected:
   eversion_t dirty_to_dups;    ///< must clear/writeout all dups <= dirty_to_dups
   eversion_t dirty_from_dups;  ///< must clear/writeout all dups >= dirty_from_dups
   eversion_t write_from_dups;  ///< must write keys >= write_from_dups
-  std::set<std::string> trimmed_dups;    ///< must clear keys in trimmed_dups
+  std::set<eversion_t> trimmed_dups; ///< must clear keys in trimmed_dups
+
   CephContext *cct;
   bool pg_log_debug;
   /// Log is clean on [dirty_to, dirty_from)
@@ -712,6 +712,7 @@ public:
   bool get_may_include_deletes_in_missing_dirty() const {
     return may_include_deletes_in_missing_dirty;
   }
+
 protected:
 
   /// DEBUG
@@ -1373,7 +1374,7 @@ public:
     eversion_t dirty_from,
     eversion_t writeout_from,
     std::set<eversion_t> &&trimmed,
-    std::set<std::string> &&trimmed_dups,
+    std::set<eversion_t> &&trimmed_dups,
     const pg_missing_tracker_t &missing,
     bool touch_log,
     bool require_rollback,
@@ -1438,6 +1439,7 @@ public:
     missing.may_include_deletes = false;
     std::list<pg_log_entry_t> entries;
     std::list<pg_log_dup_t> dups;
+    log.start_recovery();
     if (p) {
       using ceph::decode;
       for (p->seek_to_first(); p->valid() ; p->next()) {
@@ -1474,6 +1476,13 @@ public:
 	  if (!dups.empty()) {
 	    ceph_assert(dups.back().version < dup.version);
 	  }
+	  // The recycle id keys are much shorter than the old keys
+	  // We are limited to 10 digits plus 4 bytes for the "dup_" 
+	  if (p->key().length() <= log.max_recycle_id_length()) {
+	    recycle_log_id_t log_id = stoi(p->key().substr(4, string::npos));
+	    log.assignID(log_id, dup.get_key_name());
+	  }
+
 	  dups.push_back(dup);
 	} else {
 	  pg_log_entry_t e;
@@ -1484,12 +1493,21 @@ public:
 	    ceph_assert(last_e.version.version < e.version.version);
 	    ceph_assert(last_e.version.epoch <= e.version.epoch);
 	  }
+
+	  // The recycle id keys are much shorter than the old keys
+	  if (p->key().length() <= log.max_recycle_id_length()) {
+	    recycle_log_id_t log_id = stoi(p->key());
+	    log.assignID(log_id, e.get_key_name());
+	  }
+
 	  entries.push_back(e);
 	  if (log_keys_debug)
 	    log_keys_debug->insert(e.get_key_name());
 	}
       }
     }
+    log.finish_recovery();
+    
     log = IndexedLog(
       info.last_update,
       info.log_tail,

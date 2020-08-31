@@ -57,7 +57,7 @@ void PGLog::IndexedLog::trim(
   CephContext* cct,
   eversion_t s,
   set<eversion_t> *trimmed,
-  set<string>* trimmed_dups,
+  set<eversion_t>* trimmed_dups,
   eversion_t *write_from_dups)
 {
   ceph_assert(s <= can_rollback_to);
@@ -137,7 +137,8 @@ void PGLog::IndexedLog::trim(
       break;
     lgeneric_subdout(cct, osd, 20) << "trim dup " << e << dendl;
     if (trimmed_dups)
-      trimmed_dups->insert(e.get_key_name());
+      trimmed_dups->insert(e.version);
+
     unindex(e);
     dups.pop_front();
   }
@@ -682,13 +683,84 @@ void PGLog::write_log_and_missing(
     eversion_t(),
     eversion_t(),
     set<eversion_t>(),
-    set<string>(),
+    set<eversion_t>(),
     missing,
     true, require_rollback, false,
     eversion_t::max(),
     eversion_t(),
     eversion_t(),
     may_include_deletes_in_missing_dirty, nullptr);
+}
+
+//----------------------------------------------------------------------------------
+static void
+add_log_entry_to_km(
+  pg_log_t              & log,
+  map<string,bufferlist>* p_km,
+  pg_log_entry_t        & log_entry)
+{
+  bufferlist bl(sizeof(log_entry) * 2);
+  log_entry.encode_with_checksum(bl);
+
+  recycle_log_id_t recycle_id = log.assignID(log_entry.get_key_name());
+  (*p_km)[to_string(recycle_id)] = std::move(bl);
+}
+
+//----------------------------------------------------------------------------------
+static void
+add_log_dup_entry_to_km(
+  pg_log_t              & log,
+  map<string,bufferlist>* p_km,
+  const pg_log_dup_t    & log_dup_entry)
+{
+  bufferlist bl;
+  encode(log_dup_entry, bl);
+  recycle_log_id_t recycle_id = log.assignID(log_dup_entry.get_key_name());
+  (*p_km)["dup_" + to_string(recycle_id)] = std::move(bl);
+}
+
+//----------------------------------------------------------------------------------
+static void
+log_remove_dirty_to(pg_log_t & log, const eversion_t & dirty_to)
+{
+  for (auto p = log.log.begin();
+       p != log.log.end() && p->version <= dirty_to;
+       ++p) {
+    log.releaseID(p->get_key_name());
+  }
+}
+
+//----------------------------------------------------------------------------------
+static void
+dups_remove_dirty_to(pg_log_t & log, const eversion_t & dirty_to)
+{
+  for (auto p = log.dups.begin();
+       p != log.dups.end() && p->version <= dirty_to;
+       ++p) {
+    log.releaseID(p->get_key_name());
+  }
+}
+
+//----------------------------------------------------------------------------------
+static void
+log_remove_dirty_from(pg_log_t & log, const eversion_t & dirty_from)
+{
+  for (auto p = log.log.rbegin();
+       p != log.log.rend() && p->version >= dirty_from;
+       ++p) {
+    log.releaseID(p->get_key_name());
+  }
+}
+
+//----------------------------------------------------------------------------------
+static void
+dups_remove_dirty_from(pg_log_t & log, const eversion_t & dirty_from)
+{
+  for (auto p = log.dups.rbegin();
+       p != log.dups.rend() && p->version >= dirty_from;
+       ++p) {
+    log.releaseID(p->get_key_name());
+  }
 }
 
 // static
@@ -714,25 +786,20 @@ void PGLog::_write_log_and_missing_wo_missing(
   if (touch_log)
     t.touch(coll, log_oid);
   if (dirty_to != eversion_t()) {
-    t.omap_rmkeyrange(
-      coll, log_oid,
-      eversion_t().get_key_name(), dirty_to.get_key_name());
+    log_remove_dirty_to(log, dirty_to);
     clear_up_to(log_keys_debug, dirty_to.get_key_name());
   }
   if (dirty_to != eversion_t::max() && dirty_from != eversion_t::max()) {
     // dout(10) << "write_log_and_missing, clearing from " << dirty_from << dendl;
-    t.omap_rmkeyrange(
-      coll, log_oid,
-      dirty_from.get_key_name(), eversion_t::max().get_key_name());
+    log_remove_dirty_from(log, dirty_from);
     clear_after(log_keys_debug, dirty_from.get_key_name());
   }
 
   for (auto p = log.log.begin();
        p != log.log.end() && p->version <= dirty_to;
        ++p) {
-    bufferlist bl(sizeof(*p) * 2);
-    p->encode_with_checksum(bl);
-    (*km)[p->get_key_name()] = std::move(bl);
+    //const pg_log_entry_t &e = *log.begin();
+    add_log_entry_to_km( log, km, *p);
   }
 
   for (auto p = log.log.rbegin();
@@ -740,9 +807,7 @@ void PGLog::_write_log_and_missing_wo_missing(
 	 (p->version >= dirty_from || p->version >= writeout_from) &&
 	 p->version >= dirty_to;
        ++p) {
-    bufferlist bl(sizeof(*p) * 2);
-    p->encode_with_checksum(bl);
-    (*km)[p->get_key_name()] = std::move(bl);
+    add_log_entry_to_km( log, km, *p);
   }
 
   if (log_keys_debug) {
@@ -759,27 +824,16 @@ void PGLog::_write_log_and_missing_wo_missing(
   // process dups after log_keys_debug is filled, so dups do not
   // end up in that set
   if (dirty_to_dups != eversion_t()) {
-    pg_log_dup_t min, dirty_to_dup;
-    dirty_to_dup.version = dirty_to_dups;
-    t.omap_rmkeyrange(
-      coll, log_oid,
-      min.get_key_name(), dirty_to_dup.get_key_name());
+    dups_remove_dirty_to(log, dirty_to_dups);
   }
   if (dirty_to_dups != eversion_t::max() && dirty_from_dups != eversion_t::max()) {
-    pg_log_dup_t max, dirty_from_dup;
-    max.version = eversion_t::max();
-    dirty_from_dup.version = dirty_from_dups;
-    t.omap_rmkeyrange(
-      coll, log_oid,
-      dirty_from_dup.get_key_name(), max.get_key_name());
+    dups_remove_dirty_from(log, dirty_from_dups);
   }
 
   for (const auto& entry : log.dups) {
     if (entry.version > dirty_to_dups)
       break;
-    bufferlist bl;
-    encode(entry, bl);
-    (*km)[entry.get_key_name()] = std::move(bl);
+    add_log_dup_entry_to_km( log, km, entry );
   }
 
   for (auto p = log.dups.rbegin();
@@ -787,9 +841,7 @@ void PGLog::_write_log_and_missing_wo_missing(
 	 (p->version >= dirty_from_dups || p->version >= write_from_dups) &&
 	 p->version >= dirty_to_dups;
        ++p) {
-    bufferlist bl;
-    encode(*p, bl);
-    (*km)[p->get_key_name()] = std::move(bl);
+    add_log_dup_entry_to_km( log, km, *p );
   }
 
   if (dirty_divergent_priors) {
@@ -816,7 +868,7 @@ void PGLog::_write_log_and_missing(
   eversion_t dirty_from,
   eversion_t writeout_from,
   set<eversion_t> &&trimmed,
-  set<string> &&trimmed_dups,
+  set<eversion_t> &&trimmed_dups,
   const pg_missing_tracker_t &missing,
   bool touch_log,
   bool require_rollback,
@@ -828,7 +880,19 @@ void PGLog::_write_log_and_missing(
   set<string> *log_keys_debug
   ) {
   set<string> to_remove;
-  to_remove.swap(trimmed_dups);
+
+  for (auto& t : trimmed_dups) {
+    string key = t.get_key_name();
+    if (log_keys_debug) {
+      auto it = log_keys_debug->find(key);
+      ceph_assert(it != log_keys_debug->end());
+      log_keys_debug->erase(it);
+    }
+    to_remove.emplace(std::move(key));
+  }
+  trimmed_dups.clear();
+
+  
   for (auto& t : trimmed) {
     string key = t.get_key_name();
     if (log_keys_debug) {
@@ -843,25 +907,19 @@ void PGLog::_write_log_and_missing(
   if (touch_log)
     t.touch(coll, log_oid);
   if (dirty_to != eversion_t()) {
-    t.omap_rmkeyrange(
-      coll, log_oid,
-      eversion_t().get_key_name(), dirty_to.get_key_name());
+    log_remove_dirty_to(log, dirty_to);
     clear_up_to(log_keys_debug, dirty_to.get_key_name());
   }
   if (dirty_to != eversion_t::max() && dirty_from != eversion_t::max()) {
     //   dout(10) << "write_log_and_missing, clearing from " << dirty_from << dendl;
-    t.omap_rmkeyrange(
-      coll, log_oid,
-      dirty_from.get_key_name(), eversion_t::max().get_key_name());
+    log_remove_dirty_from(log, dirty_from);
     clear_after(log_keys_debug, dirty_from.get_key_name());
   }
 
   for (auto p = log.log.begin();
        p != log.log.end() && p->version <= dirty_to;
        ++p) {
-    bufferlist bl(sizeof(*p) * 2);
-    p->encode_with_checksum(bl);
-    (*km)[p->get_key_name()] = std::move(bl);
+    add_log_entry_to_km( log, km, *p);
   }
 
   for (auto p = log.log.rbegin();
@@ -869,9 +927,7 @@ void PGLog::_write_log_and_missing(
 	 (p->version >= dirty_from || p->version >= writeout_from) &&
 	 p->version >= dirty_to;
        ++p) {
-    bufferlist bl(sizeof(*p) * 2);
-    p->encode_with_checksum(bl);
-    (*km)[p->get_key_name()] = std::move(bl);
+    add_log_entry_to_km( log, km, *p);
   }
 
   if (log_keys_debug) {
@@ -888,27 +944,17 @@ void PGLog::_write_log_and_missing(
   // process dups after log_keys_debug is filled, so dups do not
   // end up in that set
   if (dirty_to_dups != eversion_t()) {
-    pg_log_dup_t min, dirty_to_dup;
-    dirty_to_dup.version = dirty_to_dups;
-    t.omap_rmkeyrange(
-      coll, log_oid,
-      min.get_key_name(), dirty_to_dup.get_key_name());
+    dups_remove_dirty_to(log, dirty_to_dups);
   }
+
   if (dirty_to_dups != eversion_t::max() && dirty_from_dups != eversion_t::max()) {
-    pg_log_dup_t max, dirty_from_dup;
-    max.version = eversion_t::max();
-    dirty_from_dup.version = dirty_from_dups;
-    t.omap_rmkeyrange(
-      coll, log_oid,
-      dirty_from_dup.get_key_name(), max.get_key_name());
+    dups_remove_dirty_from(log, dirty_from_dups);
   }
 
   for (const auto& entry : log.dups) {
     if (entry.version > dirty_to_dups)
       break;
-    bufferlist bl;
-    encode(entry, bl);
-    (*km)[entry.get_key_name()] = std::move(bl);
+    add_log_dup_entry_to_km( log, km, entry );
   }
 
   for (auto p = log.dups.rbegin();
@@ -916,15 +962,16 @@ void PGLog::_write_log_and_missing(
 	 (p->version >= dirty_from_dups || p->version >= write_from_dups) &&
 	 p->version >= dirty_to_dups;
        ++p) {
-    bufferlist bl;
-    encode(*p, bl);
-    (*km)[p->get_key_name()] = std::move(bl);
+    add_log_dup_entry_to_km( log, km, *p );
   }
 
+#if 0
   if (clear_divergent_priors) {
     //dout(10) << "write_log_and_missing: writing divergent_priors" << dendl;
     to_remove.insert("divergent_priors");
   }
+#endif
+
   // since we encode individual missing items instead of a whole
   // missing set, we need another key to store this bit of state
   if (*may_include_deletes_in_missing_dirty) {

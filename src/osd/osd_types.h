@@ -51,6 +51,7 @@
 #include "librados/ListObjectImpl.h"
 #include "compressor/Compressor.h"
 #include "osd_perf_counters.h"
+#include "IDFreeList.h"
 
 #define CEPH_OSD_ONDISK_MAGIC "ceph osd volume v026"
 
@@ -4314,7 +4315,7 @@ struct pg_log_t {
    */
   eversion_t head;    // newest entry
   eversion_t tail;    // version prior to oldest
-
+  IDFreeList ifl;     // recycle log entries
 protected:
   // We can rollback rollback-able entries > can_rollback_to
   eversion_t can_rollback_to;
@@ -4370,6 +4371,33 @@ public:
     return can_rollback_to;
   }
 
+  recycle_log_id_t releaseID(const std::string & key) {
+    return ifl.releaseID(key);
+  }
+  
+  recycle_log_id_t assignID(const std::string & key) {
+    return ifl.assignID(key);
+  }
+
+  recycle_log_id_t assignID(recycle_log_id_t id, const std::string & key) {
+    return ifl.assignID(id, key);
+  }
+
+  const std::string* reverseMapId(recycle_log_id_t id) {
+    return ifl.reverseMapId(id);
+  }
+
+  unsigned max_recycle_id_length(void) {
+    return ifl.max_recycle_id_length();
+  }
+
+  void start_recovery(void) {
+    ifl.start_recovery();
+  }
+
+  void finish_recovery(void) {
+    ifl.finish_recovery();
+  }
 
   pg_log_t split_out_child(pg_t child_pgid, unsigned split_bits) {
     mempool::osd_pglog::list<pg_log_entry_t> oldlog, childlog;
