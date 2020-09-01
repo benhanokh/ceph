@@ -22,6 +22,7 @@
 #include "osd_types.h"
 #include "os/ObjectStore.h"
 #include <list>
+#include "IDFreeList.h"
 
 #ifdef WITH_SEASTAR
 #include <seastar/core/future.hh>
@@ -642,7 +643,6 @@ public:
 
 protected:
   //////////////////// data members ////////////////////
-
   pg_missing_tracker_t missing;
   IndexedLog  log;
 
@@ -656,6 +656,7 @@ protected:
   std::set<eversion_t> trimmed_dups; ///< must clear keys in trimmed_dups
 
   CephContext *cct;
+  IDFreeList ifl;     // recycle log entries
   bool pg_log_debug;
   /// Log is clean on [dirty_to, dirty_from)
   bool touched_log;
@@ -756,6 +757,7 @@ public:
     dirty_from_dups(eversion_t::max()),
     write_from_dups(eversion_t::max()),
     cct(cct),
+    ifl(cct->_conf->osd_max_pg_log_entries),
     pg_log_debug(!(cct && !(cct->_conf->osd_debug_pg_log_writeout))),
     touched_log(false),
     dirty_log(false),
@@ -1332,6 +1334,7 @@ public:
   static void write_log_and_missing_wo_missing(
     ObjectStore::Transaction& t,
     std::map<std::string,ceph::buffer::list>* km,
+    IDFreeList & ifl,
     pg_log_t &log,
     const coll_t& coll,
     const ghobject_t &log_oid, std::map<eversion_t, hobject_t> &divergent_priors,
@@ -1340,6 +1343,7 @@ public:
   static void write_log_and_missing(
     ObjectStore::Transaction& t,
     std::map<std::string,ceph::buffer::list>* km,
+    IDFreeList & ifl,
     pg_log_t &log,
     const coll_t& coll,
     const ghobject_t &log_oid,
@@ -1350,6 +1354,7 @@ public:
   static void _write_log_and_missing_wo_missing(
     ObjectStore::Transaction& t,
     std::map<std::string,ceph::buffer::list>* km,
+    IDFreeList& ifl,
     pg_log_t &log,
     const coll_t& coll, const ghobject_t &log_oid,
     std::map<eversion_t, hobject_t> &divergent_priors,
@@ -1368,6 +1373,7 @@ public:
   static void _write_log_and_missing(
     ObjectStore::Transaction& t,
     std::map<std::string,ceph::buffer::list>* km,
+    IDFreeList& ifl,
     pg_log_t &log,
     const coll_t& coll, const ghobject_t &log_oid,
     eversion_t dirty_to,
@@ -1397,7 +1403,7 @@ public:
     ) {
     return read_log_and_missing(
       store, ch, pgmeta_oid, info,
-      log, missing, oss,
+      ifl, log, missing, oss,
       tolerate_divergent_missing_log,
       &clear_divergent_priors,
       this,
@@ -1411,6 +1417,7 @@ public:
     ObjectStore::CollectionHandle &ch,
     ghobject_t pgmeta_oid,
     const pg_info_t &info,
+    IDFreeList& ifl,
     IndexedLog &log,
     missing_type &missing,
     std::ostringstream &oss,
@@ -1439,7 +1446,7 @@ public:
     missing.may_include_deletes = false;
     std::list<pg_log_entry_t> entries;
     std::list<pg_log_dup_t> dups;
-    log.start_recovery();
+    ifl.start_recovery();
     if (p) {
       using ceph::decode;
       for (p->seek_to_first(); p->valid() ; p->next()) {
@@ -1478,9 +1485,9 @@ public:
 	  }
 	  // The recycle id keys are much shorter than the old keys
 	  // We are limited to 10 digits plus 4 bytes for the "dup_" 
-	  if (p->key().length() <= log.max_recycle_id_length()) {
+	  if (p->key().length() <= ifl.max_recycle_id_length()) {
 	    recycle_log_id_t log_id = stoi(p->key().substr(4, string::npos));
-	    log.assignID(log_id, dup.get_key_name());
+	    ifl.assignID(log_id, dup.get_key_name());
 	  }
 
 	  dups.push_back(dup);
@@ -1495,9 +1502,9 @@ public:
 	  }
 
 	  // The recycle id keys are much shorter than the old keys
-	  if (p->key().length() <= log.max_recycle_id_length()) {
+	  if (p->key().length() <= ifl.max_recycle_id_length()) {
 	    recycle_log_id_t log_id = stoi(p->key());
-	    log.assignID(log_id, e.get_key_name());
+	    ifl.assignID(log_id, e.get_key_name());
 	  }
 
 	  entries.push_back(e);
@@ -1506,7 +1513,7 @@ public:
 	}
       }
     }
-    log.finish_recovery();
+    ifl.finish_recovery();
     
     log = IndexedLog(
       info.last_update,

@@ -628,7 +628,7 @@ void PGLog::write_log_and_missing(
 	     << ", clear_divergent_priors: " << clear_divergent_priors
 	     << dendl;
     _write_log_and_missing(
-      t, km, log, coll, log_oid,
+      t, km, ifl, log, coll, log_oid,
       dirty_to,
       dirty_from,
       writeout_from,
@@ -653,6 +653,7 @@ void PGLog::write_log_and_missing(
 void PGLog::write_log_and_missing_wo_missing(
     ObjectStore::Transaction& t,
     map<string,bufferlist> *km,
+    IDFreeList & ifl,
     pg_log_t &log,
     const coll_t& coll, const ghobject_t &log_oid,
     map<eversion_t, hobject_t> &divergent_priors,
@@ -660,7 +661,7 @@ void PGLog::write_log_and_missing_wo_missing(
     )
 {
   _write_log_and_missing_wo_missing(
-    t, km, log, coll, log_oid,
+    t, km, ifl, log, coll, log_oid,
     divergent_priors, eversion_t::max(), eversion_t(), eversion_t(),
     true, true, require_rollback,
     eversion_t::max(), eversion_t(), eversion_t(), nullptr);
@@ -670,6 +671,7 @@ void PGLog::write_log_and_missing_wo_missing(
 void PGLog::write_log_and_missing(
     ObjectStore::Transaction& t,
     map<string,bufferlist> *km,
+    IDFreeList & ifl,
     pg_log_t &log,
     const coll_t& coll,
     const ghobject_t &log_oid,
@@ -678,7 +680,7 @@ void PGLog::write_log_and_missing(
     bool *may_include_deletes_in_missing_dirty)
 {
   _write_log_and_missing(
-    t, km, log, coll, log_oid,
+    t, km, ifl, log, coll, log_oid,
     eversion_t::max(),
     eversion_t(),
     eversion_t(),
@@ -695,71 +697,71 @@ void PGLog::write_log_and_missing(
 //----------------------------------------------------------------------------------
 static void
 add_log_entry_to_km(
-  pg_log_t              & log,
+  IDFreeList            & ifl,
   map<string,bufferlist>* p_km,
   pg_log_entry_t        & log_entry)
 {
   bufferlist bl(sizeof(log_entry) * 2);
   log_entry.encode_with_checksum(bl);
 
-  recycle_log_id_t recycle_id = log.assignID(log_entry.get_key_name());
+  recycle_log_id_t recycle_id = ifl.assignID(log_entry.get_key_name());
   (*p_km)[to_string(recycle_id)] = std::move(bl);
 }
 
 //----------------------------------------------------------------------------------
 static void
 add_log_dup_entry_to_km(
-  pg_log_t              & log,
+  IDFreeList            & ifl,
   map<string,bufferlist>* p_km,
   const pg_log_dup_t    & log_dup_entry)
 {
   bufferlist bl;
   encode(log_dup_entry, bl);
-  recycle_log_id_t recycle_id = log.assignID(log_dup_entry.get_key_name());
+  recycle_log_id_t recycle_id = ifl.assignID(log_dup_entry.get_key_name());
   (*p_km)["dup_" + to_string(recycle_id)] = std::move(bl);
 }
 
 //----------------------------------------------------------------------------------
 static void
-log_remove_dirty_to(pg_log_t & log, const eversion_t & dirty_to)
+log_remove_dirty_to(IDFreeList & ifl, pg_log_t & log, const eversion_t & dirty_to)
 {
   for (auto p = log.log.begin();
        p != log.log.end() && p->version <= dirty_to;
        ++p) {
-    log.releaseID(p->get_key_name());
+    ifl.releaseID(p->get_key_name());
   }
 }
 
 //----------------------------------------------------------------------------------
 static void
-dups_remove_dirty_to(pg_log_t & log, const eversion_t & dirty_to)
+dups_remove_dirty_to(IDFreeList & ifl, pg_log_t & log, const eversion_t & dirty_to)
 {
   for (auto p = log.dups.begin();
        p != log.dups.end() && p->version <= dirty_to;
        ++p) {
-    log.releaseID(p->get_key_name());
+    ifl.releaseID(p->get_key_name());
   }
 }
 
 //----------------------------------------------------------------------------------
 static void
-log_remove_dirty_from(pg_log_t & log, const eversion_t & dirty_from)
+log_remove_dirty_from(IDFreeList & ifl, pg_log_t & log, const eversion_t & dirty_from)
 {
   for (auto p = log.log.rbegin();
        p != log.log.rend() && p->version >= dirty_from;
        ++p) {
-    log.releaseID(p->get_key_name());
+    ifl.releaseID(p->get_key_name());
   }
 }
 
 //----------------------------------------------------------------------------------
 static void
-dups_remove_dirty_from(pg_log_t & log, const eversion_t & dirty_from)
+dups_remove_dirty_from(IDFreeList & ifl, pg_log_t & log, const eversion_t & dirty_from)
 {
   for (auto p = log.dups.rbegin();
        p != log.dups.rend() && p->version >= dirty_from;
        ++p) {
-    log.releaseID(p->get_key_name());
+    ifl.releaseID(p->get_key_name());
   }
 }
 
@@ -767,6 +769,7 @@ dups_remove_dirty_from(pg_log_t & log, const eversion_t & dirty_from)
 void PGLog::_write_log_and_missing_wo_missing(
   ObjectStore::Transaction& t,
   map<string,bufferlist> *km,
+  IDFreeList& ifl,
   pg_log_t &log,
   const coll_t& coll, const ghobject_t &log_oid,
   map<eversion_t, hobject_t> &divergent_priors,
@@ -786,12 +789,12 @@ void PGLog::_write_log_and_missing_wo_missing(
   if (touch_log)
     t.touch(coll, log_oid);
   if (dirty_to != eversion_t()) {
-    log_remove_dirty_to(log, dirty_to);
+    log_remove_dirty_to(ifl, log, dirty_to);
     clear_up_to(log_keys_debug, dirty_to.get_key_name());
   }
   if (dirty_to != eversion_t::max() && dirty_from != eversion_t::max()) {
     // dout(10) << "write_log_and_missing, clearing from " << dirty_from << dendl;
-    log_remove_dirty_from(log, dirty_from);
+    log_remove_dirty_from(ifl, log, dirty_from);
     clear_after(log_keys_debug, dirty_from.get_key_name());
   }
 
@@ -799,7 +802,7 @@ void PGLog::_write_log_and_missing_wo_missing(
        p != log.log.end() && p->version <= dirty_to;
        ++p) {
     //const pg_log_entry_t &e = *log.begin();
-    add_log_entry_to_km( log, km, *p);
+    add_log_entry_to_km(ifl, km, *p);
   }
 
   for (auto p = log.log.rbegin();
@@ -807,7 +810,7 @@ void PGLog::_write_log_and_missing_wo_missing(
 	 (p->version >= dirty_from || p->version >= writeout_from) &&
 	 p->version >= dirty_to;
        ++p) {
-    add_log_entry_to_km( log, km, *p);
+    add_log_entry_to_km(ifl, km, *p);
   }
 
   if (log_keys_debug) {
@@ -824,16 +827,16 @@ void PGLog::_write_log_and_missing_wo_missing(
   // process dups after log_keys_debug is filled, so dups do not
   // end up in that set
   if (dirty_to_dups != eversion_t()) {
-    dups_remove_dirty_to(log, dirty_to_dups);
+    dups_remove_dirty_to(ifl, log, dirty_to_dups);
   }
   if (dirty_to_dups != eversion_t::max() && dirty_from_dups != eversion_t::max()) {
-    dups_remove_dirty_from(log, dirty_from_dups);
+    dups_remove_dirty_from(ifl, log, dirty_from_dups);
   }
 
   for (const auto& entry : log.dups) {
     if (entry.version > dirty_to_dups)
       break;
-    add_log_dup_entry_to_km( log, km, entry );
+    add_log_dup_entry_to_km(ifl, km, entry);
   }
 
   for (auto p = log.dups.rbegin();
@@ -841,7 +844,7 @@ void PGLog::_write_log_and_missing_wo_missing(
 	 (p->version >= dirty_from_dups || p->version >= write_from_dups) &&
 	 p->version >= dirty_to_dups;
        ++p) {
-    add_log_dup_entry_to_km( log, km, *p );
+    add_log_dup_entry_to_km(ifl, km, *p);
   }
 
   if (dirty_divergent_priors) {
@@ -862,6 +865,7 @@ void PGLog::_write_log_and_missing_wo_missing(
 void PGLog::_write_log_and_missing(
   ObjectStore::Transaction& t,
   map<string,bufferlist>* km,
+  IDFreeList& ifl,
   pg_log_t &log,
   const coll_t& coll, const ghobject_t &log_oid,
   eversion_t dirty_to,
@@ -907,19 +911,19 @@ void PGLog::_write_log_and_missing(
   if (touch_log)
     t.touch(coll, log_oid);
   if (dirty_to != eversion_t()) {
-    log_remove_dirty_to(log, dirty_to);
+    log_remove_dirty_to(ifl, log, dirty_to);
     clear_up_to(log_keys_debug, dirty_to.get_key_name());
   }
   if (dirty_to != eversion_t::max() && dirty_from != eversion_t::max()) {
     //   dout(10) << "write_log_and_missing, clearing from " << dirty_from << dendl;
-    log_remove_dirty_from(log, dirty_from);
+    log_remove_dirty_from(ifl, log, dirty_from);
     clear_after(log_keys_debug, dirty_from.get_key_name());
   }
 
   for (auto p = log.log.begin();
        p != log.log.end() && p->version <= dirty_to;
        ++p) {
-    add_log_entry_to_km( log, km, *p);
+    add_log_entry_to_km(ifl, km, *p);
   }
 
   for (auto p = log.log.rbegin();
@@ -927,7 +931,7 @@ void PGLog::_write_log_and_missing(
 	 (p->version >= dirty_from || p->version >= writeout_from) &&
 	 p->version >= dirty_to;
        ++p) {
-    add_log_entry_to_km( log, km, *p);
+    add_log_entry_to_km(ifl, km, *p);
   }
 
   if (log_keys_debug) {
@@ -944,17 +948,17 @@ void PGLog::_write_log_and_missing(
   // process dups after log_keys_debug is filled, so dups do not
   // end up in that set
   if (dirty_to_dups != eversion_t()) {
-    dups_remove_dirty_to(log, dirty_to_dups);
+    dups_remove_dirty_to(ifl, log, dirty_to_dups);
   }
 
   if (dirty_to_dups != eversion_t::max() && dirty_from_dups != eversion_t::max()) {
-    dups_remove_dirty_from(log, dirty_from_dups);
+    dups_remove_dirty_from(ifl, log, dirty_from_dups);
   }
 
   for (const auto& entry : log.dups) {
     if (entry.version > dirty_to_dups)
       break;
-    add_log_dup_entry_to_km( log, km, entry );
+    add_log_dup_entry_to_km(ifl, km, entry);
   }
 
   for (auto p = log.dups.rbegin();
@@ -962,7 +966,7 @@ void PGLog::_write_log_and_missing(
 	 (p->version >= dirty_from_dups || p->version >= write_from_dups) &&
 	 p->version >= dirty_to_dups;
        ++p) {
-    add_log_dup_entry_to_km( log, km, *p );
+    add_log_dup_entry_to_km(ifl, km, *p);
   }
 
 #if 0

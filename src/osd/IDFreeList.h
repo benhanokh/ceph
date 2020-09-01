@@ -27,51 +27,9 @@ typedef std::unordered_map<std::string, recycle_log_id_t> recycle_logmap_t;
 
 class IDFreeList {
 public:
-
   //----------------------------------------------
-  IDFreeList& operator= (const IDFreeList & other) {
-    p_size          = other.p_size;
-    p_free_count    = other.p_free_count;
-    p_head          = other.p_head;
-    p_tail          = other.p_tail;
-    p_recovery_mode = other.p_recovery_mode;
-    
-    if (p_size == 0) {
-      return *this;
-    }
-
-    p_id_vec        = other.p_id_vec;
-    p_map           = other.p_map;
-    p_key_vec.resize(p_size);
-    for (recycle_log_id_t id = 0; id < p_size; id++) {
-      p_key_vec[id] = nullptr;
-    }
-    
-    // now we need to set reverse mapping to the hashtable
-    for (auto itr = p_map.begin(); itr != p_map.end(); itr++) {
-      const std::string & sr = itr->first;
-      recycle_log_id_t id    = itr->second;
-      assert(p_key_vec[id] == nullptr);
-      p_key_vec[id] = & sr;
-    }
-    
-    return *this;
-  }
-
-  //----------------------------------------------
-  IDFreeList(void) {
-    p_size          = 0;
-    p_free_count    = 0;    
-    p_head          = NULL_ID;
-    p_tail          = NULL_ID;
-    p_recovery_mode = false;
-    //    assert(size <= cct->_conf->osd_max_pg_log_entries);
-  }
-					 
-  //----------------------------------------------
-  IDFreeList(recycle_log_id_t size): p_map(size), p_id_vec(size), p_key_vec(size)
+  IDFreeList(recycle_log_id_t size): p_map(size), p_id_vec(size), p_key_vec(size) //throw(std::bad_alloc)
   {
-    //    assert(size <= cct->_conf->osd_max_pg_log_entries);
     p_size = size;
     
     for (recycle_log_id_t i = 0; i < p_size - 1; i++) {
@@ -89,13 +47,6 @@ public:
   //----------------------------------------------
   void start_recovery(void) {
     assert(!p_recovery_mode);
-
-    // mark all entries as unused
-    // TBD - must make sure no valid entries could exist at this point
-    for (recycle_log_id_t i = 0; i < p_size; i++) {
-      p_id_vec[i] = NULL_ID;
-    }
-
     p_recovery_mode = true;
   }
 
@@ -145,7 +96,7 @@ public:
       grow( (id-p_size) + MIN_GROWTH_SIZE );
     }
 
-    assert(p_id_vec [id] == NULL_ID);
+    assert(p_id_vec [id] != USED_ID);
     assert(p_key_vec[id] == nullptr);
     auto itr = p_map.find(key);
     assert(itr == p_map.end());
@@ -243,7 +194,9 @@ public:
   const unsigned max_recycle_id_length(void) {  return MAX_RECYCLE_ID_LENGTH;}
 
 private:
-
+  IDFreeList(const IDFreeList&) = delete;
+  IDFreeList& operator= (const IDFreeList & other) = delete;
+  
   // initialize array and link unused entries after recovery
   //----------------------------------------------
   void link_empty_entries(void) {
@@ -322,6 +275,48 @@ private:
     p_key_vec[id] = & sr;
   }
 
+#if 0
+  //----------------------------------------------
+  IDFreeList(void) {
+    p_size          = 0;
+    p_free_count    = 0;    
+    p_head          = NULL_ID;
+    p_tail          = NULL_ID;
+    p_recovery_mode = false;
+    //    assert(size <= cct->_conf->osd_max_pg_log_entries);
+  }
+
+  //----------------------------------------------
+  IDFreeList& operator= (const IDFreeList & other) {
+    p_size          = other.p_size;
+    p_free_count    = other.p_free_count;
+    p_head          = other.p_head;
+    p_tail          = other.p_tail;
+    p_recovery_mode = other.p_recovery_mode;
+    
+    if (p_size == 0) {
+      return *this;
+    }
+
+    p_id_vec        = other.p_id_vec;
+    p_map           = other.p_map;
+    p_key_vec.resize(p_size);
+    for (recycle_log_id_t id = 0; id < p_size; id++) {
+      p_key_vec[id] = nullptr;
+    }
+    
+    // now we need to set reverse mapping to the hashtable
+    for (auto itr = p_map.begin(); itr != p_map.end(); itr++) {
+      const std::string & sr = itr->first;
+      recycle_log_id_t id    = itr->second;
+      assert(p_key_vec[id] == nullptr);
+      p_key_vec[id] = & sr;
+    }
+    
+    return *this;
+  }
+#endif
+  
   const recycle_log_id_t          NULL_ID               = -1;
   const recycle_log_id_t          USED_ID               = -2;
   const recycle_log_id_t          MIN_GROWTH_SIZE       = 16;
