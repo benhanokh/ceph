@@ -757,7 +757,7 @@ public:
     dirty_from_dups(eversion_t::max()),
     write_from_dups(eversion_t::max()),
     cct(cct),
-    ifl(cct->_conf->osd_max_pg_log_entries),
+    ifl(cct->_conf->osd_max_pg_log_entries, cct),
     pg_log_debug(!(cct && !(cct->_conf->osd_debug_pg_log_writeout))),
     touched_log(false),
     dirty_log(false),
@@ -1483,6 +1483,7 @@ public:
 	  if (!dups.empty()) {
 	    ceph_assert(dups.back().version < dup.version);
 	  }
+	  //lgeneric_subdout(ifl.p_cct, osd, 5) << "IFL::"<< __func__ << p->key << dendl;
 	  // The recycle id keys are much shorter than the old keys
 	  // We are limited to 10 digits plus 4 bytes for the "dup_" 
 	  if (p->key().length() <= ifl.max_recycle_id_length()) {
@@ -1501,6 +1502,7 @@ public:
 	    ceph_assert(last_e.version.epoch <= e.version.epoch);
 	  }
 
+	  //lgeneric_subdout(ifl.p_cct, osd, 5) << "IFL::"<< __func__ << p->key << dendl;
 	  // The recycle id keys are much shorter than the old keys
 	  if (p->key().length() <= ifl.max_recycle_id_length()) {
 	    recycle_log_id_t log_id = stoi(p->key());

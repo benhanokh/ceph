@@ -27,8 +27,9 @@ typedef std::unordered_map<std::string, recycle_log_id_t> recycle_logmap_t;
 
 class IDFreeList {
 public:
+  CephContext*                    p_cct;
   //----------------------------------------------
-  IDFreeList(recycle_log_id_t size): p_map(size), p_id_vec(size), p_key_vec(size) //throw(std::bad_alloc)
+  IDFreeList(recycle_log_id_t size, CephContext* cct): p_map(size), p_id_vec(size), p_key_vec(size) //throw(std::bad_alloc)
   {
     p_size = size;
     
@@ -42,10 +43,14 @@ public:
     p_key_vec[p_tail] = nullptr;
     p_free_count      = p_size;
     p_recovery_mode   = false;
+    p_cct             = cct;
+
+    lgeneric_subdout(p_cct, osd, 10) << "IFL::("<<this<<")"<< __func__ <<" size=" << size << dendl;
   }
 
   //----------------------------------------------
   void start_recovery(void) {
+    lgeneric_subdout(p_cct, osd, 1) << "IFL::"<< __func__ << dendl;
     assert(!p_recovery_mode);
     p_recovery_mode = true;
   }
@@ -55,6 +60,7 @@ public:
     assert(p_recovery_mode);
     link_empty_entries();
     p_recovery_mode = true;
+    lgeneric_subdout(p_cct, osd, 1) << "IFL::"<< __func__ << dendl;
   }
 
   //----------------------------------------------
@@ -90,6 +96,7 @@ public:
   // recreate the mapping from eversion_t->get_key_name() to the recycle_log_id_t
   recycle_log_id_t assignID(recycle_log_id_t id, const std::string & key) //throw(std::bad_alloc)
   {
+    lgeneric_subdout(p_cct, osd, 9) << "IFL::("<<this<<")"<< __func__ << " id=" << id << " key="<< key<< dendl;
     assert(p_recovery_mode);
     // make sure we got enough space
     if (id >= p_size) {
@@ -119,7 +126,7 @@ public:
 
     if (p_size == 0) {
       grow(MIN_GROWTH_SIZE);
-    } else if (p_free_count <= p_size) {
+    } else if (p_free_count == 0) {
       grow(std::max(MIN_GROWTH_SIZE,p_size));
     }
 
@@ -138,6 +145,7 @@ public:
 
       p_map[key] = id;
 
+      lgeneric_subdout(p_cct, osd, 11) << "IFL::("<<this<<")"<< __func__ << " key="<< key<< " id=" << id<< dendl;
       create_reverse_mapping(id , key);      
       return id;
     } else {
@@ -148,6 +156,7 @@ public:
  
   //----------------------------------------------
   recycle_log_id_t releaseID(const std::string & key) {
+    lgeneric_subdout(p_cct, osd, 11) << "IFL::("<<this<<")"<< __func__ << " key="<< key<< dendl;
     assert(p_free_count < p_size);
     recycle_log_id_t id;
     auto itr = p_map.find(key);
@@ -200,6 +209,7 @@ private:
   // initialize array and link unused entries after recovery
   //----------------------------------------------
   void link_empty_entries(void) {
+    lgeneric_subdout(p_cct, osd, 1) << "IFL::"<< __func__ << dendl;
     p_free_count = 0;
     // find the first unused entry and assign it to p_head
     for (p_head = 0; p_head < p_size; p_head++) {
@@ -232,6 +242,7 @@ private:
   //----------------------------------------------
   void grow(unsigned size_to_grow) //throw(std::bad_alloc)
   {
+    lgeneric_subdout(p_cct, osd, 1) << "IFL::"<< __func__ << " size_to_grow="<< size_to_grow<< dendl;
     recycle_log_id_t old_size = p_size;
     p_size += size_to_grow;
     p_id_vec. resize(p_size);
