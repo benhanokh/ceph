@@ -60,23 +60,24 @@ void PGLog::IndexedLog::trim(
   set<eversion_t>* trimmed_dups,
   eversion_t *write_from_dups)
 {
-  lgeneric_subdout(cct, osd, 5)<<__func__<<"::IFL::"<<trimmed->size() << " || "<< trimmed_dups->size() <<dendl;
+  lgeneric_subdout(cct, osd, 5)<<__func__<<"::IFL2::trim_to="<< s << log.empty() <<
+    (trimmed ? trimmed->size():0)<<" || " << (trimmed_dups ? trimmed_dups->size():0) << dendl;
   
   ceph_assert(s <= can_rollback_to);
   if (complete_to != log.end())
-    lgeneric_subdout(cct, osd, 20) << " complete_to " << complete_to->version << dendl;
+    lgeneric_subdout(cct, osd, 20) << "IFL:: complete_to " << complete_to->version << dendl;
 
   auto earliest_dup_version =
     log.rbegin()->version.version < cct->_conf->osd_pg_log_dups_tracked
     ? 0u
     : log.rbegin()->version.version - cct->_conf->osd_pg_log_dups_tracked + 1;
 
-  lgeneric_subdout(cct, osd, 20) << "earliest_dup_version = " << earliest_dup_version << dendl;
+  lgeneric_subdout(cct, osd, 20) << "IFL::earliest_dup_version = " << earliest_dup_version << dendl;
   while (!log.empty()) {
     const pg_log_entry_t &e = *log.begin();
     if (e.version > s)
       break;
-    lgeneric_subdout(cct, osd, 20) << "trim " << e << dendl;
+    lgeneric_subdout(cct, osd, 20) << "IFL::trim " << e << dendl;
     if (trimmed)
       trimmed->emplace(e.version);
 
@@ -85,7 +86,7 @@ void PGLog::IndexedLog::trim(
     // add to dup list
     if (e.version.version >= earliest_dup_version) {
       if (write_from_dups != nullptr && *write_from_dups > e.version) {
-	lgeneric_subdout(cct, osd, 20) << "updating write_from_dups from " << *write_from_dups << " to " << e.version << dendl;
+	lgeneric_subdout(cct, osd, 20) << "IFL::updating write_from_dups from " << *write_from_dups << " to " << e.version << dendl;
 	*write_from_dups = e.version;
       }
       dups.push_back(pg_log_dup_t(e));
@@ -137,7 +138,7 @@ void PGLog::IndexedLog::trim(
     const auto& e = *dups.begin();
     if (e.version.version >= earliest_dup_version)
       break;
-    lgeneric_subdout(cct, osd, 20) << "trim dup " << e << dendl;
+    lgeneric_subdout(cct, osd, 20) << ">trim dup " << e << dendl;
     if (trimmed_dups)
       trimmed_dups->insert(e.version);
 
@@ -194,8 +195,8 @@ void PGLog::trim(
   bool transaction_applied,
   bool async)
 {
-  dout(5)<<__func__<<"::IFL::trim_to="<<trim_to <<dendl;
-  dout(10) << __func__ << " proposed trim_to = " << trim_to << dendl;
+  dout(5)<<__func__<<"::IFL>::trim_to="<<trim_to <<dendl;
+  dout(10) << __func__ << "::IFL>:: proposed trim_to = " << trim_to << dendl;
   // trim?
   if (trim_to > log.tail) {
     dout(10) << __func__ << " missing = " << missing.num_missing() << dendl;
@@ -204,11 +205,14 @@ void PGLog::trim(
     if (transaction_applied && !async && (missing.num_missing() == 0))
       ceph_assert(trim_to <= info.last_complete);
 
-    dout(10) << "trim " << log << " to " << trim_to << dendl;
+    dout(10) << "IFL>::trim " << log << " to " << trim_to << dendl;
     log.trim(cct, trim_to, &trimmed, &trimmed_dups, &write_from_dups);
     info.log_tail = log.tail;
-    if (log.complete_to != log.log.end())
-      dout(10) << " after trim complete_to " << log.complete_to->version << dendl;
+    if (log.complete_to != log.log.end()) {
+      dout(10) << "IFL:: after trim complete_to " << log.complete_to->version << dendl;
+    } else {
+      dout(10) << "IFL:: after trim: log.complete_to("<< log.complete_to->version <<") == log.log.end(" << log.log.end()->version <<")"<< dendl;
+    }
   }
 }
 
@@ -699,7 +703,8 @@ void PGLog::write_log_and_missing(
 
 //----------------------------------------------------------------------------------
 static void
-add_keys_to_remove(set<string> & to_remove, set<eversion_t> & ver_set, set<string> *log_keys_debug) {
+add_keys_to_remove(IDFreeList & ifl, set<string> & to_remove, set<eversion_t> & ver_set, set<string> *log_keys_debug) {
+  lgeneric_subdout(ifl.p_cct, osd, 10) << __func__ << "::IFL::"<< ver_set.size() << dendl;
   for (auto& t : ver_set) {
     string key = t.get_key_name();
     if (log_keys_debug) {
@@ -707,6 +712,7 @@ add_keys_to_remove(set<string> & to_remove, set<eversion_t> & ver_set, set<strin
       ceph_assert(it != log_keys_debug->end());
       log_keys_debug->erase(it);
     }
+    lgeneric_subdout(ifl.p_cct, osd, 10) <<"::IFL::add key to-remove "<< key << dendl;
     to_remove.emplace(std::move(key));
   }
   ver_set.clear();
@@ -940,6 +946,9 @@ void PGLog::_write_log_and_missing_wo_missing(
   }
 }
 
+// bin/ceph -s
+// grep -A 30 'ceph version' out/osd.*.log
+
 // static
 void PGLog::_write_log_and_missing(
   ObjectStore::Transaction& t,
@@ -962,14 +971,14 @@ void PGLog::_write_log_and_missing(
   bool *may_include_deletes_in_missing_dirty, // in/out param
   set<string> *log_keys_debug
   ) {
-  lgeneric_subdout(ifl.p_cct, osd, 5)<<__func__<<"::IFL2("<<coll.pool()<<"):: " << log_oid.hobj.to_str() <<":: "
-				     <<(dirty_to      != eversion_t()) <<"; "<<(dirty_from    != eversion_t()) <<"; "<<(writeout_from != eversion_t()) 
-				     <<"log-size="<<log.log.size()<<", dups-size="<<log.dups.size()
+  lgeneric_subdout(ifl.p_cct, osd, 5)<<"::IFLL("<<coll.pool()<<"):: " << log_oid.hobj.to_str() <<":: "
+				     <<(dirty_to != eversion_t()) <<"; "<<(dirty_from != eversion_t::max()) <<"; "<<(writeout_from != eversion_t::max()) 
+				     <<"; log-size="<<log.log.size()<<", dups-size="<<log.dups.size()
 				     <<" || "<<trimmed.size() << " || "<< trimmed_dups.size() <<dendl;
 
   set<string> to_remove;
-  add_keys_to_remove(to_remove, trimmed_dups, log_keys_debug);
-  add_keys_to_remove(to_remove, trimmed, log_keys_debug);
+  add_keys_to_remove(ifl, to_remove, trimmed_dups, log_keys_debug);
+  add_keys_to_remove(ifl, to_remove, trimmed, log_keys_debug);
 
   if (touch_log)
     t.touch(coll, log_oid);
@@ -1073,8 +1082,14 @@ void PGLog::_write_log_and_missing(
       (*km)["rollback_info_trimmed_to"]);
   }
 
-  if (!to_remove.empty())
-    t.omap_rmkeys(coll, log_oid, to_remove);
+  if (!to_remove.empty()) {
+    lgeneric_subdout(ifl.p_cct, osd, 5)<<__func__<<"::IFLXX::("<<coll.pool()<<")::call omap_rmkey with count="<<to_remove.size()<<dendl;
+    for (auto& s : to_remove) {
+      lgeneric_subdout(ifl.p_cct, osd, 5)<<"::IFLXX::("<<coll.pool()<<")::remove trimmed key "<< s <<dendl;
+      log_remove_key(t, coll, log_oid, ifl, s);
+    }
+    //t.omap_rmkeys(coll, log_oid, to_remove);
+  }
 }
 
 void PGLog::rebuild_missing_set_with_deletes(

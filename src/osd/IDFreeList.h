@@ -16,11 +16,11 @@
  */
 #pragma once
 #include <cstdint>
-#include <cassert>
 #include <iostream>
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include "include/ceph_assert.h"
 
 typedef int32_t recycle_log_id_t;
 typedef std::unordered_map<std::string, recycle_log_id_t> recycle_logmap_t;
@@ -50,17 +50,17 @@ public:
 
   //----------------------------------------------
   void start_recovery(void) {
-    lgeneric_subdout(p_cct, osd, 1) << "IFL::"<< __func__ << dendl;
-    assert(!p_recovery_mode);
+    lgeneric_subdout(p_cct, osd, 0) << "IFL::"<< __func__ << dendl;
+    ceph_assert(!p_recovery_mode);
     p_recovery_mode = true;
   }
 
   //----------------------------------------------
   void finish_recovery(void) {
-    assert(p_recovery_mode);
+    ceph_assert(p_recovery_mode);
     link_empty_entries();
     p_recovery_mode = true;
-    lgeneric_subdout(p_cct, osd, 1) << "IFL::"<< __func__ << dendl;
+    lgeneric_subdout(p_cct, osd, 0) << "IFL::"<< __func__ << dendl;
   }
 
   //----------------------------------------------
@@ -69,7 +69,7 @@ public:
     if (itr != p_map.end()) {
       /* key exists already => return the associated index */
       recycle_log_id_t id = itr->second;
-      assert(p_key_vec[id] == &itr->first);
+      ceph_assert(p_key_vec[id] == &itr->first);
       return id;
     } else {
       return NULL_ID; 
@@ -80,14 +80,14 @@ public:
   const std::string* reverseMapId(recycle_log_id_t id) {
     if (id >= p_size) {
       // should never happen ...
-      //assert(id < p_size); 
+      //ceph_assert(id < p_size); 
       return nullptr;
     } else if (p_id_vec[id] == USED_ID) {
-      assert(p_key_vec[id] != nullptr);
-      assert(p_map[*(p_key_vec[id])] == id);
+      ceph_assert(p_key_vec[id] != nullptr);
+      ceph_assert(p_map[*(p_key_vec[id])] == id);
       return p_key_vec[id];
     } else {
-      assert(p_key_vec[id] == nullptr);
+      ceph_assert(p_key_vec[id] == nullptr);
       return nullptr;
     }
   }
@@ -97,16 +97,16 @@ public:
   recycle_log_id_t assignID(recycle_log_id_t id, const std::string & key) //throw(std::bad_alloc)
   {
     lgeneric_subdout(p_cct, osd, 9) << "IFL::("<<this<<")"<< __func__ << " id=" << id << " key="<< key<< dendl;
-    assert(p_recovery_mode);
+    ceph_assert(p_recovery_mode);
     // make sure we got enough space
     if (id >= p_size) {
       grow( (id-p_size) + MIN_GROWTH_SIZE );
     }
 
-    assert(p_id_vec [id] != USED_ID);
-    assert(p_key_vec[id] == nullptr);
+    ceph_assert(p_id_vec [id] != USED_ID);
+    ceph_assert(p_key_vec[id] == nullptr);
     auto itr = p_map.find(key);
-    assert(itr == p_map.end());
+    ceph_assert(itr == p_map.end());
 
     p_id_vec[id]  = USED_ID;
     p_map   [key] = id;
@@ -120,7 +120,7 @@ public:
     auto itr = p_map.find(key);
     if (itr != p_map.end()) {
       /* key exists already => return the associated index */
-      assert(p_key_vec[itr->second] == &itr->first);
+      ceph_assert(p_key_vec[itr->second] == &itr->first);
       return itr->second;
     }
 
@@ -130,18 +130,18 @@ public:
       grow(std::max(MIN_GROWTH_SIZE,p_size));
     }
 
-    assert(p_head != NULL_ID);
+    ceph_assert(p_head != NULL_ID);
     
     if (p_head != NULL_ID) {
-      assert(p_free_count > 0);
+      ceph_assert(p_free_count > 0);
       
       recycle_log_id_t id   = p_head;
       p_head       = p_id_vec[p_head];
-      assert(p_id_vec[id] != USED_ID);
+      ceph_assert(p_id_vec[id] != USED_ID);
       p_id_vec[id] = USED_ID;
       
       p_free_count --;
-      assert(p_free_count >= 0);
+      ceph_assert(p_free_count >= 0);
 
       p_map[key] = id;
 
@@ -157,31 +157,33 @@ public:
   //----------------------------------------------
   recycle_log_id_t releaseID(const std::string & key) {
     lgeneric_subdout(p_cct, osd, 11) << "IFL::("<<this<<")"<< __func__ << " key="<< key<< dendl;
-    assert(p_free_count < p_size);
+    ceph_assert(p_free_count < p_size);
     recycle_log_id_t id;
     auto itr = p_map.find(key);
     if (itr != p_map.end()) {
       id = itr->second;
+      lgeneric_subdout(p_cct, osd, 11) << "IFL::("<<this<<")"<< __func__ << " key="<< key<< ", recycle_id=" << id << dendl;
     } else {
+      lgeneric_subdout(p_cct, osd, 11) << "IFL::("<<this<<")"<< __func__ << " key="<< key<< " **Does Not Exist**" << dendl;
       return NULL_ID;
     }
     
-    assert(id < p_size);
-    assert(p_id_vec[id] == USED_ID);
-    assert(p_key_vec[id] == &itr->first);
+    ceph_assert(id < p_size);
+    ceph_assert(p_id_vec[id] == USED_ID);
+    ceph_assert(p_key_vec[id] == &itr->first);
     
     if (p_head != NULL_ID) {
-      assert(p_free_count > 0);
-      assert(p_tail != NULL_ID);
-      assert(p_id_vec[p_tail] == NULL_ID);
+      ceph_assert(p_free_count > 0);
+      ceph_assert(p_tail != NULL_ID);
+      ceph_assert(p_id_vec[p_tail] == NULL_ID);
       p_id_vec[p_tail] = id;
       p_tail           = id;
     } else {
-      assert(p_free_count == 0);
+      ceph_assert(p_free_count == 0);
       p_head = p_tail = id;
     }
 
-    assert(p_map.erase(key) == 1);
+    ceph_assert(p_map.erase(key) == 1);
     p_id_vec[id]  = NULL_ID;
     p_key_vec[id] = nullptr;
     p_free_count++;
@@ -281,7 +283,7 @@ private:
   void create_reverse_mapping(recycle_log_id_t id, const std::string & key) {
     /* get a reference to the key stored in the map */
     auto itr = p_map.find(key);
-    assert(itr != p_map.end());
+    ceph_assert(itr != p_map.end());
     const std::string & sr = itr->first;
     p_key_vec[id] = & sr;
   }
@@ -294,7 +296,7 @@ private:
     p_head          = NULL_ID;
     p_tail          = NULL_ID;
     p_recovery_mode = false;
-    //    assert(size <= cct->_conf->osd_max_pg_log_entries);
+    //    ceph_assert(size <= cct->_conf->osd_max_pg_log_entries);
   }
 
   //----------------------------------------------
@@ -320,7 +322,7 @@ private:
     for (auto itr = p_map.begin(); itr != p_map.end(); itr++) {
       const std::string & sr = itr->first;
       recycle_log_id_t id    = itr->second;
-      assert(p_key_vec[id] == nullptr);
+      ceph_assert(p_key_vec[id] == nullptr);
       p_key_vec[id] = & sr;
     }
     

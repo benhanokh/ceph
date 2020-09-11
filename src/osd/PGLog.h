@@ -1427,7 +1427,7 @@ public:
     std::set<std::string> *log_keys_debug = nullptr,
     bool debug_verify_stored_missing = false
     ) {
-    ldpp_dout(dpp, 20) << "read_log_and_missing coll " << ch->cid
+    ldpp_dout(dpp, 0) << "read_log_and_missing coll " << ch->cid
 		       << " " << pgmeta_oid << dendl;
 
     // legacy?
