@@ -60,7 +60,7 @@ void PGLog::IndexedLog::trim(
   set<eversion_t>* trimmed_dups,
   eversion_t *write_from_dups)
 {
-  lgeneric_subdout(cct, osd, 5)<<__func__<<"::IFL2::trim_to="<< s << log.empty() <<
+  lgeneric_subdout(cct, osd, 5)<<__func__<<"::IFL::trim_to="<< s << log.empty() <<
     (trimmed ? trimmed->size():0)<<" || " << (trimmed_dups ? trimmed_dups->size():0) << dendl;
   
   ceph_assert(s <= can_rollback_to);
@@ -195,7 +195,6 @@ void PGLog::trim(
   bool transaction_applied,
   bool async)
 {
-  dout(5)<<__func__<<"::IFL>::trim_to="<<trim_to <<dendl;
   dout(10) << __func__ << "::IFL>:: proposed trim_to = " << trim_to << dendl;
   // trim?
   if (trim_to > log.tail) {
@@ -205,7 +204,6 @@ void PGLog::trim(
     if (transaction_applied && !async && (missing.num_missing() == 0))
       ceph_assert(trim_to <= info.last_complete);
 
-    dout(10) << "IFL>::trim " << log << " to " << trim_to << dendl;
     log.trim(cct, trim_to, &trimmed, &trimmed_dups, &write_from_dups);
     info.log_tail = log.tail;
     if (log.complete_to != log.log.end()) {
@@ -660,7 +658,7 @@ void PGLog::write_log_and_missing(
 void PGLog::write_log_and_missing_wo_missing(
     ObjectStore::Transaction& t,
     map<string,bufferlist> *km,
-    IDFreeList & ifl,
+    IDFreeList &ifl,
     pg_log_t &log,
     const coll_t& coll, const ghobject_t &log_oid,
     map<eversion_t, hobject_t> &divergent_priors,
@@ -678,7 +676,7 @@ void PGLog::write_log_and_missing_wo_missing(
 void PGLog::write_log_and_missing(
     ObjectStore::Transaction& t,
     map<string,bufferlist> *km,
-    IDFreeList & ifl,
+    IDFreeList &ifl,
     pg_log_t &log,
     const coll_t& coll,
     const ghobject_t &log_oid,
@@ -703,8 +701,7 @@ void PGLog::write_log_and_missing(
 
 //----------------------------------------------------------------------------------
 static void
-add_keys_to_remove(IDFreeList & ifl, set<string> & to_remove, set<eversion_t> & ver_set, set<string> *log_keys_debug) {
-  lgeneric_subdout(ifl.p_cct, osd, 10) << __func__ << "::IFL::"<< ver_set.size() << dendl;
+add_keys_to_remove(IDFreeList &ifl, set<string> &to_remove, set<eversion_t> &ver_set, set<string> *log_keys_debug) {
   for (auto& t : ver_set) {
     string key = t.get_key_name();
     if (log_keys_debug) {
@@ -712,7 +709,7 @@ add_keys_to_remove(IDFreeList & ifl, set<string> & to_remove, set<eversion_t> & 
       ceph_assert(it != log_keys_debug->end());
       log_keys_debug->erase(it);
     }
-    lgeneric_subdout(ifl.p_cct, osd, 10) <<"::IFL::add key to-remove "<< key << dendl;
+    lgeneric_subdout(ifl.m_cct, osd, 10) <<"::IFL::add key to-remove "<< key << dendl;
     to_remove.emplace(std::move(key));
   }
   ver_set.clear();
@@ -721,44 +718,43 @@ add_keys_to_remove(IDFreeList & ifl, set<string> & to_remove, set<eversion_t> & 
 //----------------------------------------------------------------------------------
 static void
 add_log_entry_to_km(
-  IDFreeList            & ifl,
-  map<string,bufferlist>* p_km,
-  pg_log_entry_t        & log_entry)
+  IDFreeList             &ifl,
+  map<string,bufferlist> *p_km,
+  pg_log_entry_t         &log_entry)
 {
   bufferlist bl(sizeof(log_entry) * 2);
   log_entry.encode_with_checksum(bl);
 
-  recycle_log_id_t recycle_id = ifl.assignID(log_entry.get_key_name());
-  lgeneric_subdout(ifl.p_cct, osd, 10) << "IFL::("<<&ifl<<")"<< __func__ << ": id=" << recycle_id << " eversion=" << log_entry.get_key_name() << dendl;
+  recycle_log_id_t recycle_id = ifl.assign_id(log_entry.get_key_name());
+  // TBD - Can I aboid dynamic allocation here and allocate string object on stack instead ???
   (*p_km)[to_string(recycle_id)] = std::move(bl);
 }
 
 //----------------------------------------------------------------------------------
 static void
 add_log_dup_entry_to_km(
-  IDFreeList            & ifl,
-  map<string,bufferlist>* p_km,
-  const pg_log_dup_t    & log_dup_entry)
+  IDFreeList             &ifl,
+  map<string,bufferlist> *p_km,
+  const pg_log_dup_t     &log_dup_entry)
 {
   bufferlist bl;
   encode(log_dup_entry, bl);
-  recycle_log_id_t recycle_id = ifl.assignID(log_dup_entry.get_key_name());
-  lgeneric_subdout(ifl.p_cct, osd, 10) << "IFL::("<<&ifl<<")"<< __func__ << ": id=" << recycle_id << " eversion=" << log_dup_entry.get_key_name() << dendl;
-
+  recycle_log_id_t recycle_id = ifl.assign_id(log_dup_entry.get_key_name());
+  // TBD - Can I aboid dynamic allocation here and allocate string object on stack instead ???
   (*p_km)["dup_" + to_string(recycle_id)] = std::move(bl);
 }
 
 //----------------------------------------------------------------------------------
 static void
 log_remove_key(
-  ObjectStore::Transaction& t,
-  const coll_t            & coll,
-  const ghobject_t        & log_oid,
-  IDFreeList              & ifl,
-  const std::string       & key)
+  ObjectStore::Transaction &t,
+  const coll_t             &coll,
+  const ghobject_t         &log_oid,
+  IDFreeList               &ifl,
+  const std::string        &key)
 {
-  lgeneric_subdout(ifl.p_cct, osd, 10) << "IFL::("<<&ifl<<")"<< __func__ << ": eversion=" << key << dendl;
-  if (ifl.releaseID(key) != ifl.nullID()) {
+  lgeneric_subdout(ifl.m_cct, osd, 10) << "IFL::("<<&ifl<<")"<< __func__ << ": eversion=" << key << dendl;
+  if (ifl.release_id(key) != ifl.null_id()) {
     // key belongs to the recycle_id DB and should not be removed from disk
     return;
   }
@@ -770,14 +766,13 @@ log_remove_key(
 //----------------------------------------------------------------------------------
 static void
 log_remove_dirty_to(
-  ObjectStore::Transaction& t,
-  const coll_t            & coll,
-  const ghobject_t        & log_oid,
-  IDFreeList              & ifl,
-  pg_log_t                & log,
-  const eversion_t        & dirty_to)
+  ObjectStore::Transaction &t,
+  const coll_t             &coll,
+  const ghobject_t         &log_oid,
+  IDFreeList               &ifl,
+  pg_log_t                 &log,
+  const eversion_t         &dirty_to)
 {
-  lgeneric_subdout(ifl.p_cct, osd, 10)  << __func__<<" ::IFL<"<<&ifl<<">::size="<<log.log.size()<<" dirty_to=" << dirty_to.get_key_name() << dendl;
   for (auto p = log.log.begin();
        p != log.log.end() && p->version <= dirty_to;
        ++p) {
@@ -788,14 +783,13 @@ log_remove_dirty_to(
 //----------------------------------------------------------------------------------
 static void
 dups_remove_dirty_to(
-  ObjectStore::Transaction& t,
-  const coll_t            & coll,
-  const ghobject_t        & log_oid,
-  IDFreeList              & ifl,
-  pg_log_t                & log,
-  const eversion_t        & dirty_to)
+  ObjectStore::Transaction &t,
+  const coll_t             &coll,
+  const ghobject_t         &log_oid,
+  IDFreeList               &ifl,
+  pg_log_t                 &log,
+  const eversion_t         &dirty_to)
 {
-  lgeneric_subdout(ifl.p_cct, osd, 10)  << __func__<<"::IFL<"<<&ifl<<">::size="<<log.dups.size()<<" dirty_to=" << dirty_to.get_key_name() << dendl;
   for (auto p = log.dups.begin();
        p != log.dups.end() && p->version <= dirty_to;
        ++p) {
@@ -806,14 +800,13 @@ dups_remove_dirty_to(
 //----------------------------------------------------------------------------------
 static void
 log_remove_dirty_from(
-  ObjectStore::Transaction& t,
-  const coll_t            & coll,
-  const ghobject_t        & log_oid,
-  IDFreeList              & ifl,
-  pg_log_t                & log,
-  const eversion_t        & dirty_from)
+  ObjectStore::Transaction &t,
+  const coll_t             &coll,
+  const ghobject_t         &log_oid,
+  IDFreeList               &ifl,
+  pg_log_t                 &log,
+  const eversion_t         &dirty_from)
 {
-  lgeneric_subdout(ifl.p_cct, osd, 10)  << __func__<<" ::IFL<"<<&ifl<<">::size="<<log.log.size()<<" dirty_from=" << dirty_from.get_key_name() << dendl;
   for (auto p = log.log.rbegin();
        p != log.log.rend() && p->version >= dirty_from;
        ++p) {
@@ -824,14 +817,13 @@ log_remove_dirty_from(
 //----------------------------------------------------------------------------------
 static void
 dups_remove_dirty_from(
-  ObjectStore::Transaction& t,
-  const coll_t            & coll,
-  const ghobject_t        & log_oid,
-  IDFreeList              & ifl,
-  pg_log_t                & log,
-  const eversion_t        & dirty_from)
+  ObjectStore::Transaction &t,
+  const coll_t             &coll,
+  const ghobject_t         &log_oid,
+  IDFreeList               &ifl,
+  pg_log_t                 &log,
+  const eversion_t         &dirty_from)
 {
-  lgeneric_subdout(ifl.p_cct, osd, 10)  << __func__<<"::IFL<"<<&ifl<<">::size="<<log.log.size()<<" dirty_from=" << dirty_from.get_key_name() << dendl;
   for (auto p = log.dups.rbegin();
        p != log.dups.rend() && p->version >= dirty_from;
        ++p) {
@@ -843,7 +835,7 @@ dups_remove_dirty_from(
 void PGLog::_write_log_and_missing_wo_missing(
   ObjectStore::Transaction& t,
   map<string,bufferlist> *km,
-  IDFreeList& ifl,
+  IDFreeList &ifl,
   pg_log_t &log,
   const coll_t& coll, const ghobject_t &log_oid,
   map<eversion_t, hobject_t> &divergent_priors,
@@ -860,19 +852,16 @@ void PGLog::_write_log_and_missing_wo_missing(
   )
 {
   // dout(10) << "write_log_and_missing, clearing up to " << dirty_to << dendl;
-  lgeneric_subdout(ifl.p_cct, osd, 5)<<__func__<<"::IFL("<<coll.pool()<<
+  lgeneric_subdout(ifl.m_cct, osd, 5)<<__func__<<"::IFL("<<coll.pool()<<
     ")::clearing from:"<<dirty_from.get_key_name()<<" up to:"<< dirty_to.get_key_name() <<dendl;
 
   if (touch_log)
     t.touch(coll, log_oid);
   if (dirty_to != eversion_t()) {
-    lgeneric_subdout(ifl.p_cct, osd, 10)  << "IFL::("<<&ifl<<")"<< __func__ << "remove: dirty_to     =" << dirty_to.get_key_name() << dendl;
     log_remove_dirty_to(t, coll, log_oid, ifl, log, dirty_to);
     clear_up_to(log_keys_debug, dirty_to.get_key_name());
   }
   if (dirty_to != eversion_t::max() && dirty_from != eversion_t::max()) {
-    // dout(10) << "write_log_and_missing, clearing from " << dirty_from << dendl;
-    lgeneric_subdout(ifl.p_cct, osd, 10) << "IFL::("<<&ifl<<")"<< __func__ << "remove: dirty_from     =" << dirty_from.get_key_name() << dendl;
     log_remove_dirty_from(t, coll, log_oid, ifl, log, dirty_from);
     clear_after(log_keys_debug, dirty_from.get_key_name());
   }
@@ -880,8 +869,6 @@ void PGLog::_write_log_and_missing_wo_missing(
   for (auto p = log.log.begin();
        p != log.log.end() && p->version <= dirty_to;
        ++p) {
-    //const pg_log_entry_t &e = *log.begin();
-    lgeneric_subdout(ifl.p_cct, osd, 10)  << "IFL::("<<&ifl<<")"<< __func__ << ": add_log_entry_to_km= " << p->get_key_name() << dendl;
     add_log_entry_to_km(ifl, km, *p);
   }
 
@@ -890,7 +877,6 @@ void PGLog::_write_log_and_missing_wo_missing(
 	 (p->version >= dirty_from || p->version >= writeout_from) &&
 	 p->version >= dirty_to;
        ++p) {
-    lgeneric_subdout(ifl.p_cct, osd, 10) << "IFL::("<<&ifl<<")"<< __func__ << ": add_log_entry_to_km2=" << p->get_key_name() << dendl;
     add_log_entry_to_km(ifl, km, *p);
   }
 
@@ -908,18 +894,15 @@ void PGLog::_write_log_and_missing_wo_missing(
   // process dups after log_keys_debug is filled, so dups do not
   // end up in that set
   if (dirty_to_dups != eversion_t()) {
-    lgeneric_subdout(ifl.p_cct, osd, 10)  << "IFL::("<<&ifl<<")"<< __func__ << "remove: dirty_to_dups=" << dirty_to_dups.get_key_name() << dendl;
     dups_remove_dirty_to(t, coll, log_oid, ifl, log, dirty_to_dups);
   }
   if (dirty_to_dups != eversion_t::max() && dirty_from_dups != eversion_t::max()) {
-    lgeneric_subdout(ifl.p_cct, osd, 10) << "IFL::("<<&ifl<<")"<< __func__ << "remove: dirty_from_dups=" << dirty_from_dups.get_key_name() << dendl;
     dups_remove_dirty_from(t, coll, log_oid, ifl, log, dirty_from_dups);
   }
 
   for (const auto& entry : log.dups) {
     if (entry.version > dirty_to_dups)
       break;
-    lgeneric_subdout(ifl.p_cct, osd, 10)  << "IFL::("<<&ifl<<")"<< __func__ << ": add_dup_entry_to_km= " << entry.get_key_name() << dendl;
     add_log_dup_entry_to_km(ifl, km, entry);
   }
 
@@ -928,7 +911,6 @@ void PGLog::_write_log_and_missing_wo_missing(
 	 (p->version >= dirty_from_dups || p->version >= write_from_dups) &&
 	 p->version >= dirty_to_dups;
        ++p) {
-    lgeneric_subdout(ifl.p_cct, osd, 10)  << "IFL::("<<&ifl<<")"<< __func__ << ": add_dup_entry_to_km2=" << p->get_key_name() << dendl;
     add_log_dup_entry_to_km(ifl, km, *p);
   }
 
@@ -953,7 +935,7 @@ void PGLog::_write_log_and_missing_wo_missing(
 void PGLog::_write_log_and_missing(
   ObjectStore::Transaction& t,
   map<string,bufferlist>* km,
-  IDFreeList& ifl,
+  IDFreeList &ifl,
   pg_log_t &log,
   const coll_t& coll, const ghobject_t &log_oid,
   eversion_t dirty_to,
@@ -971,7 +953,7 @@ void PGLog::_write_log_and_missing(
   bool *may_include_deletes_in_missing_dirty, // in/out param
   set<string> *log_keys_debug
   ) {
-  lgeneric_subdout(ifl.p_cct, osd, 5)<<"::IFLL("<<coll.pool()<<"):: " << log_oid.hobj.to_str() <<":: "
+  lgeneric_subdout(ifl.m_cct, osd, 5)<<"::IFLL("<<coll.pool()<<"):: " << log_oid.hobj.to_str() <<":: "
 				     <<(dirty_to != eversion_t()) <<"; "<<(dirty_from != eversion_t::max()) <<"; "<<(writeout_from != eversion_t::max()) 
 				     <<"; log-size="<<log.log.size()<<", dups-size="<<log.dups.size()
 				     <<" || "<<trimmed.size() << " || "<< trimmed_dups.size() <<dendl;
@@ -984,12 +966,10 @@ void PGLog::_write_log_and_missing(
     t.touch(coll, log_oid);
   
   if (dirty_to != eversion_t()) {
-    lgeneric_subdout(ifl.p_cct, osd, 10)  << __func__<<"::IFL("<<coll.pool()<<")<" <<&ifl<<">:: remove: dirty_to=" << dirty_to.get_key_name() << dendl;
     log_remove_dirty_to(t, coll, log_oid, ifl, log, dirty_to);
     clear_up_to(log_keys_debug, dirty_to.get_key_name());
   }
   if (dirty_to != eversion_t::max() && dirty_from != eversion_t::max()) {
-    lgeneric_subdout(ifl.p_cct, osd, 10)  << __func__<<"::IFL("<<coll.pool()<<")<" <<&ifl<<">:: remove: dirty_from=" << dirty_from.get_key_name() << dendl;
     log_remove_dirty_from(t, coll, log_oid, ifl, log, dirty_from);
     clear_after(log_keys_debug, dirty_from.get_key_name());
   }
@@ -997,7 +977,6 @@ void PGLog::_write_log_and_missing(
   for (auto p = log.log.begin();
        p != log.log.end() && p->version <= dirty_to;
        ++p) {
-    lgeneric_subdout(ifl.p_cct, osd, 10)  << "IFL::("<<&ifl<<")"<< __func__ << ": add_log_entry_to_km=" << p->get_key_name() << dendl;
     add_log_entry_to_km(ifl, km, *p);
   }
 
@@ -1006,7 +985,6 @@ void PGLog::_write_log_and_missing(
 	 (p->version >= dirty_from || p->version >= writeout_from) &&
 	 p->version >= dirty_to;
        ++p) {
-    lgeneric_subdout(ifl.p_cct, osd, 10)  << "IFL::("<<&ifl<<")"<< __func__ << ": add_log_entry_to_km2=" << p->get_key_name() << dendl;
     add_log_entry_to_km(ifl, km, *p);
   }
 
@@ -1024,19 +1002,16 @@ void PGLog::_write_log_and_missing(
   // process dups after log_keys_debug is filled, so dups do not
   // end up in that set
   if (dirty_to_dups != eversion_t()) {
-    lgeneric_subdout(ifl.p_cct, osd, 10)<< __func__<<"::IFL("<<coll.pool()<<")<" <<&ifl<<">:: remove: dups dirty_to=" << dirty_to_dups.get_key_name()<<dendl;
     dups_remove_dirty_to(t, coll, log_oid, ifl, log, dirty_to_dups);
   }
 
   if (dirty_to_dups != eversion_t::max() && dirty_from_dups != eversion_t::max()) {
-    lgeneric_subdout(ifl.p_cct, osd,10)<< __func__<<"::IFL("<<coll.pool()<<")<"<<&ifl<<">:: remove: dups dirty_from="<<dirty_from_dups.get_key_name()<<dendl;
     dups_remove_dirty_from(t, coll, log_oid, ifl, log, dirty_from_dups);
   }
 
   for (const auto& entry : log.dups) {
     if (entry.version > dirty_to_dups)
       break;
-    lgeneric_subdout(ifl.p_cct, osd, 10)  << "IFL::("<<&ifl<<")"<< __func__ << ": add_dup_entry_to_km=" << entry.get_key_name() << dendl;
     add_log_dup_entry_to_km(ifl, km, entry);
   }
 
@@ -1045,7 +1020,6 @@ void PGLog::_write_log_and_missing(
 	 (p->version >= dirty_from_dups || p->version >= write_from_dups) &&
 	 p->version >= dirty_to_dups;
        ++p) {
-    lgeneric_subdout(ifl.p_cct, osd, 10)  << "IFL::("<<&ifl<<")"<< __func__ << ": add_dup_entry_to_km2=" << p->get_key_name() << dendl;
     add_log_dup_entry_to_km(ifl, km, *p);
   }
 
@@ -1083,12 +1057,10 @@ void PGLog::_write_log_and_missing(
   }
 
   if (!to_remove.empty()) {
-    lgeneric_subdout(ifl.p_cct, osd, 5)<<__func__<<"::IFLXX::("<<coll.pool()<<")::call omap_rmkey with count="<<to_remove.size()<<dendl;
     for (auto& s : to_remove) {
-      lgeneric_subdout(ifl.p_cct, osd, 5)<<"::IFLXX::("<<coll.pool()<<")::remove trimmed key "<< s <<dendl;
+      lgeneric_subdout(ifl.m_cct, osd, 5)<<"::IFLXX::("<<coll.pool()<<")::remove trimmed key "<< s <<dendl;
       log_remove_key(t, coll, log_oid, ifl, s);
     }
-    //t.omap_rmkeys(coll, log_oid, to_remove);
   }
 }
 

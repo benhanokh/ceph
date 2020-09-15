@@ -972,7 +972,6 @@ void PG::prepare_write(
   bool need_write_epoch,
   ObjectStore::Transaction &t)
 {
-  static unsigned counter;
   info.stats.stats.add(unstable_stats);
   unstable_stats.clear();
   map<string,bufferlist> km;
@@ -993,17 +992,12 @@ void PG::prepare_write(
       this);
     ceph_assert(ret == 0);
   }
-  counter++;
   pglog.write_log_and_missing(
     t, &km, coll, pgmeta_oid, pool.info.require_rollback());
-  if (!km.empty()) {
-    dout(5)<<__func__<<"::DFL("<<counter<<")::km.size()="<<km.size()<<dendl;
+  if (!km.empty())
     t.omap_setkeys(coll, pgmeta_oid, km);
-  }
-  if (!key_to_remove.empty()) {
-    dout(5)<<__func__<<"::DFL("<<counter<<")::key_to_remove.size()="<<key_to_remove.size()<<dendl;
+  if (!key_to_remove.empty())
     t.omap_rmkey(coll, pgmeta_oid, key_to_remove);
-  }
 }
 
 #pragma GCC diagnostic ignored "-Wpragmas"

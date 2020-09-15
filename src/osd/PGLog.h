@@ -155,6 +155,7 @@ public:
     // recovery pointers
     std::list<pg_log_entry_t>::iterator complete_to; // not inclusive of referenced item
     version_t last_requested = 0;               // last object requested by primary
+
     //
   private:
     mutable __u16 indexed_data = 0;
@@ -634,7 +635,7 @@ public:
       CephContext* cct,
       eversion_t s,
       std::set<eversion_t> *trimmed,
-      std::set<eversion_t>* trimmed_dups,
+      std::set<eversion_t> *trimmed_dups,
       eversion_t *write_from_dups);
 
     std::ostream& print(std::ostream& out) const;
@@ -643,6 +644,7 @@ public:
 
 protected:
   //////////////////// data members ////////////////////
+
   pg_missing_tracker_t missing;
   IndexedLog  log;
 
@@ -713,7 +715,6 @@ public:
   bool get_may_include_deletes_in_missing_dirty() const {
     return may_include_deletes_in_missing_dirty;
   }
-
 protected:
 
   /// DEBUG
@@ -757,7 +758,7 @@ public:
     dirty_from_dups(eversion_t::max()),
     write_from_dups(eversion_t::max()),
     cct(cct),
-    ifl(cct->_conf->osd_max_pg_log_entries, cct),
+    ifl(cct->_conf->osd_min_pg_log_entries, cct),
     pg_log_debug(!(cct && !(cct->_conf->osd_debug_pg_log_writeout))),
     touched_log(false),
     dirty_log(false),
@@ -1334,7 +1335,7 @@ public:
   static void write_log_and_missing_wo_missing(
     ObjectStore::Transaction& t,
     std::map<std::string,ceph::buffer::list>* km,
-    IDFreeList & ifl,
+    IDFreeList &ifl,
     pg_log_t &log,
     const coll_t& coll,
     const ghobject_t &log_oid, std::map<eversion_t, hobject_t> &divergent_priors,
@@ -1343,7 +1344,7 @@ public:
   static void write_log_and_missing(
     ObjectStore::Transaction& t,
     std::map<std::string,ceph::buffer::list>* km,
-    IDFreeList & ifl,
+    IDFreeList &ifl,
     pg_log_t &log,
     const coll_t& coll,
     const ghobject_t &log_oid,
@@ -1354,7 +1355,7 @@ public:
   static void _write_log_and_missing_wo_missing(
     ObjectStore::Transaction& t,
     std::map<std::string,ceph::buffer::list>* km,
-    IDFreeList& ifl,
+    IDFreeList &ifl,
     pg_log_t &log,
     const coll_t& coll, const ghobject_t &log_oid,
     std::map<eversion_t, hobject_t> &divergent_priors,
@@ -1373,7 +1374,7 @@ public:
   static void _write_log_and_missing(
     ObjectStore::Transaction& t,
     std::map<std::string,ceph::buffer::list>* km,
-    IDFreeList& ifl,
+    IDFreeList &ifl,
     pg_log_t &log,
     const coll_t& coll, const ghobject_t &log_oid,
     eversion_t dirty_to,
@@ -1417,7 +1418,7 @@ public:
     ObjectStore::CollectionHandle &ch,
     ghobject_t pgmeta_oid,
     const pg_info_t &info,
-    IDFreeList& ifl,
+    IDFreeList &ifl,
     IndexedLog &log,
     missing_type &missing,
     std::ostringstream &oss,
@@ -1427,7 +1428,7 @@ public:
     std::set<std::string> *log_keys_debug = nullptr,
     bool debug_verify_stored_missing = false
     ) {
-    ldpp_dout(dpp, 0) << "read_log_and_missing coll " << ch->cid
+    ldpp_dout(dpp, 20) << "read_log_and_missing coll " << ch->cid
 		       << " " << pgmeta_oid << dendl;
 
     // legacy?
@@ -1483,12 +1484,12 @@ public:
 	  if (!dups.empty()) {
 	    ceph_assert(dups.back().version < dup.version);
 	  }
-	  //lgeneric_subdout(ifl.p_cct, osd, 5) << "IFL::"<< __func__ << p->key << dendl;
+	  lgeneric_subdout(ifl.m_cct, osd, 5) << "IFL::"<< __func__ << p->key() << dendl;
 	  // The recycle id keys are much shorter than the old keys
 	  // We are limited to 10 digits plus 4 bytes for the "dup_" 
 	  if (p->key().length() <= ifl.max_recycle_id_length()) {
 	    recycle_log_id_t log_id = stoi(p->key().substr(4, string::npos));
-	    ifl.assignID(log_id, dup.get_key_name());
+	    ifl.assign_id(log_id, dup.get_key_name());
 	  }
 
 	  dups.push_back(dup);
@@ -1502,11 +1503,11 @@ public:
 	    ceph_assert(last_e.version.epoch <= e.version.epoch);
 	  }
 
-	  //lgeneric_subdout(ifl.p_cct, osd, 5) << "IFL::"<< __func__ << p->key << dendl;
+	  lgeneric_subdout(ifl.m_cct, osd, 5) << "IFL::"<< __func__ << p->key() << dendl;
 	  // The recycle id keys are much shorter than the old keys
 	  if (p->key().length() <= ifl.max_recycle_id_length()) {
 	    recycle_log_id_t log_id = stoi(p->key());
-	    ifl.assignID(log_id, e.get_key_name());
+	    ifl.assign_id(log_id, e.get_key_name());
 	  }
 
 	  entries.push_back(e);

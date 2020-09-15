@@ -4314,6 +4314,7 @@ struct pg_log_t {
    */
   eversion_t head;    // newest entry
   eversion_t tail;    // version prior to oldest
+
 protected:
   // We can rollback rollback-able entries > can_rollback_to
   eversion_t can_rollback_to;
@@ -4368,6 +4369,7 @@ public:
   eversion_t get_can_rollback_to() const {
     return can_rollback_to;
   }
+
 
   pg_log_t split_out_child(pg_t child_pgid, unsigned split_bits) {
     mempool::osd_pglog::list<pg_log_entry_t> oldlog, childlog;
