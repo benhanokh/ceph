@@ -14,6 +14,7 @@ set(osd_srcs
   Watch.cc
   ClassHandler.cc
   PG.cc
+  IDFreeList.cc
   PGLog.cc
   PrimaryLogPG.cc
   ReplicatedBackend.cc
