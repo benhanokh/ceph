@@ -1487,7 +1487,7 @@ public:
 	  lgeneric_subdout(ifl.m_cct, osd, 5) << "IFL::"<< __func__ << p->key() << dendl;
 	  // The recycle id keys are much shorter than the old keys
 	  // We are limited to 10 digits plus 4 bytes for the "dup_" 
-	  if (p->key().length() <= ifl.max_recycle_id_length()) {
+	  if (p->key().length() <= ifl.MAX_RECYCLE_ID_LENGTH) {
 	    recycle_log_id_t log_id = stoi(p->key().substr(4, string::npos));
 	    ifl.assign_id(log_id, dup.get_key_name());
 	  }
@@ -1505,7 +1505,7 @@ public:
 
 	  lgeneric_subdout(ifl.m_cct, osd, 5) << "IFL::"<< __func__ << p->key() << dendl;
 	  // The recycle id keys are much shorter than the old keys
-	  if (p->key().length() <= ifl.max_recycle_id_length()) {
+	  if (p->key().length() <= ifl.MAX_RECYCLE_ID_LENGTH) {
 	    recycle_log_id_t log_id = stoi(p->key());
 	    ifl.assign_id(log_id, e.get_key_name());
 	  }

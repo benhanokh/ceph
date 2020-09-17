@@ -209,7 +209,7 @@ void PGLog::trim(
     if (log.complete_to != log.log.end()) {
       dout(10) << "IFL:: after trim complete_to " << log.complete_to->version << dendl;
     } else {
-      dout(10) << "IFL:: after trim: log.complete_to("<< log.complete_to->version <<") == log.log.end(" << log.log.end()->version <<")"<< dendl;
+      dout(10) << "IFL:: after trim: log.complete_to end"<< dendl;
     }
   }
 }
@@ -753,12 +753,13 @@ log_remove_key(
   IDFreeList               &ifl,
   const std::string        &key)
 {
-  lgeneric_subdout(ifl.m_cct, osd, 10) << "IFL::("<<&ifl<<")"<< __func__ << ": eversion=" << key << dendl;
-  if (ifl.release_id(key) != ifl.null_id()) {
+  lgeneric_subdout(ifl.m_cct, osd, 10) << "IFL::(" << &ifl << ")" << __func__ << ": eversion=" << key << dendl;
+  if (ifl.release_id(key) != ifl.NULL_ID) {
     // key belongs to the recycle_id DB and should not be removed from disk
     return;
   }
 
+  lgeneric_subdout(ifl.m_cct, osd, 10) << "IFL::(" << &ifl << ")" << __func__ << "::Old Format key > remove from RockDB!" << dendl;
   // if arrived here the key belongs to an entry in the old format -> remove it from disk
   t.omap_rmkey(coll, log_oid, key);
 }
@@ -953,7 +954,7 @@ void PGLog::_write_log_and_missing(
   bool *may_include_deletes_in_missing_dirty, // in/out param
   set<string> *log_keys_debug
   ) {
-  lgeneric_subdout(ifl.m_cct, osd, 5)<<"::IFLL("<<coll.pool()<<"):: " << log_oid.hobj.to_str() <<":: "
+  lgeneric_subdout(ifl.m_cct, osd, 5)<<"IFL("<<coll.pool()<<"):: " << log_oid.hobj.to_str() <<":: "
 				     <<(dirty_to != eversion_t()) <<"; "<<(dirty_from != eversion_t::max()) <<"; "<<(writeout_from != eversion_t::max()) 
 				     <<"; log-size="<<log.log.size()<<", dups-size="<<log.dups.size()
 				     <<" || "<<trimmed.size() << " || "<< trimmed_dups.size() <<dendl;

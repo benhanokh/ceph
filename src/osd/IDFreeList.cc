@@ -3,9 +3,6 @@
 /*
  * Ceph - scalable distributed file system
  *
- * Copyright (C) 2004-2006 Sage Weil <sage@newdream.net>
- * Copyright (C) 2013 Cloudwatt <libre.licensing@cloudwatt.com>
- *
  * Author: Gabriel BenHanokh <benhanokh@gmail.com>
  *
  * This is free software; you can redistribute it and/or
@@ -45,12 +42,12 @@ IDFreeList::IDFreeList(recycle_log_id_t size, CephContext *cct): p_map(size), p_
   p_recovery_mode   = false;
   m_cct             = cct;
 
-  dout(10) << "IFL::("<<this<<")"<< __func__ <<" size=" << size << dendl;
+  dout(10) << __func__ << " size=" << size << dendl;
 }
 
 //----------------------------------------------
 void IDFreeList::start_recovery(void) {
-  dout(0) << "IFL::"<< __func__ << dendl;
+  dout(0) << __func__ << dendl;
   ceph_assert(!p_recovery_mode);
   p_recovery_mode = true;
 }
@@ -60,7 +57,7 @@ void IDFreeList::finish_recovery(void) {
   ceph_assert(p_recovery_mode);
   link_empty_entries();
   p_recovery_mode = true;
-  dout(0) << "IFL::"<< __func__ << dendl;
+  dout(0) << __func__ << dendl;
 }
 
 //----------------------------------------------
@@ -96,7 +93,7 @@ const std::string* IDFreeList::reverse_map_id(recycle_log_id_t id) {
 // recreate the mapping from eversion_t->get_key_name() to the recycle_log_id_t
 recycle_log_id_t IDFreeList::assign_id(recycle_log_id_t id, const std::string &key) //throw(std::bad_alloc)
 {
-  dout(10) << "IFL::("<<this<<")"<< __func__ << " id=" << id << " key="<< key<< dendl;
+  dout(10) << __func__ << " id=" << id << " key=" << key << dendl;
   ceph_assert(p_recovery_mode);
   // make sure we got enough space
   if (id >= p_size) {
@@ -122,7 +119,7 @@ recycle_log_id_t IDFreeList::assign_id(const std::string &key) //throw(std::bad_
   if (itr != p_map.end()) {
     recycle_log_id_t id = itr->second;
     ceph_assert(p_key_vec[id] == &itr->first);
-    dout(10) << "IFL::("<<this<<")"<< __func__ << " key="<< key<< "already exists mapped to id=" << id<< dendl;
+    dout(10) << __func__ << " key=" << key << "already exists mapped to id=" << id << dendl;
     return id;
   }
 
@@ -147,7 +144,7 @@ recycle_log_id_t IDFreeList::assign_id(const std::string &key) //throw(std::bad_
 
     p_map[key] = id;
 
-    dout(10) << "IFL::("<<this<<")"<< __func__ << " key="<< key<< " id=" << id<< dendl;
+    dout(10) << __func__ << " key=" << key << " id=" << id << dendl;
     create_reverse_mapping(id , key);      
     return id;
   } else {
@@ -158,14 +155,15 @@ recycle_log_id_t IDFreeList::assign_id(const std::string &key) //throw(std::bad_
  
 //----------------------------------------------
 recycle_log_id_t IDFreeList::release_id(const std::string &key) {
-  ceph_assert(p_free_count < p_size);
   recycle_log_id_t id;
   auto itr = p_map.find(key);
   if (itr != p_map.end()) {
     id = itr->second;
-    dout(10) << "IFL(remove)::"<< __func__ << " key="<< key<< ", recycle_id=" << id << dendl;
+    dout(10) << __func__ << " key=" << key << ", recycle_id=" << id << dendl;
+    ceph_assert(p_free_count < p_size);
   } else {
-    dout(10) << "IFL(remove)::"<< __func__ << " key="<< key<< " **Does Not Exist**" << dendl;
+    dout(10) << __func__ << " key=" << key << " **Does Not Exist**" << dendl;
+    ceph_assert(p_free_count <= p_size);
     return NULL_ID;
   }
     
@@ -196,7 +194,7 @@ recycle_log_id_t IDFreeList::release_id(const std::string &key) {
 // initialize array and link unused entries after recovery
 //----------------------------------------------
 void IDFreeList::link_empty_entries(void) {
-  dout(1) << "IFL::"<< __func__ << dendl;
+  dout(1) << __func__ << dendl;
   p_free_count = 0;
   // find the first unused entry and assign it to p_head
   for (p_head = 0; p_head < p_size; p_head++) {
@@ -227,9 +225,9 @@ void IDFreeList::link_empty_entries(void) {
 }
 
 //----------------------------------------------
-void IDFreeList::grow(unsigned size_to_grow) //throw(std::bad_alloc)
+void IDFreeList::grow(size_t size_to_grow) //throw(std::bad_alloc)
 {
-  dout(1) << "IFL::"<< __func__ << " size_to_grow="<< size_to_grow<< dendl;
+  dout(1) << __func__ << " size_to_grow=" << size_to_grow << dendl;
   recycle_log_id_t old_size = p_size;
   p_size += size_to_grow;
   p_id_vec. resize(p_size);
