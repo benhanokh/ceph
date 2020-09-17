@@ -1393,6 +1393,18 @@ public:
     std::set<std::string> *log_keys_debug
     );
 
+  //----------------------------------------------------------------------------------
+  static void log_add_key(IDFreeList &ifl, const std::string &log_id_string, int offset, const std::string &key_name)
+  {
+    try {
+      recycle_log_id_t log_id = stoi(log_id_string.substr(offset, string::npos));
+      ifl.assign_id(log_id, key_name);
+    }
+    catch (exception &err) {
+      lgeneric_subdout(ifl.m_cct, osd, 0) << __func__ << "IFL::<exception> - log_id_string is not a legal int - [" << log_id_string << "]" << dendl;
+    }
+  }
+  
   void read_log_and_missing(
     ObjectStore *store,
     ObjectStore::CollectionHandle& ch,
@@ -1488,8 +1500,7 @@ public:
 	  // The recycle id keys are much shorter than the old keys
 	  // We are limited to 10 digits plus 4 bytes for the "dup_" 
 	  if (p->key().length() <= ifl.MAX_RECYCLE_ID_LENGTH) {
-	    recycle_log_id_t log_id = stoi(p->key().substr(4, string::npos));
-	    ifl.assign_id(log_id, dup.get_key_name());
+	    log_add_key(ifl, p->key(), 4, dup.get_key_name());
 	  }
 
 	  dups.push_back(dup);
@@ -1506,8 +1517,7 @@ public:
 	  lgeneric_subdout(ifl.m_cct, osd, 5) << "IFL::"<< __func__ << p->key() << dendl;
 	  // The recycle id keys are much shorter than the old keys
 	  if (p->key().length() <= ifl.MAX_RECYCLE_ID_LENGTH) {
-	    recycle_log_id_t log_id = stoi(p->key());
-	    ifl.assign_id(log_id, e.get_key_name());
+	    log_add_key(ifl, p->key(), 0, e.get_key_name());
 	  }
 
 	  entries.push_back(e);
