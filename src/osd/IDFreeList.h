@@ -17,7 +17,11 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#if 1
 #include "include/ceph_assert.h"
+#else
+struct CephContext;
+#endif
 
 using recycle_log_id_t = int32_t;
 using recycle_logmap_t = std::unordered_map<std::string, recycle_log_id_t>;
@@ -35,6 +39,7 @@ public:
   recycle_log_id_t   assign_id(recycle_log_id_t id, const std::string &key);
   recycle_log_id_t   assign_id(const std::string &key);
   recycle_log_id_t   release_id(const std::string &key);
+  void               scrub();
 
   recycle_logmap_t::const_iterator cbegin() const noexcept {
     return p_map.begin();
