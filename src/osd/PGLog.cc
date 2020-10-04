@@ -829,6 +829,12 @@ void PGLog::_write_log_and_missing(
   bool *may_include_deletes_in_missing_dirty, // in/out param
   set<string> *log_keys_debug
   ) {
+  lgeneric_subdout(cct, osd, 10) << "SNGL_RMV::["<<coll.pool() << "] "
+				 << "; log-size=" << log.log.size() << ", dups-size=" << log.dups.size()
+				 << " || "<< trimmed.size() << " || " << trimmed_dups.size() << dendl;
+
+
+  
   set<string> to_remove;
   to_remove.swap(trimmed_dups);
   for (auto& t : trimmed) {
@@ -954,10 +960,10 @@ void PGLog::_write_log_and_missing(
   }
 
   if (!to_remove.empty()) {
-    lgeneric_subdout(cct, osd, 10) << "SNGL_RMV(1)::" << __func__ << "::" << dendl;
+    lgeneric_subdout(cct, osd, 10) << "SNGL_RMV(1)" << __func__ << "::Trim PGLog" << dendl;
     int counter = 0;
     for (auto& key : to_remove) {
-      lgeneric_subdout(cct, osd, 10) << "[" << counter++ << "]SNGL_RMV(1)::(" << coll.pool() << ")::remove trimmed key "<< key <<dendl;
+      lgeneric_subdout(cct, osd, 10)<<"[" << counter++ << "]SNGL_RMV(1)::(" << coll.pool() << ")::remove trimmed key "<< key <<dendl;
       //t.omap_single_rmkey(coll, log_oid, key);
     }
     t.omap_single_rmkeys(coll, log_oid, to_remove);
