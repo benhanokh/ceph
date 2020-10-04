@@ -626,7 +626,7 @@ void PGLog::write_log_and_missing(
 	     << ", trimmed_dups: " << trimmed_dups
 	     << ", clear_divergent_priors: " << clear_divergent_priors
 	     << dendl;
-    _write_log_and_missing(
+    _write_log_and_missing(cct,
       t, km, log, coll, log_oid,
       dirty_to,
       dirty_from,
@@ -667,6 +667,7 @@ void PGLog::write_log_and_missing_wo_missing(
 
 // static
 void PGLog::write_log_and_missing(
+    CephContext *cct,
     ObjectStore::Transaction& t,
     map<string,bufferlist> *km,
     pg_log_t &log,
@@ -676,7 +677,7 @@ void PGLog::write_log_and_missing(
     bool require_rollback,
     bool *may_include_deletes_in_missing_dirty)
 {
-  _write_log_and_missing(
+  _write_log_and_missing(cct,
     t, km, log, coll, log_oid,
     eversion_t::max(),
     eversion_t(),
@@ -808,6 +809,7 @@ void PGLog::_write_log_and_missing_wo_missing(
 
 // static
 void PGLog::_write_log_and_missing(
+  CephContext *cct,
   ObjectStore::Transaction& t,
   map<string,bufferlist>* km,
   pg_log_t &log,
@@ -951,8 +953,15 @@ void PGLog::_write_log_and_missing(
       (*km)["rollback_info_trimmed_to"]);
   }
 
-  if (!to_remove.empty())
-    t.omap_rmkeys(coll, log_oid, to_remove);
+  if (!to_remove.empty()) {
+    lgeneric_subdout(cct, osd, 10) << "SNGL_RMV(1)::" << __func__ << "::" << dendl;
+    int counter = 0;
+    for (auto& key : to_remove) {
+      lgeneric_subdout(cct, osd, 10) << "[" << counter++ << "]SNGL_RMV(1)::(" << coll.pool() << ")::remove trimmed key "<< key <<dendl;
+      //t.omap_single_rmkey(coll, log_oid, key);
+    }
+    t.omap_single_rmkeys(coll, log_oid, to_remove);
+  }
 }
 
 void PGLog::rebuild_missing_set_with_deletes(

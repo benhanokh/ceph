@@ -1414,13 +1414,18 @@ void RocksDBStore::RocksDBTransactionImpl::rmkey(const string &prefix,
   }
 }
 
-void RocksDBStore::RocksDBTransactionImpl::rm_single_key(const string &prefix,
+void RocksDBStore::RocksDBTransactionImpl::rm_single_key(/*CephContext *cct,*/
+							 const string &prefix,
 					                 const string &k)
 {
+  // lgeneric_dout(cct, 10) << "SNGL_RMV::" << __func__ << ":: prefix=" << prefix << ", key=" << k << dendl;
   auto cf = db->get_cf_handle(prefix, k);
   if (cf) {
+    //lgeneric_dout(cct, 10) << "SNGL_RMV::" << __func__ << ":: cf=" << cf << ", key=" << k << dendl;
     bat.SingleDelete(cf, k);
+    //bat.Delete(cf, rocksdb::Slice(k));
   } else {
+    //lgeneric_dout(cct, 10) << "SNGL_RMV::" << __func__ << ":: default-cf=" << db->default_cf << ", key=" << k << dendl;
     bat.SingleDelete(db->default_cf, combine_strings(prefix, k));
   }
 }
