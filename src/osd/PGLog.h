@@ -1337,7 +1337,6 @@ public:
     bool require_rollback);
 
   static void write_log_and_missing(
-    CephContext *cct,
     ObjectStore::Transaction& t,
     std::map<std::string,ceph::buffer::list>* km,
     pg_log_t &log,

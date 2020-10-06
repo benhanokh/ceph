@@ -667,7 +667,6 @@ void PGLog::write_log_and_missing_wo_missing(
 
 // static
 void PGLog::write_log_and_missing(
-    CephContext *cct,
     ObjectStore::Transaction& t,
     map<string,bufferlist> *km,
     pg_log_t &log,
