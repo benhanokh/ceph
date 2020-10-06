@@ -756,10 +756,12 @@ log_remove_key(
   lgeneric_subdout(ifl.m_cct, osd, 10) << "IFL::(" << &ifl << ")" << __func__ << ": eversion=" << key << dendl;
   if (ifl.release_id(key) != ifl.NULL_ID) {
     // key belongs to the recycle_id DB and should not be removed from disk
-    return;
+    //return;
+    lgeneric_subdout(ifl.m_cct, osd, 10) << "IFL::(" << &ifl << ")" << __func__ << "::New Format key > remove from RockDB!" << dendl;
   }
-
-  lgeneric_subdout(ifl.m_cct, osd, 10) << "IFL::(" << &ifl << ")" << __func__ << "::Old Format key > remove from RockDB!" << dendl;
+  else {
+    lgeneric_subdout(ifl.m_cct, osd, 10) << "IFL::(" << &ifl << ")" << __func__ << "::Old Format key > remove from RockDB!" << dendl;
+  }
   // if arrived here the key belongs to an entry in the old format -> remove it from disk
   t.omap_rmkey(coll, log_oid, key);
 }
