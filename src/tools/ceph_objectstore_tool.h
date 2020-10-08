@@ -16,7 +16,7 @@
 #define CEPH_OBJECTSTORE_TOOL_H_
 
 #include "RadosDump.h"
-
+#include "osd/IDFreeList.h"
 class ObjectStoreTool : public RadosDump
 {
   public:
@@ -26,11 +26,11 @@ class ObjectStoreTool : public RadosDump
 
     int dump_export(Formatter *formatter);
     int do_import(ObjectStore *store, OSDSuperblock& sb, bool force,
-		  std::string pgidstr);
+		  std::string pgidstr, IDFreeList & ifl);
     int do_export(ObjectStore *fs, coll_t coll, spg_t pgid,
           pg_info_t &info, epoch_t map_epoch, __u8 struct_ver,
           const OSDSuperblock& superblock,
-          PastIntervals &past_intervals);
+		  PastIntervals &past_intervals, IDFreeList & ifl);
     int dump_object(Formatter *formatter,
 				bufferlist &bl);
     int get_object(

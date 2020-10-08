@@ -2717,7 +2717,7 @@ TEST_F(PGLogTrimTest, TestPartialTrim)
   log.add(mk_ple_dt_rb(mk_obj(5), mk_evt(21, 167), mk_evt(31, 166)));
 
   std::set<eversion_t> trimmed;
-  std::set<std::string> trimmed_dups;
+  std::set<eversion_t> trimmed_dups;
   eversion_t write_from_dups = eversion_t::max();
 
   log.trim(cct, mk_evt(19, 157), &trimmed, &trimmed_dups, &write_from_dups);
@@ -2731,7 +2731,7 @@ TEST_F(PGLogTrimTest, TestPartialTrim)
   SetUp(15);
 
   std::set<eversion_t> trimmed2;
-  std::set<std::string> trimmed_dups2;
+  std::set<eversion_t> trimmed_dups2;
   eversion_t write_from_dups2 = eversion_t::max();
 
   log.trim(cct, mk_evt(20, 164), &trimmed2, &trimmed_dups2, &write_from_dups2);
@@ -2784,7 +2784,7 @@ TEST_F(PGLogTrimTest, TestTrimNoDups)
   log.add(mk_ple_dt_rb(mk_obj(5), mk_evt(21, 167), mk_evt(31, 166)));
 
   std::set<eversion_t> trimmed;
-  std::set<std::string> trimmed_dups;
+  std::set<eversion_t> trimmed_dups;
   eversion_t write_from_dups = eversion_t::max();
 
   log.trim(cct, mk_evt(19, 157), &trimmed, &trimmed_dups, &write_from_dups);
@@ -2812,7 +2812,7 @@ TEST_F(PGLogTrimTest, TestNoTrim)
   log.add(mk_ple_dt_rb(mk_obj(5), mk_evt(21, 167), mk_evt(31, 166)));
 
   std::set<eversion_t> trimmed;
-  std::set<std::string> trimmed_dups;
+  std::set<eversion_t> trimmed_dups;
   eversion_t write_from_dups = eversion_t::max();
 
   log.trim(cct, mk_evt(9, 99), &trimmed, &trimmed_dups, &write_from_dups);
@@ -2841,7 +2841,7 @@ TEST_F(PGLogTrimTest, TestTrimAll)
   log.add(mk_ple_dt_rb(mk_obj(5), mk_evt(21, 167), mk_evt(31, 166)));
 
   std::set<eversion_t> trimmed;
-  std::set<std::string> trimmed_dups;
+  std::set<eversion_t> trimmed_dups;
   eversion_t write_from_dups = eversion_t::max();
 
   log.trim(cct, mk_evt(22, 180), &trimmed, &trimmed_dups, &write_from_dups);

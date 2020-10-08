@@ -36,6 +36,7 @@
 #include "osd/PGLog.h"
 #include "osd/OSD.h"
 #include "osd/PG.h"
+#include "osd/IDFreeList.h"
 #include "osd/ECUtil.h"
 
 #include "json_spirit/json_spirit_value.h"
@@ -432,7 +433,7 @@ static int get_fd_data(int fd, bufferlist &bl)
 
 int get_log(ObjectStore *fs, __u8 struct_ver,
 	    spg_t pgid, const pg_info_t &info,
-	    PGLog::IndexedLog &log, pg_missing_t &missing)
+	    PGLog::IndexedLog &log, pg_missing_t &missing, IDFreeList & ifl)
 {
   try {
     auto ch = fs->open_collection(coll_t(pgid));
@@ -444,7 +445,7 @@ int get_log(ObjectStore *fs, __u8 struct_ver,
     PGLog::read_log_and_missing(
       fs, ch,
       pgid.make_pgmeta_oid(),
-      info, log, missing,
+      info, ifl, log, missing,
       oss,
       g_ceph_context->_conf->osd_ignore_stale_divergent_priors);
     if (debug && oss.str().size())
@@ -600,7 +601,7 @@ typedef map<eversion_t, hobject_t> divergent_priors_t;
 int write_pg(ObjectStore::Transaction &t, epoch_t epoch, pg_info_t &info,
 	     pg_log_t &log, PastIntervals &past_intervals,
 	     divergent_priors_t &divergent,
-	     pg_missing_t &missing)
+	     pg_missing_t &missing, IDFreeList & ifl)
 {
   cout << __func__ << " epoch " << epoch << " info " << info << std::endl;
   int ret = write_info(t, epoch, info, past_intervals);
@@ -612,12 +613,12 @@ int write_pg(ObjectStore::Transaction &t, epoch_t epoch, pg_info_t &info,
   if (!divergent.empty()) {
     ceph_assert(missing.get_items().empty());
     PGLog::write_log_and_missing_wo_missing(
-      t, &km, log, coll, info.pgid.make_pgmeta_oid(), divergent, true);
+      t, &km, ifl, log, coll, info.pgid.make_pgmeta_oid(), divergent, true);
   } else {
     pg_missing_tracker_t tmissing(missing);
     bool rebuilt_missing_set_with_deletes = missing.may_include_deletes;
     PGLog::write_log_and_missing(
-      t, &km, log, coll, info.pgid.make_pgmeta_oid(), tmissing, true,
+      t, &km, ifl, log, coll, info.pgid.make_pgmeta_oid(), tmissing, true,
       &rebuilt_missing_set_with_deletes);
   }
   t.omap_setkeys(coll, info.pgid.make_pgmeta_oid(), km);
@@ -995,14 +996,14 @@ int add_osdmap(ObjectStore *store, metadata_section &ms)
 int ObjectStoreTool::do_export(ObjectStore *fs, coll_t coll, spg_t pgid,
     pg_info_t &info, epoch_t map_epoch, __u8 struct_ver,
     const OSDSuperblock& superblock,
-    PastIntervals &past_intervals)
+    PastIntervals &past_intervals, IDFreeList & ifl)
 {
   PGLog::IndexedLog log;
   pg_missing_t missing;
 
   cerr << "Exporting " << pgid << " info " << info << std::endl;
 
-  int ret = get_log(fs, struct_ver, pgid, info, log, missing);
+  int ret = get_log(fs, struct_ver, pgid, info, log, missing, ifl);
   if (ret > 0)
       return ret;
 
@@ -1680,7 +1681,7 @@ int ObjectStoreTool::dump_export(Formatter *formatter)
 }
 
 int ObjectStoreTool::do_import(ObjectStore *store, OSDSuperblock& sb,
-			       bool force, std::string pgidstr)
+			       bool force, std::string pgidstr, IDFreeList & ifl)
 {
   bufferlist ebl;
   pg_info_t info;
@@ -1968,7 +1969,8 @@ int ObjectStoreTool::do_import(ObjectStore *store, OSDSuperblock& sb,
       newlog,
       ms.past_intervals,
       ms.divergent_priors,
-      ms.missing);
+      ms.missing,
+      ifl);
     if (ret) return ret;
   }
 
@@ -3558,6 +3560,10 @@ int main(int argc, char **argv)
     }
     return 0;
   }
+
+  const ceph::common::CephContext *occt = cct->get();
+  IDFreeList ifl(cct->_conf->osd_min_pg_log_entries, (ceph::common::CephContext*)occt);
+  
   if (op == "dup") {
     string target_type;
     char fn[PATH_MAX];
@@ -3793,7 +3799,7 @@ int main(int argc, char **argv)
   if (op == "import") {
     ceph_assert(superblock != nullptr);
     try {
-      ret = tool.do_import(fs, *superblock, force, pgidstr);
+      ret = tool.do_import(fs, *superblock, force, pgidstr, ifl);
     }
     catch (const buffer::error &e) {
       cerr << "do_import threw exception error " << e.what() << std::endl;
@@ -4296,12 +4302,14 @@ int main(int argc, char **argv)
       ret = -EFAULT;
       goto out;
     }
+
+    
     if (debug)
       cerr << "struct_v " << (int)struct_ver << std::endl;
 
     if (op == "export" || op == "export-remove") {
       ceph_assert(superblock != nullptr);
-      ret = tool.do_export(fs, coll, pgid, info, map_epoch, struct_ver, *superblock, past_intervals);
+      ret = tool.do_export(fs, coll, pgid, info, map_epoch, struct_ver, *superblock, past_intervals, ifl);
       if (ret == 0) {
         cerr << "Export successful" << std::endl;
         if (op == "export-remove") {
@@ -4320,7 +4328,7 @@ int main(int argc, char **argv)
     } else if (op == "log") {
       PGLog::IndexedLog log;
       pg_missing_t missing;
-      ret = get_log(fs, struct_ver, pgid, info, log, missing);
+      ret = get_log(fs, struct_ver, pgid, info, log, missing, ifl);
       if (ret < 0)
           goto out;
 
