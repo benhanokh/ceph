@@ -774,12 +774,18 @@ log_remove_dirty_to(
   const ghobject_t         &log_oid,
   IDFreeList               &ifl,
   pg_log_t                 &log,
-  const eversion_t         &dirty_to)
+  const eversion_t         &dirty_to,
+  set<string>              *to_remove)
 {
   for (auto p = log.log.begin();
        p != log.log.end() && p->version <= dirty_to;
        ++p) {
-    log_remove_key(t, coll, log_oid, ifl, p->get_key_name());
+    if (to_remove != nullptr) {
+      to_remove->insert(p->get_key_name());
+    }
+    else {
+      log_remove_key(t, coll, log_oid, ifl, p->get_key_name());
+    }
   }
 }
 
@@ -791,12 +797,18 @@ dups_remove_dirty_to(
   const ghobject_t         &log_oid,
   IDFreeList               &ifl,
   pg_log_t                 &log,
-  const eversion_t         &dirty_to)
+  const eversion_t         &dirty_to,
+  set<string>              *to_remove)
 {
   for (auto p = log.dups.begin();
        p != log.dups.end() && p->version <= dirty_to;
        ++p) {
-    log_remove_key(t, coll, log_oid, ifl, p->get_key_name());
+    if (to_remove != nullptr) {
+      to_remove->insert(p->get_key_name());
+    }
+    else {
+      log_remove_key(t, coll, log_oid, ifl, p->get_key_name());
+    }
   }
 }
 
@@ -808,12 +820,18 @@ log_remove_dirty_from(
   const ghobject_t         &log_oid,
   IDFreeList               &ifl,
   pg_log_t                 &log,
-  const eversion_t         &dirty_from)
+  const eversion_t         &dirty_from,
+  set<string>              *to_remove)
 {
   for (auto p = log.log.rbegin();
        p != log.log.rend() && p->version >= dirty_from;
        ++p) {
-    log_remove_key(t, coll, log_oid, ifl, p->get_key_name());
+    if (to_remove != nullptr) {
+      to_remove->insert(p->get_key_name());
+    }
+    else {
+      log_remove_key(t, coll, log_oid, ifl, p->get_key_name());
+    }
   }
 }
 
@@ -825,12 +843,18 @@ dups_remove_dirty_from(
   const ghobject_t         &log_oid,
   IDFreeList               &ifl,
   pg_log_t                 &log,
-  const eversion_t         &dirty_from)
+  const eversion_t         &dirty_from,
+  set<string>              *to_remove)
 {
   for (auto p = log.dups.rbegin();
        p != log.dups.rend() && p->version >= dirty_from;
        ++p) {
-    log_remove_key(t, coll, log_oid, ifl, p->get_key_name());
+    if (to_remove != nullptr) {
+      to_remove->insert(p->get_key_name());
+    }
+    else {
+      log_remove_key(t, coll, log_oid, ifl, p->get_key_name());
+    }
   }
 }
 
@@ -861,11 +885,11 @@ void PGLog::_write_log_and_missing_wo_missing(
   if (touch_log)
     t.touch(coll, log_oid);
   if (dirty_to != eversion_t()) {
-    log_remove_dirty_to(t, coll, log_oid, ifl, log, dirty_to);
+    log_remove_dirty_to(t, coll, log_oid, ifl, log, dirty_to, nullptr);
     clear_up_to(log_keys_debug, dirty_to.get_key_name());
   }
   if (dirty_to != eversion_t::max() && dirty_from != eversion_t::max()) {
-    log_remove_dirty_from(t, coll, log_oid, ifl, log, dirty_from);
+    log_remove_dirty_from(t, coll, log_oid, ifl, log, dirty_from, nullptr);
     clear_after(log_keys_debug, dirty_from.get_key_name());
   }
 
@@ -897,10 +921,10 @@ void PGLog::_write_log_and_missing_wo_missing(
   // process dups after log_keys_debug is filled, so dups do not
   // end up in that set
   if (dirty_to_dups != eversion_t()) {
-    dups_remove_dirty_to(t, coll, log_oid, ifl, log, dirty_to_dups);
+    dups_remove_dirty_to(t, coll, log_oid, ifl, log, dirty_to_dups, nullptr);
   }
   if (dirty_to_dups != eversion_t::max() && dirty_from_dups != eversion_t::max()) {
-    dups_remove_dirty_from(t, coll, log_oid, ifl, log, dirty_from_dups);
+    dups_remove_dirty_from(t, coll, log_oid, ifl, log, dirty_from_dups, nullptr);
   }
 
   for (const auto& entry : log.dups) {
@@ -956,8 +980,8 @@ void PGLog::_write_log_and_missing(
   bool *may_include_deletes_in_missing_dirty, // in/out param
   set<string> *log_keys_debug
   ) {
-  lgeneric_subdout(ifl.m_cct, osd, 5)<<"IFL("<<coll.pool()<<"):: " << log_oid.hobj.to_str() <<":: "
-				     <<(dirty_to != eversion_t()) <<"; "<<(dirty_from != eversion_t::max()) <<"; "<<(writeout_from != eversion_t::max()) 
+  lgeneric_subdout(ifl.m_cct, osd, 5)<<"IFLXXX("<<coll.pool()<<"):: " << log_oid.hobj.to_str() <<":: "
+ 				     <<(dirty_to != eversion_t()) <<"; "<<(dirty_from != eversion_t::max()) <<"; "<<(writeout_from != eversion_t::max()) 
 				     <<"; log-size="<<log.log.size()<<", dups-size="<<log.dups.size()
 				     <<" || "<<trimmed.size() << " || "<< trimmed_dups.size() <<dendl;
 
@@ -969,11 +993,11 @@ void PGLog::_write_log_and_missing(
     t.touch(coll, log_oid);
   
   if (dirty_to != eversion_t()) {
-    log_remove_dirty_to(t, coll, log_oid, ifl, log, dirty_to);
+    log_remove_dirty_to(t, coll, log_oid, ifl, log, dirty_to, &to_remove);
     clear_up_to(log_keys_debug, dirty_to.get_key_name());
   }
   if (dirty_to != eversion_t::max() && dirty_from != eversion_t::max()) {
-    log_remove_dirty_from(t, coll, log_oid, ifl, log, dirty_from);
+    log_remove_dirty_from(t, coll, log_oid, ifl, log, dirty_from, &to_remove);
     clear_after(log_keys_debug, dirty_from.get_key_name());
   }
 
@@ -1005,11 +1029,11 @@ void PGLog::_write_log_and_missing(
   // process dups after log_keys_debug is filled, so dups do not
   // end up in that set
   if (dirty_to_dups != eversion_t()) {
-    dups_remove_dirty_to(t, coll, log_oid, ifl, log, dirty_to_dups);
+    dups_remove_dirty_to(t, coll, log_oid, ifl, log, dirty_to_dups, &to_remove);
   }
 
   if (dirty_to_dups != eversion_t::max() && dirty_from_dups != eversion_t::max()) {
-    dups_remove_dirty_from(t, coll, log_oid, ifl, log, dirty_from_dups);
+    dups_remove_dirty_from(t, coll, log_oid, ifl, log, dirty_from_dups, &to_remove);
   }
 
   for (const auto& entry : log.dups) {
@@ -1060,10 +1084,13 @@ void PGLog::_write_log_and_missing(
   }
 
   if (!to_remove.empty()) {
+    t.omap_rmkeys(coll, log_oid, to_remove);
+#if 0
     for (auto& s : to_remove) {
       lgeneric_subdout(ifl.m_cct, osd, 5)<<"::IFLXX::("<<coll.pool()<<")::remove trimmed key "<< s <<dendl;
       log_remove_key(t, coll, log_oid, ifl, s);
     }
+#endif
   }
 }
 
