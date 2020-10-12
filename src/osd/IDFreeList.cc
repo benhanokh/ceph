@@ -211,13 +211,8 @@ recycle_log_id_t IDFreeList::release_id(const std::string &key) {
     ceph_assert(p_free_count > 0);
     ceph_assert(p_tail != NULL_ID);
     ceph_assert(p_id_vec[p_tail] == NULL_ID);
-#if 0
     p_id_vec[p_tail] = id;
     p_tail           = id;
-#else
-    p_id_vec[id] = p_head;
-    p_head       = id;
-#endif
   } else {
     ceph_assert(p_tail == NULL_ID);
     ceph_assert(p_free_count == 0);
@@ -225,7 +220,7 @@ recycle_log_id_t IDFreeList::release_id(const std::string &key) {
   }
 
   ceph_assert(p_map.erase(key) == 1);
-  //p_id_vec[id]  = NULL_ID;
+  p_id_vec[id]  = NULL_ID;
   p_key_vec[id] = nullptr;
   p_free_count++;
   return id;
