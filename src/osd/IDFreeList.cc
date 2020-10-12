@@ -246,7 +246,7 @@ void IDFreeList::link_empty_entries(void) {
   if (p_free_count == 0) {
     p_head = p_tail = NULL_ID;
     dout(1) << __func__ << "::No Free entries!!; size=" << p_size << ", free_count=" << p_free_count << ", p_head=" << p_head << dendl;
-    scrub();
+    //scrub();
     return;
   }
 
@@ -264,7 +264,7 @@ void IDFreeList::link_empty_entries(void) {
   p_tail = prev;
   p_id_vec[p_tail] = NULL_ID;
   dout(1) << __func__ << "::size=" << p_size << ", free_count=" << p_free_count << ", p_head=" << p_head << dendl;
-  scrub();
+  //scrub();
 }
 
 //----------------------------------------------
@@ -299,7 +299,7 @@ void IDFreeList::grow(size_t size_to_grow) //throw(std::bad_alloc)
   p_key_vec[p_tail] = nullptr;
   p_free_count += size_to_grow;
 
-  scrub();
+  //scrub();
 }
 
 //----------------------------------------------
