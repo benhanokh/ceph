@@ -756,8 +756,8 @@ log_remove_key(
   lgeneric_subdout(ifl.m_cct, osd, 10) << "IFL::(" << &ifl << ")" << __func__ << ": eversion=" << key << dendl;
   if (ifl.release_id(key) != ifl.NULL_ID) {
     // key belongs to the recycle_id DB and should not be removed from disk
-    //return;
     lgeneric_subdout(ifl.m_cct, osd, 10) << "IFL::(" << &ifl << ")" << __func__ << "::New Format key > remove from RockDB!" << dendl;
+    return;
   }
   else {
     lgeneric_subdout(ifl.m_cct, osd, 10) << "IFL::(" << &ifl << ")" << __func__ << "::Old Format key > remove from RockDB!" << dendl;
@@ -1084,8 +1084,9 @@ void PGLog::_write_log_and_missing(
   }
 
   if (!to_remove.empty()) {
-    t.omap_rmkeys(coll, log_oid, to_remove);
 #if 0
+    t.omap_rmkeys(coll, log_oid, to_remove);
+#else
     for (auto& s : to_remove) {
       lgeneric_subdout(ifl.m_cct, osd, 5)<<"::IFLXX::("<<coll.pool()<<")::remove trimmed key "<< s <<dendl;
       log_remove_key(t, coll, log_oid, ifl, s);
