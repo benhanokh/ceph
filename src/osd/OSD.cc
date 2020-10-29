@@ -2469,6 +2469,14 @@ void OSD::asok_command(
     f->dump_unsigned("newest_map", superblock.newest_map);
     f->dump_unsigned("num_pgs", num_pgs);
     f->close_section();
+  } else if (prefix == "rocksdb_stats_flush"       ||
+	     prefix == "rocksdb_stats_flush_short" ||
+	     prefix == "rocksdb_stats_compaction"  ||
+	     prefix == "rocksdb_stats_compaction_short") {
+    f->open_object_section("rocksdb_stats");
+    f->dump_string( "prefix", prefix );
+    store->show_rocksdb_stats(f, prefix);
+    f->close_section();
   } else if (prefix == "flush_journal") {
     store->flush_journal();
   } else if (prefix == "dump_ops_in_flight" ||
@@ -3689,6 +3697,27 @@ void OSD::final_init()
   int r = admin_socket->register_command("status", asok_hook,
 					 "high-level status of OSD");
   ceph_assert(r == 0);
+
+  r = admin_socket->register_command("rocksdb_stats_flush",
+                                     asok_hook,
+                                     "Display RocksDB flush statistics");
+  ceph_assert(r == 0);
+
+  r = admin_socket->register_command("rocksdb_stats_flush_short",
+                                     asok_hook,
+                                     "Display RocksDB flush statistics (short version)");
+  ceph_assert(r == 0);
+
+  r = admin_socket->register_command("rocksdb_stats_compaction",
+                                     asok_hook,
+                                     "Display RocksDB compaction statistics");
+  ceph_assert(r == 0);
+
+  r = admin_socket->register_command("rocksdb_stats_compaction_short",
+                                     asok_hook,
+                                     "Display RocksDB compaction statistics (short version)");
+  ceph_assert(r == 0);
+
   r = admin_socket->register_command("flush_journal",
                                      asok_hook,
                                      "flush the journal to permanent store");

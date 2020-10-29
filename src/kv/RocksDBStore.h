@@ -18,6 +18,7 @@
 #include "rocksdb/table.h"
 #include "rocksdb/db.h"
 #include "kv/rocksdb_cache/BinnedLRUCache.h"
+#include "RockDBListener.h"
 #include <errno.h>
 #include "common/errno.h"
 #include "common/dout.h"
@@ -70,6 +71,7 @@ extern rocksdb::Logger *create_rocksdb_ceph_logger();
  */
 class RocksDBStore : public KeyValueDB {
   CephContext *cct;
+  RockDBListener *rdl;
   PerfCounters *logger;
   std::string path;
   std::map<std::string,std::string> kv_options;
@@ -101,6 +103,11 @@ public:
 		 uint32_t hash_l, uint32_t hash_h)
       : name(name), shard_cnt(shard_cnt), options(options), hash_l(hash_l), hash_h(hash_h) {}
   };
+
+  //----------------------------------------------------
+  const void show_rocksdb_stats(Formatter *formatter, const std::string_view & prefix) {
+    rdl->show_rocksdb_stats(formatter, prefix);
+  }
 private:
   friend std::ostream& operator<<(std::ostream& out, const ColumnFamily& cf);
 

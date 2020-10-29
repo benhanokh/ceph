@@ -35,7 +35,6 @@ namespace fs = std::experimental::filesystem;
 #include "include/str_map.h"
 #include "KeyValueDB.h"
 #include "RocksDBStore.h"
-
 #include "common/debug.h"
 
 #define dout_context cct
@@ -906,13 +905,17 @@ int RocksDBStore::do_open(ostream &out,
       }
       default_cf = db->DefaultColumnFamily();
     } else {
+      rocksdb::DBOptions dbopt(opt);
+      rdl = new RockDBListener(cct);
+      dbopt.listeners.emplace_back(rdl);
+      
       std::vector<rocksdb::ColumnFamilyHandle*> handles;
       if (open_readonly) {
-        status = rocksdb::DB::OpenForReadOnly(rocksdb::DBOptions(opt),
+        status = rocksdb::DB::OpenForReadOnly(dbopt,
 				              path, existing_cfs,
 					      &handles, &db);
       } else {
-        status = rocksdb::DB::Open(rocksdb::DBOptions(opt),
+        status = rocksdb::DB::Open(dbopt,
 				   path, existing_cfs, &handles, &db);
       }
       if (!status.ok()) {

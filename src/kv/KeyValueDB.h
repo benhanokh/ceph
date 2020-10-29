@@ -162,6 +162,9 @@ public:
     return submit_transaction(t);
   }
 
+  virtual const void show_rocksdb_stats(Formatter *formatter, const std::string_view & prefix) {}
+
+  
   /// Retrieve Keys
   virtual int get(
     const std::string &prefix,               ///< [in] Prefix/CF for key

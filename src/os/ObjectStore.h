@@ -112,6 +112,7 @@ public:
    */
   virtual const PerfCounters* get_perf_counters() const = 0;
 
+  virtual const void show_rocksdb_stats(Formatter *formatter, const std::string_view & prefix) {}
   /**
    * a collection also orders transactions
    *
@@ -145,7 +146,8 @@ public:
 
     const coll_t &get_cid() {
       return cid;
-    }
+    }    
+
   protected:
     CollectionImpl() = delete;
     CollectionImpl(CephContext* cct, const coll_t& c) : RefCountedObject(cct), cid(c) {}

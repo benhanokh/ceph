@@ -2041,6 +2041,11 @@ public:
   };
 
   // --------------------------------------------------------
+  const void show_rocksdb_stats(Formatter *formatter, const std::string_view & prefix) {
+    db->show_rocksdb_stats(formatter, prefix);
+  }
+  
+  // --------------------------------------------------------
   // members
 private:
   BlueFS *bluefs = nullptr;
