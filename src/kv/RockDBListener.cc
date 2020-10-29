@@ -85,6 +85,7 @@ void RockDBListener::OnFlushBegin(rocksdb::DB* db, const rocksdb::FlushJobInfo& 
   gettimeofday(&now, 0);
   uint32_t msec_diff = (now.tv_sec - t_stat.last_time.tv_sec) * 1000;
   msec_diff += (now.tv_usec - t_stat.last_time.tv_usec)/1000;
+  t_stat.last_time = now;
   
   t_stat.accum_msec += msec_diff;
   t_stat.min_msec    = std::min(t_stat.min_msec, msec_diff);
@@ -178,8 +179,8 @@ int RockDBListener::dump_flush_info_row(unsigned cf_id, char *s, unsigned n) {
   rdl_time_stats & t_stat = info.time_stat; 
   if (info.cf_name == nullptr)  return -1;
 
-  int offset = snprintf(s, n, "[%u]%7s::flush_count=%u, num_entries=%lu, num_deletions=%lu::time_msec{min=%u, max=%u, avg=%u}::",
-			cf_id, info.cf_name->c_str(), info.flush_cnt, info.num_entries, info.num_deletions,
+  int offset = snprintf(s, n, "[%u]%7s::flush_count=%u::time_msec{min=%u, max=%u, avg=%u}::",
+			cf_id, info.cf_name->c_str(), info.flush_cnt,
 			t_stat.min_msec, t_stat.max_msec, (uint32_t)(t_stat.accum_msec/info.flush_cnt));
 
   dout(2) << __func__ << "::" << s << dendl;
@@ -208,17 +209,23 @@ void RockDBListener::show_rocksdb_flush_stats(Formatter *f, bool short_output) {
   f->open_object_section("rocksdb_flush_stats");
   char buffer[4<<10];
   for (unsigned i = 0; i < CF_COUNT_MAX; i++) {
-    if (m_fcf_info[i].cf_name != nullptr) {
-      dout(2) << __func__ << "[" << i << "]" << m_fcf_info[i].cf_name << dendl;
+    rdl_fcf_info & info = m_fcf_info[i];
+    if (info.cf_name != nullptr) {
+      dout(2) << __func__ << "[" << i << "]" << info.cf_name << dendl;
       memset( buffer, 0, sizeof(buffer) );
       int n = dump_flush_info_row(i, buffer, sizeof(buffer) -1);
       if (n>0) {
 	dout(2) << "dump buffer" << dendl;
 	dout(2) << buffer << dendl;
 	f->dump_string( "cf", buffer);
+	int offset = snprintf(buffer, sizeof(buffer)-1, "[num_entries=%lu, avg_num_entries=%lu] [num_deletions=%lu, avg_num_deletions=%lu]",
+			      info.table_properties.num_entries,   info.num_entries/info.flush_cnt,
+			      info.table_properties.num_deletions, info.num_deletions/info.flush_cnt);
+	buffer[offset]='\0';
+	f->dump_string( "cf", buffer);	
       }
       if (short_output == false) {
-	f->dump_string("TableProperties", m_fcf_info[i].table_properties.ToString());
+	f->dump_string("TableProperties", info.table_properties.ToString());
       }
     }
   }
@@ -314,8 +321,8 @@ void RockDBListener::OnFlushCompleted(rocksdb::DB* db, const rocksdb::FlushJobIn
   }
   rdl_fcf_info   & cf_info = m_fcf_info[id];
 
-  cf_info.num_entries   = fji.table_properties.num_entries;
-  cf_info.num_deletions = fji.table_properties.num_deletions;
+  cf_info.num_entries   += fji.table_properties.num_entries;
+  cf_info.num_deletions += fji.table_properties.num_deletions;
   dout(2) << "::num_entries=" << cf_info.num_entries << ", num_deletions=" << cf_info.num_deletions << dendl;
 
   cf_info.table_properties = fji.table_properties;
