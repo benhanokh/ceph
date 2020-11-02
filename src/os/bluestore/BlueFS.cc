@@ -3582,7 +3582,7 @@ uint8_t OriginalVolumeSelector::select_prefer_bdev(void* hint)
 void OriginalVolumeSelector::get_paths(const std::string& base, paths& res) const
 {
   res.emplace_back(base, db_total);
-  res.emplace_back(base + ".slow", slow_total);
+  //res.emplace_back(base + ".slow", slow_total);
 }
 
 #undef dout_prefix

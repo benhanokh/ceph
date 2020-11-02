@@ -701,7 +701,8 @@ int RocksDBStore::create_shards(const rocksdb::Options& opt,
       status = db->CreateColumnFamily(cf_opt, cf_name, &cf);
       if (!status.ok()) {
 	derr << __func__ << " Failed to create rocksdb column family: "
-	     << cf_name << dendl;
+	     << cf_name << " " << status.getState() << dendl;
+	//<< cf_name << dendl;
 	return -EINVAL;
       }
       // store the new CF handle
@@ -803,6 +804,18 @@ int RocksDBStore::verify_sharding(const rocksdb::Options& opt,
 	   << column.name << "': " << column.options << dendl;
       return -EINVAL;
     }
+    if (column.name == "P") {
+      cf_opt.compaction_options_fifo.allow_compaction = false;
+      cf_opt.compaction_options_fifo.max_table_files_size = 32 << 20;
+    }
+#ifdef NEW_BLOOMFILTER
+    // change bloom filter bits from 10 to 1
+    if (column.name == "P") {
+      auto x = bbt_opts;
+      x.filter_policy.reset(rocksdb::NewBloomFilterPolicy(1));
+      cf_opt.table_factory.reset(rocksdb::NewBlockBasedTableFactory(x));
+    }
+#endif
     install_cf_mergeop(column.name, &cf_opt);
 
     if (column.shard_cnt == 1) {
@@ -2870,7 +2883,8 @@ int RocksDBStore::prepare_for_reshard(const std::string& new_sharding,
     status = db->CreateColumnFamily(cf_opt, full_name, &cf);
     if (!status.ok()) {
       derr << __func__ << " Failed to create rocksdb column family: "
-	   << full_name << dendl;
+	//<< full_name << dendl;
+	   << full_name << " " << status.getState() << dendl;
       return -EINVAL;
     }
     dout(10) << "created column " << full_name << " handle = " << (void*)cf << dendl; 

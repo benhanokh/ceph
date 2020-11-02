@@ -63,6 +63,7 @@ struct rdl_fcf_info {
   uint32_t         flush_cnt;
   uint64_t         num_entries;
   uint64_t         num_deletions;
+  uint64_t         data_size;
   rdl_time_stats   time_stat;
   uint32_t         reason[FLUSH_REASON_ARR_SIZE];
   rocksdb::TableProperties  table_properties;

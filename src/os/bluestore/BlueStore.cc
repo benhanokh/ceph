@@ -15910,7 +15910,7 @@ uint8_t RocksDBBlueFSVolumeSelector::select_prefer_bdev(void* h) {
 void RocksDBBlueFSVolumeSelector::get_paths(const std::string& base, paths& res) const
 {
   res.emplace_back(base, l_totals[LEVEL_DB - LEVEL_FIRST]);
-  res.emplace_back(base + ".slow", l_totals[LEVEL_SLOW - LEVEL_FIRST]);
+  //res.emplace_back(base + ".slow", l_totals[LEVEL_SLOW - LEVEL_FIRST]);
 }
 
 void* RocksDBBlueFSVolumeSelector::get_hint_by_dir(const string& dirname) const {
