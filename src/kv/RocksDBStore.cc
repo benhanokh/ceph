@@ -804,11 +804,13 @@ int RocksDBStore::verify_sharding(const rocksdb::Options& opt,
 	   << column.name << "': " << column.options << dendl;
       return -EINVAL;
     }
+#ifdef NEW_BLOOMFILTER
+    // change fifo compaction size from default 1GB to 32MB
     if (column.name == "P") {
       cf_opt.compaction_options_fifo.allow_compaction = false;
       cf_opt.compaction_options_fifo.max_table_files_size = 32 << 20;
     }
-#ifdef NEW_BLOOMFILTER
+
     // change bloom filter bits from 10 to 1
     if (column.name == "P") {
       auto x = bbt_opts;
