@@ -1287,6 +1287,10 @@ int RocksDBStore::submit_common(rocksdb::WriteOptions& woptions, KeyValueDB::Tra
   RocksDBTransactionImpl * _t =
     static_cast<RocksDBTransactionImpl *>(t.get());
   woptions.disableWAL = disableWAL;
+#ifdef PERF_TESTING_DISABLE_WAL
+  woptions.disableWAL = true;
+  woptions.sync       = false;
+#endif
   lgeneric_subdout(cct, rocksdb, 30) << __func__;
   RocksWBHandler bat_txc(*this);
   _t->bat.Iterate(&bat_txc);
@@ -2998,7 +3002,11 @@ int RocksDBStore::reshard(const std::string& new_sharding, const RocksDBStore::r
     dout(10) << "flushing batch, " << keys_in_batch << " keys, for "
              << bytes_in_batch << " bytes" << dendl;
     rocksdb::WriteOptions woptions;
+#ifdef PERF_TESTING_DISABLE_WAL
+    woptions.disableWAL =  TRUE;
+#else
     woptions.sync = true;
+#endif
     rocksdb::Status s = db->Write(woptions, batch);
     ceph_assert(s.ok());
     bytes_in_batch = 0;

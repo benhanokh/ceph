@@ -14510,6 +14510,15 @@ int BlueStore::_omap_clear(TransContext *txc,
   return r;
 }
 
+bool is_pglog_entry(const std::string& key) {
+  //const char* path = "";
+  //lderr(g_ceph_context) << "key=" << key << dendl;
+  if (key.find("0000")==0 || key.find("dup_") == 0)
+    return true;
+  else
+    return false;
+}
+
 int BlueStore::_omap_setkeys(TransContext *txc,
 			     CollectionRef& c,
 			     OnodeRef& o,
@@ -14549,7 +14558,15 @@ int BlueStore::_omap_setkeys(TransContext *txc,
     final_key += key;
     dout(20) << __func__ << "  " << pretty_binary_string(final_key)
 	     << " <- " << key << dendl;
+#ifdef PERF_TESTING_SPLIT_CF
+    if (prefix=="P" && !is_pglog_entry(key)) {
+      txc->t->set("Q", final_key, value);
+    } else {
+      txc->t->set(prefix, final_key, value);
+    }
+#else
     txc->t->set(prefix, final_key, value);
+#endif
   }
   r = 0;
   dout(10) << __func__ << " " << c->cid << " " << o->oid << " = " << r << dendl;
@@ -14614,7 +14631,15 @@ int BlueStore::_omap_rmkeys(TransContext *txc,
       final_key += key;
       dout(20) << __func__ << "  rm " << pretty_binary_string(final_key)
 	       << " <- " << key << dendl;
+#ifdef PERF_TESTING_SPLIT_CF
+      if (prefix=="P" && !is_pglog_entry(key)) {
+        txc->t->rmkey("Q", final_key);
+      } else {
+	txc->t->rmkey(prefix, final_key);
+      }
+#else
       txc->t->rmkey(prefix, final_key);
+#endif
     }
   }
   txc->note_modified_object(o);

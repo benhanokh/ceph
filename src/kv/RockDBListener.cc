@@ -148,7 +148,7 @@ void RockDBListener::show_rocksdb_flush_stats(Formatter *f, bool short_output) {
 	dout(1) << "dump buffer" << dendl;
 	dout(1) << buffer << dendl;
 	f->dump_string( "cf", buffer);
-	int offset = snprintf(buffer, sizeof(buffer)-1, "[curr_data_size=%lu, avg_data_size=%lu] [curr_num_entries=%lu, avg_num_entries=%lu] [curr_num_deletions=%lu, avg_num_deletions=%lu]",
+	int offset = snprintf(buffer, sizeof(buffer)-1, "           [curr_data_size=%lu, avg_data_size=%lu] [curr_num_entries=%lu, avg_num_entries=%lu] [curr_num_deletions=%lu, avg_num_deletions=%lu]",
 			      info.table_properties.data_size,     info.data_size/info.flush_cnt,
 			      info.table_properties.num_entries,   info.num_entries/info.flush_cnt,
 			      info.table_properties.num_deletions, info.num_deletions/info.flush_cnt);
@@ -171,7 +171,7 @@ void RockDBListener::show_rocksdb_compaction_stats(Formatter *f, bool short_outp
     const rdl_ccf_info & ccf_info = m_ccf_info[cf_id];
     if (ccf_info.cf_name != nullptr) {
       dout(1) << __func__ << "[" << cf_id << "]" << *ccf_info.cf_name << ":: compaction_count=" << ccf_info.compaction_cnt << dendl;
-      f->dump_unsigned("compaction_count", ccf_info.compaction_cnt);
+      f->dump_unsigned(*ccf_info.cf_name, ccf_info.compaction_cnt);
 
       for (unsigned reason = 0; reason < COMPACTION_REASON_ARR_SIZE; reason++) {
 	if (ccf_info.reason[reason] == 0) {
