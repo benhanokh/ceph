@@ -841,7 +841,7 @@ int BlueFS::maybe_verify_layout(const bluefs_layout_t& layout) const
 
 void BlueFS::umount(bool avoid_compact)
 {
-  dout(1) << __func__ << dendl;
+  dout(1) << __func__ << "::NCB" << dendl;
 
   sync_metadata(avoid_compact);
 
@@ -2618,14 +2618,17 @@ int BlueFS::_flush_and_sync_log(std::unique_lock<ceph::mutex>& l,
       /* OK, now we have the guarantee alloc[i] won't be null. */
       int r = 0;
       if (cct->_conf->bdev_enable_discard && cct->_conf->bdev_async_discard) {
+	ceph_assert(bdev[i] != nullptr);
 	r = bdev[i]->queue_discard(to_release[i]);
 	if (r == 0)
 	  continue;
       } else if (cct->_conf->bdev_enable_discard) {
+	ceph_assert(bdev[i] != nullptr);
 	for (auto p = to_release[i].begin(); p != to_release[i].end(); ++p) {
 	  bdev[i]->discard(p.get_start(), p.get_len());
 	}
       }
+      ceph_assert(alloc[i] != nullptr);
       alloc[i]->release(to_release[i]);
       if (is_shared_alloc(i)) {
         shared_alloc->bluefs_used -= to_release[i].size();
@@ -2811,11 +2814,13 @@ int BlueFS::_flush_range(FileWriter *h, uint64_t offset, uint64_t length)
     uint64_t x_len = std::min(p->length - x_off, length);
     bufferlist t;
     t.substr_of(bl, bloff, x_len);
+    //(reverse PR 34109 (Optimizing the lock of bluestore writing process) which led to a deadlock)
     if (cct->_conf->bluefs_sync_write) {
       bdev[p->bdev]->write(p->offset + x_off, t, buffered, h->write_hint);
     } else {
       bdev[p->bdev]->aio_write(p->offset + x_off, t, h->iocv[p->bdev], buffered, h->write_hint);
     }
+    //(reverse PR 34109 (Optimizing the lock of bluestore writing process) which led to a deadlock)
     h->dirty_devs[p->bdev] = true;
     if (p->bdev == BDEV_SLOW) {
       bytes_written_slow += t.length();
@@ -3093,11 +3098,14 @@ int BlueFS::_allocate(uint8_t id, uint64_t len,
               << ", allocated 0x" << (alloc_len > 0 ? alloc_len : 0)
 	      << std::dec << dendl;
     }
-
+    else {
+      dout(1) << __func__ << "::NCB::NULL-ALLOCATOR on index="<< (int)id << " unable to allocate 0x" << std::hex << need
+	      << " on bdev " << (int)id << std::dec << dendl;
+    }
     if (id != BDEV_SLOW) {
-      dout(20) << __func__ << " fallback to bdev "
-               << (int)id + 1
-	       << dendl;
+      dout(10) << __func__ << "::NCB:: fallback to bdev "
+	      << (int)id + 1
+	      << dendl;
       return _allocate(id + 1, len, node);
     } else {
       derr << __func__ << " allocation failed, needed 0x" << std::hex << need
