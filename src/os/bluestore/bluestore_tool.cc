@@ -312,6 +312,7 @@ int main(int argc, char **argv)
         "fsck, "
         "qfsck, "
         "allocmap, "
+        "restore_cfb, "
         "repair, "
         "quick-fix, "
         "bluefs-export, "
@@ -364,7 +365,7 @@ int main(int argc, char **argv)
     exit(EXIT_FAILURE);
   }
     
-  if (action == "fsck" || action == "repair" || action == "quick-fix" || action == "allocmap" || action == "qfsck") {
+  if (action == "fsck" || action == "repair" || action == "quick-fix" || action == "allocmap" || action == "qfsck" || action == "restore_cfb") {
     if (path.empty()) {
       cerr << "must specify bluestore path" << std::endl;
       exit(EXIT_FAILURE);
@@ -507,8 +508,25 @@ int main(int argc, char **argv)
 			 CINIT_FLAG_NO_DEFAULT_CONFIG_FILE);
 
   common_init_finish(cct.get());
-  
-  if( action == "allocmap" ) {
+
+  if (action == "restore_cfb") {
+#ifndef CEPH_BLUESTORE_TOOL_RESTORE_ALLOCATION
+    cerr << action << " bluestore.restore_cfb is not supported!!! " << std::endl;
+    exit(EXIT_FAILURE);
+#else
+    cout << action << " bluestore.restore_cfb" << std::endl;
+    validate_path(cct.get(), path, false);
+    BlueStore bluestore(cct.get(), path);
+    int r = bluestore.push_allocation_to_rocksdb();
+    if (r < 0) {
+      cerr << action << " failed: " << cpp_strerror(r) << std::endl;
+      exit(EXIT_FAILURE);
+    } else {
+      cout << action << " success" << std::endl;
+    }
+#endif
+  }
+  else if (action == "allocmap") {
 #ifndef CEPH_BLUESTORE_TOOL_RESTORE_ALLOCATION
     cerr << action << " bluestore.allocmap is not supported!!! " << std::endl;
     exit(EXIT_FAILURE);

@@ -5305,7 +5305,7 @@ void BlueStore::_close_bdev()
   bdev = NULL;
 }
 
-int BlueStore::_open_fm(KeyValueDB::Transaction t, bool read_only)
+int BlueStore::_open_fm(KeyValueDB::Transaction t, bool read_only, bool fm_restore)
 {
   int r;
 
@@ -5345,13 +5345,16 @@ int BlueStore::_open_fm(KeyValueDB::Transaction t, bool read_only)
     }
 #endif
     fm->create(bdev->get_size(), alloc_size, t);
-
-    // allocate superblock reserved space.  note that we do not mark
-    // bluefs space as allocated in the freelist; we instead rely on
-    // bluefs doing that itself.
     auto reserved = _get_ondisk_reserved();
-    fm->allocate(0, reserved, t);
-
+    if (fm_restore) {
+      fm->allocate(0, bdev->get_size(), t);
+    }
+    else {
+      // allocate superblock reserved space.  note that we do not mark
+      // bluefs space as allocated in the freelist; we instead rely on
+      // bluefs doing that itself.
+      fm->allocate(0, reserved, t);
+    }
     // debug code - not needed for NULL FM
     if (cct->_conf->bluestore_debug_prefill > 0 && !fm->is_null_manager() ) {
       uint64_t end = bdev->get_size() - reserved;
@@ -5503,13 +5506,38 @@ int BlueStore::commit_to_null_manager()
   return db->submit_transaction_sync(t);
 }    
 
+
+//-------------------------------------------------------------------------------------
+int BlueStore::commit_to_real_manager()
+{
+  dout(1) << __func__ << "::NCB::Set FreelistManager to Real FM..." << dendl;
+  ceph_assert(!fm->is_null_manager()); 
+  freelist_type = "bitmap";
+  
+  // When allocation-info is stored in a single file we set freelist_type to "null"
+  // This will direct the startup code to read allocation from file and not RocksDB  
+  KeyValueDB::Transaction t = db->get_transaction();
+  if (t == nullptr) {
+    derr << __func__ << "::NCB::db->get_transaction() failed!!!" << dendl;
+    return -1;
+  }
+  
+  {
+    bufferlist bl;
+    bl.append("bitmap");
+    ceph_assert(t);
+    t->set(PREFIX_SUPER, "freelist_type", bl);
+  }
+  ceph_assert(t);
+  return db->submit_transaction_sync(t);
+}
+
 int BlueStore::_init_alloc(bool read_only)
 {
   int r = _create_alloc();
   if (r < 0) {
     return r;
   }
-  dout(1) << __func__ << "::NCB::shared_alloc.a=" << shared_alloc.a << dendl;
   ceph_assert(shared_alloc.a != NULL);
 
 #ifdef HAVE_LIBZBD
@@ -5525,13 +5553,10 @@ int BlueStore::_init_alloc(bool read_only)
 #endif
   
   uint64_t num = 0, bytes = 0;
-
-  dout(1) << __func__ << " opening allocation metadata" << dendl;
-
   utime_t start_time = ceph_clock_now();
   // This is the original path - loading allocation map from RocksDB and feeding into the allocator
   if (!fm->is_null_manager()) {
-    dout(1) << __func__ << "::NCB::fm->enumerate_next" << dendl;
+    dout(1) << __func__ << "::NCB::loading allocation from FM -> shared_alloc" << dendl;
     // initialize from freelist
     fm->enumerate_reset();
     uint64_t offset, length;
@@ -6013,11 +6038,8 @@ int BlueStore::_open_db_and_around(bool read_only, bool to_repair)
   // load allocated extents from bluefs into allocator.
   // And now it's time to do that
   //
-  dout(0) << __func__ << "::NCB::calling _close_db() read_only=" << read_only << dendl;
   _close_db(true);
-  dout(0) << __func__ << "::NCB::calling _open_db() read_only=" << read_only << dendl;
   r = _open_db(false, to_repair, read_only);
-  dout(0) << __func__ << "::NCB::after _open_db() ret=" << r << dendl;
   if (r < 0) {
     goto out_alloc;
   }
@@ -6759,7 +6781,7 @@ int BlueStore::add_new_bluefs_device(int id, const string& dev_path)
     derr << __func__ << " bluefs isn't configured, can't add new device " << dendl;
     return -EIO;
   }
-  dout(0) << __func__ << "::NCB::calling open_db_and_around()" << dendl;
+  dout(0) << __func__ << "::NCB::calling open_db_and_around(read-only)" << dendl;
   r = _open_db_and_around(true);
 
   if (id == BlueFS::BDEV_NEWWAL) {
@@ -7113,8 +7135,7 @@ void BlueStore::set_cache_shards(unsigned num)
 
 int BlueStore::_mount()
 {
-  dout(0) << __func__ << "::NCB::entered" << dendl;
-  dout(1) << __func__ << " path " << path << dendl;
+  dout(1) << __func__ << "NCB:: path " << path << dendl;
   _kv_only = false;
   if (cct->_conf->bluestore_fsck_on_mount) {
     dout(0) << __func__ << "::NCB::calling fsck()" << dendl;
@@ -7125,6 +7146,16 @@ int BlueStore::_mount()
       derr << __func__ << " fsck found " << rc << " errors" << dendl;
       return -EIO;
     }
+
+#if 1
+    // force allocation check to exercise recovery code
+    dout(1) << __func__ << "::NCB::calling read_allocation_from_drive_for_fsck()" << dendl;
+    if (read_allocation_from_drive_for_fsck() != 0) {
+      derr << __func__ << "::NCB::Failed read_allocation_from_drive_for_fsck()" << dendl;
+      return -1;
+    }
+#endif
+
   }
 
   if (cct->_conf->osd_max_object_size > OBJECT_MAX_SIZE) {
@@ -7134,7 +7165,7 @@ int BlueStore::_mount()
     return -EINVAL;
   }
 
-  dout(0) << __func__ << "::NCB::calling open_db_and_around()" << dendl;
+  dout(0) << __func__ << "::NCB::calling open_db_and_around(read/write)" << dendl;
   int r = _open_db_and_around(false);
   if (r < 0) {
     return r;
@@ -7176,7 +7207,7 @@ int BlueStore::_mount()
     auto was_per_pool_omap = per_pool_omap;
 
     dout(1) << __func__ << " quick-fix on mount" << dendl;
-    dout(0) << __func__ << "::NCB::calling fsck_on_open()" << dendl;
+    dout(0) << __func__ << "::NCB::calling fsck_on_open(FSCK_SHALLOW)" << dendl;
     _fsck_on_open(FSCK_SHALLOW, true);
 
     //reread statfs
@@ -7545,35 +7576,13 @@ int BlueStore::store_allocator(Allocator* src_allocator)
     return -1;
   }
 
-  //unique_ptr<Allocator> allocator = create_allocator(bdev->get_size(), "bitmap");
-  Allocator *allocator = create_allocator(bdev->get_size(), "bitmap");
-  if (allocator == nullptr) {
-    derr << __func__ << "::NCB::****failed create_allocator()" << dendl;
-    return -1;
-  }
-  
-  uint64_t num_entries = 0;
-  dout(1) << __func__ << "::NCB calling copy_allocator(shared_alloc.a -> bitmap_allocator)" << dendl;  
-  ret = copy_allocator(src_allocator, allocator, &num_entries);
-  if (ret != 0) {
-    delete allocator; return ret;
-  }
-  
   uint64_t file_size = p_handle->file->fnode.size;
   uint64_t allocated = p_handle->file->fnode.get_allocated();
   dout(1) << __func__ << "::NCB(2)::file_size=" << file_size << ", allocated=" << allocated << ",p_handle->pos="<< p_handle->pos<< dendl;
-
-  // BlueFS stores its internal allocation outside RocksDB (FM) so we should not destage them to the allcoator-file
-  // we are going to hide bluefs allocation during allocator-destage as they are stored elsewhere
-  {
-    std::vector<extent_t> bluefs_extents_vec;
-    // load current bluefs internal allocation into a vector
-    load_bluefs_extents(bluefs, &bluefs_layout, cct, path, bluefs_extents_vec, min_alloc_size);
-    // then remove them from the shared allocator before dumping it to disk (bluefs stored them internally)
-    for (auto itr = bluefs_extents_vec.begin(); itr != bluefs_extents_vec.end(); ++itr) {
-      //dout(0) << __func__ << "::NCB::remove bluefs entry from allocator[" << key << ", " << val << "]" << dendl;
-      allocator->init_add_free(itr->offset, itr->length);
-    }
+  
+  Allocator *allocator = clone_allocator_without_bluefs(src_allocator);
+  if (allocator == nullptr) {
+    return -1;
   }
 
   // store all extents (except for the bluefs extents we removed) in a single flat file
@@ -8363,71 +8372,234 @@ int BlueStore::read_allocation_from_drive_for_bluestore_tool(bool test_store_and
   _close_db_and_around(false);
   return ret;
 }
-#endif // CEPH_BLUESTORE_TOOL_RESTORE_ALLOCATION
 
-#if 0
+#if 1
 //---------------------------------------------------------
-int BlueStore::push_allocation_to_rocksdb()
-{  
-  dout(0) << __func__ << "::NCB::calling open_db_and_around() in read/write mode" << dendl;
-  ret = _open_db_and_around(false);
-  if (ret < 0) {
-    return ret;
-  }
-
-  if (!fm->is_null_manager()) {
-    derr << __func__ << "::NCB This is not a NULL-MANAGER -> nothing to do..." << dendl;
-    return 0;
-  }
-
-  if (coll_map.empty()) {
-    dout(1) << __func__ << "::NCB calling open_collection()" << dendl;
-    ret = _open_collections();
-    if (ret < 0) {
-      _close_db_and_around(false); return ret;
-    }
-  }
-  else {
-    dout(1) << __func__ << "::NCB collection already open" << dendl;
-  }
-
-  // First remove all objects of PREFIX_ALLOC_BITMAP from RocksDB
-  {
-    KeyValueDB::Transaction t = db->get_transaction();
-    t->rmkeys_by_prefix(PREFIX_ALLOC_BITMAP)
-    db->submit_transaction(t);
-  }
-  
-  ;
-  // create real fm with zero free-space
-  FreelistManager *real_fm = FreelistManager::create(cct, "bitmap", PREFIX_ALLOC);
-
-
-  uint64_t idx = 0, size = 0;
-  KeyValueDB::Transaction txn = db->get_transaction();
-  auto iterated_insert = [&](uint64_t offset, uint64_t length) {
-    //std::cout << "[" << idx2 << "]<" << offset << "," << length << ">" << std::endl;
-    size2 += length;
-    real_fm->release(offset, length, txn);
-    if ((++idx % 64) == 0) {
-      db->submit_transaction_sync(txn);
-      txn = db->get_transaction();
-    }
-  };
-  shared_alloc.a->dump(iterated_insert);
-  db->submit_transaction_sync(txn);
-
-  // commit to non-null-fm!!!
-  ...;
-
-  
-  //out_db:
+int BlueStore::db_cleanup(int ret)
+{
   _shutdown_cache();
   _close_db_and_around(false);
   return ret;
 }
+
+//---------------------------------------------------------
+Allocator* BlueStore::clone_allocator_without_bluefs(Allocator *src_allocator)
+{
+  uint64_t   bdev_size = bdev->get_size();
+  Allocator* allocator = create_allocator(bdev_size, "bitmap");
+  if (allocator) {
+    dout(1) << __func__ << "::NCB::bitmap-allocator=" << allocator << dendl;
+  }
+  else {
+    derr << __func__ << "::NCB::****failed create_allocator()" << dendl;
+    return nullptr;
+  }
+
+  uint64_t num_entries = 0;
+  dout(1) << __func__ << "::NCB calling copy_allocator(shared_alloc.a -> bitmap_allocator)" << dendl;  
+  copy_allocator(src_allocator, allocator, &num_entries);
+  
+  // BlueFS stores its internal allocation outside RocksDB (FM) so we should not destage them to the allcoator-file
+  // we are going to hide bluefs allocation during allocator-destage as they are stored elsewhere
+  {
+    std::vector<extent_t> bluefs_extents_vec;
+    // load current bluefs internal allocation into a vector
+    load_bluefs_extents(bluefs, &bluefs_layout, cct, path, bluefs_extents_vec, min_alloc_size);
+    // then remove them from the shared allocator before dumping it to disk (bluefs stored them internally)
+    for (auto itr = bluefs_extents_vec.begin(); itr != bluefs_extents_vec.end(); ++itr) {
+      allocator->init_add_free(itr->offset, itr->length);
+    }
+  }
+
+  return allocator;
+}
+
+//---------------------------------------------------------
+static void clear_allocation_objects_from_rocksdb(KeyValueDB *db, CephContext *cct, const std::string &path)
+{
+  dout(1) << __func__ << "::NCB t->rmkeys_by_prefix(PREFIX_ALLOC_BITMAP)" << dendl;  
+  KeyValueDB::Transaction t = db->get_transaction();
+  t->rmkeys_by_prefix(PREFIX_ALLOC_BITMAP);
+  db->submit_transaction_sync(t);
+}
+
+//---------------------------------------------------------
+void BlueStore::copy_allocator_content_to_fm(Allocator *allocator, FreelistManager *real_fm)
+{
+  unsigned max_txn = 16;
+  dout(1) << __func__ << "::NCB:: max_transaction_submit=" << max_txn << dendl; 
+  uint64_t size = 0, idx = 0;
+  KeyValueDB::Transaction txn = db->get_transaction();
+  auto iterated_insert = [&](uint64_t offset, uint64_t length) {
+    size += length;
+    real_fm->release(offset, length, txn);
+    if ((++idx % max_txn) == 0) {
+      db->submit_transaction_sync(txn);
+      txn = db->get_transaction();
+    }
+  };
+  allocator->dump(iterated_insert);
+  if (idx % max_txn != 0) {
+    db->submit_transaction_sync(txn);
+  }
+  dout(1) << __func__ << "::NCB::size=" << size << ", num extents=" << idx  << dendl;  
+}
+
+//---------------------------------------------------------
+Allocator* BlueStore::initialize_allocator_from_freelist(FreelistManager *real_fm)
+{
+  dout(1) << __func__ << "::NCB::real_fm->enumerate_next" << dendl;
+#if 1
+  Allocator* allocator2 = create_allocator(bdev->get_size(), "bitmap");
+  if (allocator2) {
+    dout(1) << __func__ << "::NCB::bitmap-allocator=" << allocator2 << dendl;
+  }
+  else {
+    return nullptr;
+  }
+#endif
+  
+  uint64_t size2 = 0, idx2 = 0; 
+  real_fm->enumerate_reset();
+  uint64_t offset, length;
+  while (real_fm->enumerate_next(db, &offset, &length)) {
+    //std::cout << "NCB::enumerate_next::[" << idx2 << "]<" << offset << "," << length << ">" << std::endl;
+    allocator2->init_add_free(offset, length);
+    ++idx2;
+    size2 += length;
+  }
+  real_fm->enumerate_reset();
+
+  dout(1) << __func__ << "::NCB::size2=" << size2 << ", num2=" << idx2 << dendl;
+  return allocator2;
+}
+
+//---------------------------------------------------------
+// close the active fm and open it in a new mode like makefs()
+// but make sure to mark the full device space as allocated
+// later we will mark all exetents from the allocator as free
+int BlueStore::reset_fm_for_restore()
+{
+  dout(1) << __func__ << "::NCB <<==>> fm->clear_null_manager()" << dendl;
+  fm->shutdown();
+  delete fm;
+  fm = nullptr;
+  freelist_type = "bitmap";
+  KeyValueDB::Transaction t = db->get_transaction();
+  // call _open_fm() with fm_restore set to TRUE
+  // this will mark the full device space as allocated (and not just the reserved space)
+  _open_fm(t, true, true);
+  if (fm == nullptr) {
+    derr << __func__ << "::NCB Failed _open_fm()" << dendl;
+    return -1;
+  }
+  db->submit_transaction_sync(t);
+  ceph_assert(!fm->is_null_manager()); 
+  dout(1) << __func__ << "::NCB fm was reactivated in full mode" << dendl;
+  return 0;
+}
+
+
+//---------------------------------------------------------
+// create a temp allocator filled with allocation state from the fm
+// and compare it to the base allocator passed in
+int BlueStore::verify_rocksdb_allocations(Allocator *allocator)
+{
+  dout(1) << __func__ << "::NCB::verify that shared_alloc content is identical to FM" << dendl;
+  // initialize from freelist
+  Allocator* temp_allocator = initialize_allocator_from_freelist(fm);
+  if (temp_allocator == nullptr) {
+    return -1;
+  }
+
+  uint64_t insert_count = 0;
+  auto count_entries = [&](uint64_t extent_offset, uint64_t extent_length) {
+    insert_count++;
+  };
+  temp_allocator->dump(count_entries);
+  uint64_t memory_target = cct->_conf.get_val<Option::size_t>("osd_memory_target");
+  int ret = compare_allocators(allocator, temp_allocator, insert_count, memory_target);
+
+  delete temp_allocator;
+
+  if (ret == 0) {
+    dout(1) << __func__ << "::NCB::SUCCESS!!! compare(allocator, temp_allocator)" << dendl;
+    return 0;
+  }
+  else {
+    derr << __func__ << "::NCB::**** FAILURE compare(allocator, temp_allocator)::ret=" << ret << dendl;
+    return -1;
+  }
+}
+
+//---------------------------------------------------------
+// convert back the system from null-allocator to using rocksdb to store allocation
+int BlueStore::push_allocation_to_rocksdb()
+{
+#if 0
+  if (cct->_conf->bluestore_allocation_from_file) {
+    derr << __func__ << "::NCB cct->_conf->bluestore_allocation_from_file must be cleared first" << dendl;
+    derr << __func__ << "::NCB please change default to false in <src/common/options/global.yaml.in>" << dendl;
+    return -1;
+  }
+#endif
+  dout(0) << __func__ << "::NCB::calling open_db_and_around() in read/write mode" << dendl;
+  int ret = _open_db_and_around(false);
+  if (ret < 0) {
+    return ret;
+  }
+  
+  if (!fm->is_null_manager()) {
+    derr << __func__ << "::NCB This is not a NULL-MANAGER -> nothing to do..." << dendl;
+    return db_cleanup(0);
+  }
+  
+  // start by creating a clone copy of the shared-allocator
+  Allocator *allocator = clone_allocator_without_bluefs(shared_alloc.a);
+  if (allocator == nullptr) {
+    return db_cleanup(-1);
+  }
+
+  // remove all objects of PREFIX_ALLOC_BITMAP from RocksDB to guarantee a clean start
+  clear_allocation_objects_from_rocksdb(db, cct, path);
+
+  // then open fm in new mode with the full devie marked as alloctaed 
+  if (reset_fm_for_restore() != 0) {
+    return db_cleanup(-1);
+  }
+
+  // push the free-space from the allocator (shared-alloc without bfs) to rocksdb
+  copy_allocator_content_to_fm(allocator, fm);  
+
+  // compare the allocator info with the info stored in the fm/rocksdb
+  if (verify_rocksdb_allocations(allocator) == 0) {
+    // all is good -> we can commit to rocksdb allocator
+    commit_to_real_manager();
+  }
+  else {
+    return db_cleanup(-1);
+  }
+
+#if 1
+  // can't be too paranoid :-)
+  dout(0) << __func__ << "::NCB::Running full scale verification..." << dendl;
+  // close db/fm/allocator and start fresh
+  db_cleanup(0);
+  dout(0) << __func__ << "::NCB::calling open_db_and_around() in read-only mode" << dendl;
+  ret = _open_db_and_around(true);
+  if (ret < 0) {
+    delete allocator; return db_cleanup(ret);
+  }
+  ceph_assert(!fm->is_null_manager()); 
+  ceph_assert(verify_rocksdb_allocations(allocator) == 0);
 #endif
 
+  delete allocator;
+  return db_cleanup(ret);
+}
+#endif
+
+#endif // CEPH_BLUESTORE_TOOL_RESTORE_ALLOCATION
 //================================================================================================================
 //================================================================================================================
 
@@ -9550,14 +9722,7 @@ int BlueStore::_fsck(BlueStore::FSCKDepth depth, bool repair)
     << (depth == FSCK_DEEP ? " (deep)" :
       depth == FSCK_SHALLOW ? " (shallow)" : " (regular)")
     << dendl;
-#if 0
-  // force allocation check to exercise recovery code
-  dout(1) << __func__ << "::NCB::calling read_allocation_from_drive_for_fsck()" << dendl;
-  if (read_allocation_from_drive_for_fsck() != 0) {
-    derr << __func__ << "::NCB::Failed read_allocation_from_drive_for_fsck()" << dendl;
-    return -1;
-  }
-#endif
+
   // in deep mode we need R/W write access to be able to replay deferred ops
   bool read_only = !(repair || depth == FSCK_DEEP);
   dout(0) << __func__ << "::NCB::calling open_db_and_around()" << dendl;
