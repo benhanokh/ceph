@@ -66,7 +66,7 @@ class BlueStoreRepairer;
 
 // constants for Buffer::optimize()
 #define MAX_BUFFER_SLOP_RATIO_DEN  8  // so actually 1/N
-//#define CEPH_BLUESTORE_TOOL_RESTORE_ALLOCATION
+#define CEPH_BLUESTORE_TOOL_RESTORE_ALLOCATION
 
 enum {
   l_bluestore_first = 732430,
@@ -2384,7 +2384,7 @@ private:
 	       bool to_repair_db=false,
 	       bool read_only = false);
   void _close_db(bool read_only);
-  int _open_fm(KeyValueDB::Transaction t, bool read_only);
+  int _open_fm(KeyValueDB::Transaction t, bool read_only, bool fm_restore = false);
   void _close_fm();
   int _write_out_fm_meta(uint64_t target_size);
   int _create_alloc();
@@ -3448,6 +3448,7 @@ public:
     std::map<BlobRef, bluestore_blob_t::unused_t>* referenced,
     const BlueStore::FSCK_ObjectCtx& ctx);
 #ifdef CEPH_BLUESTORE_TOOL_RESTORE_ALLOCATION
+  int  push_allocation_to_rocksdb();
   int  read_allocation_from_drive_for_bluestore_tool(bool test_store_and_restore);
   int  read_allocation_from_drive_for_fsck() { return read_allocation_from_drive_for_bluestore_tool(false); }
 #endif
@@ -3528,6 +3529,13 @@ private:
   int  reconstruct_allocations(Allocator* allocator, read_alloc_stats_t &stats);
   int  read_allocation_from_onodes(Allocator* allocator, read_alloc_stats_t& stats);
   int  commit_to_null_manager();
+  int  commit_to_real_manager();
+  int  db_cleanup(int ret);
+  int  reset_fm_for_restore();
+  int  verify_rocksdb_allocations(Allocator *allocator);
+  Allocator* clone_allocator_without_bluefs(Allocator *src_allocator);
+  Allocator* initialize_allocator_from_freelist(FreelistManager *real_fm);
+  void copy_allocator_content_to_fm(Allocator *allocator, FreelistManager *real_fm);
   void read_allocation_from_single_onode(Allocator* allocator, BlueStore::OnodeRef& onode_ref, read_alloc_stats_t&  stats);
 
   void _fsck_check_object_omap(FSCKDepth depth,
