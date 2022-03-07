@@ -18506,6 +18506,8 @@ int BlueStore::store_allocator(Allocator* src_allocator)
     }
   }
 
+  bluefs->compact_log();
+
   // reuse previous file-allocation if exists
   ret = bluefs->stat(allocator_dir, allocator_file, nullptr, nullptr);
   bool overwrite_file = (ret == 0);
@@ -18547,6 +18549,7 @@ int BlueStore::store_allocator(Allocator* src_allocator)
   // create_allocator_snapshot call bluefs->umount() so need to close writer
   bluefs->close_writer(p_handle);
   bluefs->sync_metadata(false);
+
   overwrite_file = true;
   // Get a consistent view of the shared-allocator
   dout(1) << " Calling create_allocator_snapshot" << dendl;
@@ -18662,6 +18665,7 @@ int BlueStore::store_allocator(Allocator* src_allocator)
 Allocator* BlueStore::create_bitmap_allocator(uint64_t bdev_size) {
   // create allocator
   uint64_t alloc_size = min_alloc_size;
+  dout(1) << std::hex << "bdev_size=0x" << bdev_size << ", alloc_size=0x"<< alloc_size << std::dec << dendl;
   Allocator* alloc = Allocator::create(cct, "bitmap", bdev_size, alloc_size,
 				       zone_size, first_sequential_zone,
 				       "recovery");
@@ -18860,15 +18864,16 @@ int BlueStore::__restore_allocator(Allocator* allocator, uint64_t *num, uint64_t
 // we are called from open_db_and_around->init_alloc() when DB is in Read-Only mode
 int BlueStore::restore_allocator(Allocator *dest_allocator, uint64_t *num, uint64_t *bytes)
 {
-  utime_t start      = ceph_clock_now();
-
-  auto    allocator1 = unique_ptr<Allocator>(create_bitmap_allocator(bdev->get_size()));
+  utime_t  start     = ceph_clock_now();
+  uint64_t bdev_size = bdev->get_size();
+  dout(1) << std::hex << "bdev_size=0x" << bdev_size << std::dec << dendl;
+  auto    allocator1 = unique_ptr<Allocator>(create_bitmap_allocator(bdev_size));
   int ret = __restore_allocator(allocator1.get(), num, bytes);
   if (ret != 0) {
     return ret;
   }
 
-  auto    allocator2 = unique_ptr<Allocator>(create_bitmap_allocator(bdev->get_size()));
+  auto    allocator2 = unique_ptr<Allocator>(create_bitmap_allocator(bdev_size));
   if (read_allocation_from_drive_on_startup(allocator2.get()) != 0) {
     derr << __func__ << "::***NCB::Failed Recovery" << dendl;
     ret = -1;
@@ -19174,6 +19179,7 @@ int BlueStore::reconstruct_allocations(SimpleBitmap *sbmap, read_alloc_stats_t &
 {
   // first set space used by superblock
   auto super_length = std::max<uint64_t>(min_alloc_size, SUPER_RESERVED);
+  dout(1) << "super_length=0x" << std::hex << super_length << std::dec << dendl;
   set_allocation_in_simple_bmap(sbmap, 0, super_length);
   stats.extent_count++;
 
@@ -19184,6 +19190,9 @@ int BlueStore::reconstruct_allocations(SimpleBitmap *sbmap, read_alloc_stats_t &
     return ret;
   }
 
+  dout(1) << "extent_count=" << stats.extent_count << dendl;
+  dout(1) << "onode_count =" << stats.onode_count  << dendl;
+  dout(1) << "shard_count =" << stats.shard_count  << dendl;
   return 0;
 }
 
@@ -19192,30 +19201,38 @@ static void copy_simple_bitmap_to_allocator(SimpleBitmap* sbmap, Allocator* dest
 {
   int alloc_size_shift = ctz(alloc_size);
   uint64_t offset = 0;
+
   extent_t ext    = sbmap->get_next_clr_extent(offset);
   while (ext.length != 0) {
     dest_alloc->init_add_free(ext.offset << alloc_size_shift, ext.length << alloc_size_shift);
     offset = ext.offset + ext.length;
-    ext = sbmap->get_next_clr_extent(offset);
+    ext    = sbmap->get_next_clr_extent(offset);
   }
 }
 
 //---------------------------------------------------------
 int BlueStore::read_allocation_from_drive_on_startup(Allocator* dest_allocator)
 {
-  int ret = 0;
+  int  ret = 0;
+  bool need_to_shutdown_cache = false;
 
-  ret = _open_collections();
-  if (ret < 0) {
-    return ret;
+  if (coll_map.empty()) {
+    ret = _open_collections();
+    if (ret < 0) {
+      return ret;
+    }
+    need_to_shutdown_cache =  true;
   }
+
   auto shutdown_cache = make_scope_guard([&] {
-    _shutdown_cache();
+    if (need_to_shutdown_cache) {
+      _shutdown_cache();
+    }
   });
 
   utime_t            start = ceph_clock_now();
   read_alloc_stats_t stats = {};
-  SimpleBitmap       sbmap(cct, div_round_up(bdev->get_size(), min_alloc_size));
+  SimpleBitmap       sbmap(cct, (bdev->get_size() / min_alloc_size));
   ret = reconstruct_allocations(&sbmap, stats);
   if (ret != 0) {
     return ret;
@@ -19368,7 +19385,7 @@ int BlueStore::verify_shared_alloc_against_onodes_allocation_info()
   auto allocator = unique_ptr<Allocator>(create_bitmap_allocator(bdev->get_size()));
   //reconstruct allocations into a temp simple-bitmap and copy into allocator
   {
-    SimpleBitmap sbmap(cct, div_round_up(bdev->get_size(), min_alloc_size));
+    SimpleBitmap sbmap(cct, (bdev->get_size()/ min_alloc_size));
     ret = reconstruct_allocations(&sbmap, stats);
     if (ret != 0) {
       return ret;

@@ -72,7 +72,10 @@ void BitmapAllocator::init_add_free(uint64_t offset, uint64_t length)
   auto mas = get_min_alloc_size();
   uint64_t offs = round_up_to(offset, mas);
   uint64_t l = p2align(offset + length - offs, mas);
-  ceph_assert(offs + l <= (uint64_t)device_size);
+  if (unlikely(offs + l > (uint64_t)device_size)) {
+    ldout(cct, 1) << __func__ << std::hex << "::offs=0x" << offs << ", len=0x" << l << ", dev_size=0x" << device_size << std::dec << dendl;
+    ceph_assert(offs + l <= (uint64_t)device_size);
+  }
 
   _mark_free(offs, l);
   ldout(cct, 10) << __func__ << " done" << dendl;
