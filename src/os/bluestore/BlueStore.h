@@ -3721,6 +3721,9 @@ private:
     return out;
   }
 
+  void verify_allocation_file_against_onodes_allocation_info(Allocator* allocator,
+							     uint64_t   extents_count,
+							     uint64_t   allocation_size);
   int  compare_allocators(Allocator* alloc1, Allocator* alloc2, uint64_t req_extent_count, uint64_t memory_target);
   Allocator* create_bitmap_allocator(uint64_t bdev_size);
   int  add_existing_bluefs_allocation(Allocator* allocator, read_alloc_stats_t& stats);
@@ -3732,7 +3735,7 @@ private:
   int  invalidate_allocation_file_on_bluefs();
   int  __restore_allocator(Allocator* allocator, uint64_t *num, uint64_t *bytes);
   int  restore_allocator(Allocator* allocator, uint64_t *num, uint64_t *bytes);
-  int  read_allocation_from_drive_on_startup();
+  int  read_allocation_from_drive_on_startup(Allocator* dest_allocator);
   int  reconstruct_allocations(SimpleBitmap *smbmp, read_alloc_stats_t &stats);
   int  read_allocation_from_onodes(SimpleBitmap *smbmp, read_alloc_stats_t& stats);
   void read_allocation_from_single_onode(SimpleBitmap *smbmp, BlueStore::OnodeRef& onode_ref, read_alloc_stats_t&  stats);

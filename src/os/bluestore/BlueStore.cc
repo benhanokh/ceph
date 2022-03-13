@@ -5874,7 +5874,7 @@ int BlueStore::_init_alloc(std::map<uint64_t, uint64_t> *zone_adjustments)
       // This must mean that we had an unplanned shutdown and didn't manage to destage the allocator
       dout(0) << __func__ << "::NCB::restore_allocator() failed! Run Full Recovery from ONodes (might take a while) ..." << dendl;
       // if failed must recover from on-disk ONode internal state
-      if (read_allocation_from_drive_on_startup() != 0) {
+      if (read_allocation_from_drive_on_startup(alloc) != 0) {
 	derr << __func__ << "::NCB::Failed Recovery" << dendl;
 	derr << __func__ << "::NCB::Ceph-OSD won't start, make sure your drives are connected and readable" << dendl;
 	derr << __func__ << "::NCB::If no HW fault is found, please report failure and consider redeploying OSD" << dendl;
@@ -18031,19 +18031,23 @@ struct allocator_image_header {
   uint32_t valid_signature;	// 0x04
   utime_t  timestamp;		// 0x08
   uint32_t serial;		// 0x10
-  uint32_t pad[0x7];		// 0x14
+  uint32_t pad[0x3];		// 0x14
+  uint64_t entries_count;	// 0x20
+  uint64_t allocation_size;	// 0x38
 
   allocator_image_header() {
     memset((char*)this, 0, sizeof(allocator_image_header));
   }
 
   // create header in CEPH format
-  allocator_image_header(utime_t timestamp, uint32_t format_version, uint32_t serial) {
+  allocator_image_header(utime_t timestamp, uint32_t format_version, uint32_t serial, uint64_t entries_count, uint64_t allocation_size) {
     this->format_version  = format_version;
     this->timestamp       = timestamp;
     this->valid_signature = ALLOCATOR_IMAGE_VALID_SIGNATURE;
     this->serial          = serial;
     memset(this->pad, 0, sizeof(this->pad));
+    this->entries_count   = entries_count;
+    this->allocation_size = allocation_size;
   }
 
   friend std::ostream& operator<<(std::ostream& out, const allocator_image_header& header) {
@@ -18056,6 +18060,8 @@ struct allocator_image_header {
 	out << "header.pad[" << i << "] = " << header.pad[i] << std::endl;
       }
     }
+    out << "entries_count   = " << header.entries_count   << std::endl;
+    out << "allocation_size = " << header.allocation_size << std::endl;
     return out;
   }
 
@@ -18068,6 +18074,8 @@ struct allocator_image_header {
     for (auto& pad: v.pad) {
       denc(pad, p);
     }
+    denc(v.entries_count, p);
+    denc(v.allocation_size, p);
   }
 
 
@@ -18099,7 +18107,7 @@ struct allocator_image_trailer {
   utime_t  timestamp;		// 0x18
 
   uint32_t serial;		// 0x20
-  uint32_t pad;		// 0x24
+  uint32_t pad;  		// 0x24
   uint64_t entries_count;	// 0x28
   uint64_t allocation_size;	// 0x30
 
@@ -18159,6 +18167,18 @@ struct allocator_image_trailer {
       if (timestamp != p_header->timestamp) {
 	derr << "Illegal trailer: header->timestamp(" << p_header->timestamp
 	     << ") != trailer->timestamp(" << timestamp << ")" << dendl;
+	return -1;
+      }
+
+     if (this->entries_count != p_header->entries_count) {
+	derr << "Illegal trailer: header->entries_count(" << p_header->entries_count << ") != trailer->entries_count("
+	     << this->entries_count << ")" << dendl;
+	return -1;
+      }
+
+      if (this->allocation_size != p_header->allocation_size) {
+	derr << "Illegal trailer: header->allocation_size(" << p_header->allocation_size << ") != trailer->allocation_size("
+	     << this->allocation_size << ")" << dendl;
 	return -1;
       }
 
@@ -18233,13 +18253,12 @@ int BlueStore::invalidate_allocation_file_on_bluefs()
     return -1;
   }
 
-  dout(5) << "invalidate using bluefs->truncate(p_handle, 0)" << dendl;
-  ret = bluefs->truncate(p_handle, 0);
-  if (ret != 0) {
-    derr << "Failed truncate with error-code " << ret << dendl;
-    bluefs->close_writer(p_handle);
-    return -1;
-  }
+  // keep allocation unmodified
+  dout(5) << "invalidate by overwriting with a 4KB zeroed out buffer " << dendl;
+  char buffer[4*1024];
+  // fill buffer with zero to overwrite header and any valid extents
+  memset(buffer, 0, sizeof(buffer));
+  p_handle->append(buffer, sizeof(buffer));
 
   bluefs->fsync(p_handle);
   bluefs->close_writer(p_handle);
@@ -18349,8 +18368,8 @@ int BlueStore::store_allocator(Allocator* src_allocator)
   // when storing allocations to file we must be sure there is no background compactions
   // the easiest way to achieve it is to make sure db is closed
   ceph_assert(db == nullptr);
-  utime_t  start_time = ceph_clock_now();
-  int ret = 0;
+  utime_t start_time = ceph_clock_now();
+  int     ret        = 0;
 
   // create dir if doesn't exist already
   if (!bluefs->dir_exists(allocator_dir) ) {
@@ -18371,10 +18390,6 @@ int BlueStore::store_allocator(Allocator* src_allocator)
     return -1;
   }
 
-  uint64_t file_size = p_handle->file->fnode.size;
-  uint64_t allocated = p_handle->file->fnode.get_allocated();
-  dout(10) << "file_size=" << file_size << ", allocated=" << allocated << dendl;
-
   bluefs->sync_metadata(false);
   unique_ptr<Allocator> allocator(clone_allocator_without_bluefs(src_allocator));
   if (!allocator) {
@@ -18382,11 +18397,18 @@ int BlueStore::store_allocator(Allocator* src_allocator)
     return -1;
   }
 
+  uint64_t extents_count = 0, allocation_size = 0;
+  auto count_extents = [&](uint64_t extent_offset, uint64_t extent_length) {
+    extents_count   ++;
+    allocation_size += extent_length;
+  };
+  allocator->dump(count_extents);
+
   // store all extents (except for the bluefs extents we removed) in a single flat file
   utime_t                 timestamp = ceph_clock_now();
   uint32_t                crc       = -1;
   {
-    allocator_image_header  header(timestamp, s_format_version, s_serial);
+    allocator_image_header  header(timestamp, s_format_version, s_serial, extents_count, allocation_size);
     bufferlist              header_bl;
     encode(header, header_bl);
     crc = header_bl.crc32c(crc);
@@ -18396,20 +18418,20 @@ int BlueStore::store_allocator(Allocator* src_allocator)
 
   crc = -1;					 // reset crc
   extent_t        buffer[MAX_EXTENTS_IN_BUFFER]; // 64KB
-  extent_t       *p_curr          = buffer;
-  const extent_t *p_end           = buffer + MAX_EXTENTS_IN_BUFFER;
-  uint64_t        extent_count    = 0;
-  uint64_t        allocation_size = 0;
+  extent_t       *p_curr           = buffer;
+  const extent_t *p_end            = buffer + MAX_EXTENTS_IN_BUFFER;
+  uint64_t        _extents_count   = 0;
+  uint64_t        _allocation_size = 0;
   auto iterated_allocation = [&](uint64_t extent_offset, uint64_t extent_length) {
     if (extent_length == 0) {
-      derr <<  __func__ << "" << extent_count << "::[" << extent_offset << "," << extent_length << "]" << dendl;
+      derr <<  __func__ << "" << _extents_count << "::[" << extent_offset << "," << extent_length << "]" << dendl;
       ret = -1;
       return;
     }
     p_curr->offset = HTOCEPH_64(extent_offset);
     p_curr->length = HTOCEPH_64(extent_length);
-    extent_count++;
-    allocation_size += extent_length;
+    _extents_count   ++;
+    _allocation_size += extent_length;
     p_curr++;
 
     if (p_curr == p_end) {
@@ -18432,8 +18454,10 @@ int BlueStore::store_allocator(Allocator* src_allocator)
     crc = flush_extent_buffer_with_crc(p_handle, (const char*)buffer, (const char*)p_curr, crc);
   }
 
+  ceph_assert(_extents_count   == extents_count);
+  ceph_assert(_allocation_size == allocation_size);
   {
-    allocator_image_trailer trailer(timestamp, s_format_version, s_serial, extent_count, allocation_size);
+    allocator_image_trailer trailer(timestamp, s_format_version, s_serial, _extents_count, _allocation_size);
     bufferlist trailer_bl;
     encode(trailer, trailer_bl);
     uint32_t crc = -1;
@@ -18443,14 +18467,16 @@ int BlueStore::store_allocator(Allocator* src_allocator)
   }
 
   bluefs->fsync(p_handle);
-  bluefs->truncate(p_handle, p_handle->pos);
-  bluefs->fsync(p_handle);
 
   utime_t duration = ceph_clock_now() - start_time;
-  dout(5) <<"WRITE-extent_count=" << extent_count << ", allocation_size=" << allocation_size << ", serial=" << s_serial << dendl;
-  dout(5) <<"p_handle->pos=" << p_handle->pos << " WRITE-duration=" << duration << " seconds" << dendl;
+  dout(5) <<"WRITE-extent_count=" << _extents_count << ", alloc_size=" << _allocation_size << ", serial=" << s_serial << dendl;
+  dout(5) <<"p_handle->pos=" << p_handle->pos << ", file_size=" << p_handle->file->fnode.size << " WRITE-duration=" << duration << " seconds" << dendl;
 
   bluefs->close_writer(p_handle);
+
+  // increment version for next store
+  s_serial++;
+
   need_to_destage_allocation_file = false;
   return 0;
 }
@@ -18474,7 +18500,7 @@ Allocator* BlueStore::create_bitmap_allocator(uint64_t bdev_size) {
 size_t calc_allocator_image_header_size()
 {
   utime_t                 timestamp = ceph_clock_now();
-  allocator_image_header  header(timestamp, s_format_version, s_serial);
+  allocator_image_header  header(timestamp, s_format_version, s_serial, 0, 0);
   bufferlist              header_bl;
   encode(header, header_bl);
   uint32_t crc = -1;
@@ -18513,7 +18539,6 @@ int BlueStore::__restore_allocator(Allocator* allocator, uint64_t *num, uint64_t
   unique_ptr<BlueFS::FileReader> p_handle(p_temp_handle);
   uint64_t read_alloc_size = 0;
   uint64_t file_size = p_handle->file->fnode.size;
-  dout(5) << "file_size=" << file_size << ",sizeof(extent_t)=" << sizeof(extent_t) << dendl;
 
   // make sure we were able to store a valid copy
   if (file_size == 0) {
@@ -18551,9 +18576,6 @@ int BlueStore::__restore_allocator(Allocator* allocator, uint64_t *num, uint64_t
       derr << "header = \n" << header << dendl;
       return -1;
     }
-
-    // increment version for next store
-    s_serial = header.serial + 1;
   }
 
   // then read the payload (extents list) using a recycled buffer
@@ -18610,7 +18632,7 @@ int BlueStore::__restore_allocator(Allocator* allocator, uint64_t *num, uint64_t
 
   }
 
-  // finally, read teh trailer and verify it is in good shape and that we got all the extents
+  // finally, read the trailer and verify it is in good shape and that we got all the extents
   {
     bufferlist trailer_bl,temp_bl;
     int        read_bytes = bluefs->read(p_handle.get(), offset, trailer_size, &temp_bl, nullptr);
@@ -18650,18 +18672,67 @@ int BlueStore::__restore_allocator(Allocator* allocator, uint64_t *num, uint64_t
 }
 
 //-----------------------------------------------------------------------------------
-int BlueStore::restore_allocator(Allocator* dest_allocator, uint64_t *num, uint64_t *bytes)
+// Function should be called when BlueStore is in READ-Only mode
+// allocator should only hold BlueStore allocation without BlueFS (even on shared-db)
+void BlueStore::verify_allocation_file_against_onodes_allocation_info(Allocator* allocator,
+								      uint64_t   extents_count,
+								      uint64_t   allocation_size)
 {
-  utime_t    start = ceph_clock_now();
-  auto temp_allocator = unique_ptr<Allocator>(create_bitmap_allocator(bdev->get_size()));
-  int ret = __restore_allocator(temp_allocator.get(), num, bytes);
+  dout(5) << __func__ << "::NCB::bluestore_qfsck_on_mount was initiated ... " << dendl;
+  auto allocator2 = unique_ptr<Allocator>(create_bitmap_allocator(bdev->get_size()));
+  int ret = read_allocation_from_drive_on_startup(allocator2.get());
+  if (ret != 0) {
+    return;
+  }
+
+  uint64_t extents_count_rocksdb = 0, allocation_size_rocksdb = 0;
+  auto count_extents = [&](uint64_t extent_offset, uint64_t extent_length) {
+    extents_count_rocksdb   ++;
+    allocation_size_rocksdb += extent_length;
+  };
+  allocator2->dump(count_extents);
+  if (extents_count_rocksdb != extents_count) {
+    derr << "allocator_file::extents_count=" << extents_count << ", RocksDB::extents_count=" << extents_count_rocksdb << dendl;
+  }
+  if (allocation_size_rocksdb != allocation_size) {
+    derr << "allocator_file::allocation_size=" << allocation_size << ", RocksDB::allocation_size=" << allocation_size_rocksdb << dendl;
+  }
+
+  uint64_t memory_target = cct->_conf.get_val<Option::size_t>("osd_memory_target");
+  ret = compare_allocators(allocator, allocator2.get(), extents_count, memory_target);
+  if (ret == 0) {
+    dout(5) << "Allocator drive - file integrity check OK" << dendl;
+  } else {
+    derr << "FAILURE. Allocator from file and allocator from metadata differ::ret=" << ret << dendl;
+    assert(ret == 0);
+  }
+}
+
+//-----------------------------------------------------------------------------------
+// we are called from open_db_and_around->init_alloc() when DB is in Read-Only mode
+int BlueStore::restore_allocator(Allocator* dest_allocator, uint64_t *extents_count, uint64_t *allocation_size)
+{
+  utime_t start     = ceph_clock_now();
+  auto    allocator = unique_ptr<Allocator>(create_bitmap_allocator(bdev->get_size()));
+  int ret = __restore_allocator(allocator.get(), extents_count, allocation_size);
   if (ret != 0) {
     return ret;
   }
 
+  // GBH: REMOVE-ME
+  // Verify that allocation-file content matches RocksDB state
+  // Temporary solution to debug the safe-fast-shutdown
+  // cct->_conf->bluestore_qfsck_on_mount should be changed to false on GA
+  // limit qfsck to the first mount()
+  static bool perform_bluestore_qfsck = true;
+  if (unlikely(perform_bluestore_qfsck && cct->_conf->bluestore_qfsck_on_mount)) {
+    //perform_bluestore_qfsck = false;
+    verify_allocation_file_against_onodes_allocation_info(allocator.get(), *extents_count, *allocation_size);
+  }
+
   uint64_t num_entries = 0;
   dout(5) << " calling copy_allocator(bitmap_allocator -> shared_alloc.a)" << dendl;
-  copy_allocator(temp_allocator.get(), dest_allocator, &num_entries);
+  copy_allocator(allocator.get(), dest_allocator, &num_entries);
   utime_t duration = ceph_clock_now() - start;
   dout(5) << "restored in " << duration << " seconds, num_entries=" << num_entries << dendl;
   return ret;
@@ -18924,16 +18995,23 @@ static void copy_simple_bitmap_to_allocator(SimpleBitmap* sbmap, Allocator* dest
 }
 
 //---------------------------------------------------------
-int BlueStore::read_allocation_from_drive_on_startup()
+int BlueStore::read_allocation_from_drive_on_startup(Allocator* dest_allocator)
 {
-  int ret = 0;
-
-  ret = _open_collections();
-  if (ret < 0) {
-    return ret;
+  int  ret = 0;
+  bool need_to_shutdown_cache = false;
+  // collections could be opened from another path
+  if (coll_map.empty()) {
+    ret = _open_collections();
+    if (ret == 0) {
+      need_to_shutdown_cache = true;
+    } else {
+      return ret;
+    }
   }
   auto shutdown_cache = make_scope_guard([&] {
-    _shutdown_cache();
+    if (need_to_shutdown_cache) {
+      _shutdown_cache();
+    }
   });
 
   utime_t            start = ceph_clock_now();
@@ -18944,7 +19022,7 @@ int BlueStore::read_allocation_from_drive_on_startup()
     return ret;
   }
 
-  copy_simple_bitmap_to_allocator(&sbmap, alloc, min_alloc_size);
+  copy_simple_bitmap_to_allocator(&sbmap, dest_allocator, min_alloc_size);
 
   utime_t duration = ceph_clock_now() - start;
   dout(1) << "::Allocation Recovery was completed in " << duration << " seconds, extent_count=" << stats.extent_count << dendl;

@@ -4305,6 +4305,9 @@ int OSD::shutdown()
   }
 
   if (cct->_conf->osd_fast_shutdown) {
+    // disable BlueFS compaction during fast-shutdown
+    cct->_conf->bluefs_replay_recovery_disable_compact = true;
+
     // first, stop new task from being taken from op_shardedwq
     // and clear all pending tasks
     op_shardedwq.stop_for_fast_shutdown();
