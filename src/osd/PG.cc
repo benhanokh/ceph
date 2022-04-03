@@ -934,6 +934,7 @@ void PG::prepare_write(
   unstable_stats.clear();
   map<string,bufferlist> km;
   string key_to_remove;
+#if 0
   if (dirty_big_info || dirty_info) {
     int ret = prepare_info_keymap(
       cct,
@@ -950,6 +951,7 @@ void PG::prepare_write(
       this);
     ceph_assert(ret == 0);
   }
+#endif
   pglog.write_log_and_missing(
     t, &km, coll, pgmeta_oid, pool.info.require_rollback());
   if (!km.empty())
