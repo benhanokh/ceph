@@ -1312,6 +1312,7 @@ protected:
   // pg on-disk state
   void do_pending_flush();
 
+  bool should_commit_pg_info(bool dirty_big_info, bool dirty_info);
 public:
   void prepare_write(
     pg_info_t &info,

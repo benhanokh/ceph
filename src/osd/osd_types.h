@@ -3090,30 +3090,43 @@ inline std::ostream& operator<<(std::ostream& out, const pg_info_t& pgi)
  * means that we must set an incompat OSD feature bit!
  */
 struct pg_fast_info_t {
-  eversion_t last_update;
-  eversion_t last_complete;
-  version_t last_user_version;
+  // destage the first PG_INFO and then once a second
+  // when doing peering/recovery/backfill must desatge PG-INFO like we do today
+  // write the PG-INFO to RocksDB as the last step before close_db()
+  eversion_t last_update;        // MAX(last_pg_log, pg_info)
+  eversion_t last_complete;      // Always take from PG-INFO
+  version_t last_user_version;   // MAX(last_pg_log, pg_info)
   struct { // pg_stat_t stats
-    eversion_t version;
-    version_t reported_seq;
-    utime_t last_fresh;
-    utime_t last_active;
-    utime_t last_peered;
-    utime_t last_clean;
-    utime_t last_unstale;
-    utime_t last_undegraded;
-    utime_t last_fullsized;
+    eversion_t version;          // MAX(last_pg_log, pg_info)
+
+    version_t reported_seq;      // can query the manager ??
+				 // use the version above + 1000???
+				 // maybe destage pg-info when/before/after reporting to manager
+
+    utime_t last_fresh;          // destage once a second
+    utime_t last_active;         // destage once a second
+    utime_t last_peered;         // destage once a second
+    utime_t last_clean;          // destage once a second
+    utime_t last_unstale;        // destage once a second
+    utime_t last_undegraded;     // destage once a second
+    utime_t last_fullsized;      // destage once a second
+
+    // deduce from actual PG-LOG
+    // PeeringState.cc:  info.stats.log_size = pg_log.get_head().version - pg_log.get_tail().version;
     int64_t log_size;  // (also ondisk_log_size, which has the same value)
+
     struct { // object_stat_collection_t stats;
       struct { // objct_stat_sum_t sum
-	int64_t num_bytes;    // in bytes
-	int64_t num_objects;
-	int64_t num_object_copies;
-	int64_t num_rd;
-	int64_t num_rd_kb;
-	int64_t num_wr;
-	int64_t num_wr_kb;
-	int64_t num_objects_dirty;
+	int64_t num_bytes;    // in bytes    // deduce from ONode
+	int64_t num_objects;                 // deduce from ONode
+	int64_t num_object_copies;           // use num_object * num_replica
+
+	int64_t num_rd;                      // destage once a second
+	int64_t num_rd_kb;                   // destage once a second
+	int64_t num_wr;                      // destage once a second
+	int64_t num_wr_kb;                   // destage once a second
+
+	int64_t num_objects_dirty;           // iterate over obj_info_t and count dirty during recovery
       } sum;
     } stats;
   } stats;

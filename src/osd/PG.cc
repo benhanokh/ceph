@@ -920,6 +920,52 @@ void PG::upgrade(ObjectStore *store)
 #pragma GCC diagnostic pop
 #pragma GCC diagnostic warning "-Wpragmas"
 
+bool PG::should_commit_pg_info(bool dirty_big_info, bool dirty_info)
+{
+  const  uint64_t MAX_TIMNEOUT_SEC = 1;
+  const  uint64_t MAX_COUNT        = 1000;
+  static uint64_t count            = 0;
+  static uint64_t committed_count  = 0;
+  static uint64_t skipped_count    = 0;
+  static utime_t  last_commit;
+
+  if (unlikely( (committed_count+skipped_count) % 1000000 == 0)) {
+    dout(0) << __func__ << "::NPGI::committed_count=" << committed_count << ", skipped_count=" << skipped_count << dendl;
+  }
+
+  // always commit big-info
+  if (unlikely(dirty_big_info)) {
+    goto out_commit;
+  }
+
+  // must commit every TIMEOUT even if there is no dirty_info now
+  // as we skipped many updates before which might have been dirty
+  if (unlikely(ceph_clock_now() - last_commit > MAX_TIMNEOUT_SEC)) {
+    goto out_commit;
+  }
+
+  if (!dirty_info) {
+    return false;
+  }
+get_peering_state().is_backfilling()
+  if (unlikely(is_peering() || is_recovering() /*|| is_backfilling()*/)) {
+    goto out_commit;
+  }
+
+  if (unlikely( (count++ % MAX_COUNT) == 0)) {
+    goto out_commit;
+  }
+
+  skipped_count ++;
+  return false;
+
+ out_commit:
+  committed_count ++;
+  count = 1;
+  last_commit = ceph_clock_now();
+  return true;
+}
+
 void PG::prepare_write(
   pg_info_t &info,
   pg_info_t &last_written_info,
@@ -934,8 +980,8 @@ void PG::prepare_write(
   unstable_stats.clear();
   map<string,bufferlist> km;
   string key_to_remove;
-#if 0
-  if (dirty_big_info || dirty_info) {
+
+  if (should_commit_pg_info(dirty_big_info, dirty_info)) {
     int ret = prepare_info_keymap(
       cct,
       &km,
@@ -951,7 +997,7 @@ void PG::prepare_write(
       this);
     ceph_assert(ret == 0);
   }
-#endif
+
   pglog.write_log_and_missing(
     t, &km, coll, pgmeta_oid, pool.info.require_rollback());
   if (!km.empty())
