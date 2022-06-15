@@ -320,7 +320,7 @@ public:
     const hobject_t &oid,    ///< [in] oid to remove
     MapCacher::Transaction<std::string, ceph::buffer::list> *t ///< [out] transaction
     ); ///< @return error, -ENOENT if the object is not mapped
-
+private:
   /// Get snaps for oid
   int get_snaps(
     const hobject_t &oid,     ///< [in] oid to get snaps for
