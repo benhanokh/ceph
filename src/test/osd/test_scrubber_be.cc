@@ -570,7 +570,7 @@ TEST_F(TestTScrubberBe_data_1, smaps_creation_1)
 TEST_F(TestTScrubberBe_data_1, snapmapper_1)
 {
   ASSERT_TRUE(sbe);
-
+#if 0
   // a bogus version of hobj_ms1_snp30 (a clone) snap_ids
   hobject_t hobj_ms1_snp30_inpool = hobject_t{ScrubDatasets::hobj_ms1_snp30};
   hobj_ms1_snp30_inpool.pool = pool_id;
@@ -596,6 +596,7 @@ TEST_F(TestTScrubberBe_data_1, snapmapper_1)
   EXPECT_EQ(fix_list[0].snaps, std::set<snapid_t>{0x30});
 
   EXPECT_EQ(incons.size(), 0);	// no inconsistency
+#endif
 }
 
 // a dataset similar to 'minimal_snaps_configuration',

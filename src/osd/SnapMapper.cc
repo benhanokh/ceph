@@ -197,10 +197,12 @@ int SnapMapper::remove_mapping_from_snapid_to_hobject(
     //dout(1) << "+++GBH::SNAPMAP::" << __func__ << "::snapid=" << snapid << ", coid=" << coid << dendl ;
     // if was the last element in the set -> remove the mapping
     if (obj_set.empty()) {
+#if 0
       utime_t start    = snap_trim_time[snapid];
       utime_t duration = ceph_clock_now() - start;
       dout(10) << "---GBH::SNAPMAP::" << __func__ << "::removed the last obj from snap " << snapid << dendl;
       dout(10) << "GBH::SNAPMAP::TIME::" << __func__ << "::" << pgid << "::snap_id=" << snapid << " duration=" << duration << "(sec)" << dendl;
+#endif
       snap_to_objs.erase(snapid);
       // should we return -ENOENT here ???
     }
@@ -285,6 +287,7 @@ int SnapMapper::get_next_objects_to_trim(
   auto itr = snap_to_objs.find(snap);
   if (itr != snap_to_objs.end()) {
     auto & obj_set  = itr->second;
+#if 0
     auto const & itr_time = snap_trim_time.find(snap);
     if (unlikely(itr_time == snap_trim_time.end())) {
       uint32_t global_count = count_objects();
@@ -292,7 +295,7 @@ int SnapMapper::get_next_objects_to_trim(
       dout(1) << "GBH::SNAPMAP::TIME::" << __func__ << "::" << pgid <<"::snap_id=" << snap
 	      << ", count=" << itr->second.size() << ", global_count=" << global_count << dendl;
     }
-
+#endif
     for (auto itr = obj_set.begin(); itr != obj_set.end(); ++itr) {
       const hobject_t & coid = *itr;
       //dout(1) << "GBH::SNAPMAP::" << __func__ << "::" << snap << "-->" << coid << dendl;
