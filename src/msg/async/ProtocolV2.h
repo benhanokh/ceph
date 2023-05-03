@@ -105,9 +105,12 @@ private:
   ceph::msgr::v2::FrameAssembler tx_frame_asm;
   ceph::msgr::v2::FrameAssembler rx_frame_asm;
 
-  ceph::bufferlist rx_preamble;
-  ceph::bufferlist rx_epilogue;
-  ceph::msgr::v2::segment_bls_t rx_segments_data;
+  bool  recycle_preamble_buffer = true;
+  std::vector<rx_buffer_t> buffers_pool;
+  ceph::bufferlist rx_preamble_bl;
+  rx_buffer_t rx_preamble_ptr;
+  rx_buffer_t rx_epilogue;
+  ceph::msgr::v2::segment_bls_t rx_segments_data; // vector of bufferlists
   ceph::msgr::v2::Tag next_tag;
   utime_t backoff;  // backoff time
   utime_t recv_stamp;
@@ -123,6 +126,10 @@ private:
   bool write_in_progress = false;
 
   CompConnectionMeta comp_meta;
+
+  void allocate_new_buffer(rx_buffer_t& rx_buff, unsigned onwire_len, const char* caller);
+  void recycle_buffer(rx_buffer_t& rx_buff, unsigned onwire_len);
+
   std::ostream& _conn_prefix(std::ostream *_dout);
   void run_continuation(Ct<ProtocolV2> *pcontinuation);
   void run_continuation(Ct<ProtocolV2> &continuation);
@@ -167,6 +174,7 @@ private:
   CONTINUATION_DECL(ProtocolV2, read_frame);
   CONTINUATION_DECL(ProtocolV2, finish_auth);
   READ_BPTR_HANDLER_CONTINUATION_DECL(ProtocolV2, handle_read_frame_preamble_main);
+  READ_BPTR_HANDLER_CONTINUATION_DECL(ProtocolV2, handle_read_frame_preamble_main_no_alloc);
   READ_BPTR_HANDLER_CONTINUATION_DECL(ProtocolV2, handle_read_frame_segment);
   READ_BPTR_HANDLER_CONTINUATION_DECL(ProtocolV2, handle_read_frame_epilogue_main);
   CONTINUATION_DECL(ProtocolV2, throttle_message);
@@ -179,6 +187,7 @@ private:
   Ct<ProtocolV2> *finish_client_auth();
   Ct<ProtocolV2> *finish_server_auth();
   Ct<ProtocolV2> *handle_read_frame_preamble_main(rx_buffer_t &&buffer, int r);
+  Ct<ProtocolV2> *handle_read_frame_preamble_main_no_alloc(rx_buffer_t &&buffer, int r);
   Ct<ProtocolV2> *read_frame_segment();
   Ct<ProtocolV2> *handle_read_frame_segment(rx_buffer_t &&rx_buffer, int r);
   Ct<ProtocolV2> *_handle_read_frame_segment();

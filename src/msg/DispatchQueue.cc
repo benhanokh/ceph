@@ -70,6 +70,7 @@ bool DispatchQueue::can_fast_dispatch(const cref_t<Message> &m) const
 
 void DispatchQueue::fast_dispatch(const ref_t<Message>& m)
 {
+  ldout(cct, 0) << __func__ << "::(5)GBH::MSG::DispatchQueue::fast_dispatch: got message - " << *m << dendl;
   uint64_t msize = pre_dispatch(m);
   msgr->ms_fast_dispatch(m);
   post_dispatch(m, msize);

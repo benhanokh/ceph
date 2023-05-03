@@ -334,11 +334,70 @@ Tag FrameAssembler::disassemble_preamble(bufferlist& preamble_bl) {
   return static_cast<Tag>(preamble->tag);
 }
 
+Tag FrameAssembler::disassemble_preamble(rx_buffer_t& rx_preamble, bool &crypto, bool &rev1) {
+  if (m_crypto->rx) {
+    crypto = true;
+    m_crypto->rx->reset_rx_handler();
+    if (m_is_rev1) {
+      ceph_assert(rx_preamble->length() == FRAME_PREAMBLE_WITH_INLINE_SIZE +
+                                          get_auth_tag_len());
+      m_crypto->rx->authenticated_decrypt_update_final(rx_preamble);
+    } else {
+      ceph_assert(rx_preamble->length() == sizeof(preamble_block_t));
+      m_crypto->rx->authenticated_decrypt_update(rx_preamble);
+    }
+  } else {
+    crypto = false;
+    ceph_assert(rx_preamble->length() == sizeof(preamble_block_t));
+  }
+  rev1   = m_is_rev1;
+  // I expect ceph_le32 will make the endian conversion for me. Passing
+  // everything through ::Decode is unnecessary.
+  auto preamble = reinterpret_cast<const preamble_block_t*>(
+      rx_preamble->c_str());
+  // check preamble crc before any further processing
+  uint32_t crc = ceph_crc32c(
+      0, reinterpret_cast<const unsigned char*>(preamble),
+      sizeof(*preamble) - sizeof(preamble->crc));
+  ceph_assert(crc == preamble->crc);
+  if (crc != preamble->crc) {
+    ceph_abort_msg("preamble->crc");
+    throw FrameError(fmt::format(
+        "bad preamble crc calculated={} expected={}", crc, preamble->crc));
+  }
+
+  // see calc_num_segments()
+  if (preamble->num_segments < 1 ||
+      preamble->num_segments > MAX_NUM_SEGMENTS) {
+    ceph_abort_msg("bad num_segments");
+    throw FrameError(fmt::format(
+        "bad number of segments num_segments={}", preamble->num_segments));
+  }
+  if (preamble->num_segments > 1 &&
+      preamble->segments[preamble->num_segments - 1].length == 0) {
+    ceph_abort_msg("last segment empty");
+    throw FrameError("last segment empty");
+  }
+
+  m_descs.resize(preamble->num_segments);
+  for (size_t i = 0; i < m_descs.size(); i++) {
+    m_descs[i].logical_len = preamble->segments[i].length;
+    m_descs[i].align = preamble->segments[i].alignment;
+  }
+
+  m_flags = preamble->flags;
+  // If frame has been compressed, 
+  // we need to make sure the compression handler has been setup
+  ceph_assert_always(!is_compressed() || m_compression->rx);
+
+  return static_cast<Tag>(preamble->tag);
+}
+
 bool FrameAssembler::disasm_all_crc_rev0(bufferlist segment_bls[],
-                                         bufferlist& epilogue_bl) const {
-  ceph_assert(epilogue_bl.length() == sizeof(epilogue_crc_rev0_block_t));
+                                         rx_buffer_t& rx_epilogue) const {
+  ceph_assert(rx_epilogue->length() == sizeof(epilogue_crc_rev0_block_t));
   auto epilogue = reinterpret_cast<const epilogue_crc_rev0_block_t*>(
-      epilogue_bl.c_str());
+      rx_epilogue->c_str());
 
   for (size_t i = 0; i < m_descs.size(); i++) {
     ceph_assert(segment_bls[i].length() == m_descs[i].logical_len);
@@ -350,7 +409,7 @@ bool FrameAssembler::disasm_all_crc_rev0(bufferlist segment_bls[],
 }
 
 bool FrameAssembler::disasm_all_secure_rev0(bufferlist segment_bls[],
-                                            bufferlist& epilogue_bl) const {
+                                            rx_buffer_t& rx_epilogue) const {
   for (size_t i = 0; i < m_descs.size(); i++) {
     ceph_assert(segment_bls[i].length() == get_segment_padded_len(i));
     if (segment_bls[i].length() > 0) {
@@ -359,12 +418,30 @@ bool FrameAssembler::disasm_all_secure_rev0(bufferlist segment_bls[],
     }
   }
 
-  ceph_assert(epilogue_bl.length() == sizeof(epilogue_secure_rev0_block_t) +
+  ceph_assert(rx_epilogue->length() == sizeof(epilogue_secure_rev0_block_t) +
                                       get_auth_tag_len());
-  m_crypto->rx->authenticated_decrypt_update_final(epilogue_bl);
+  m_crypto->rx->authenticated_decrypt_update_final(rx_epilogue);
   auto epilogue = reinterpret_cast<const epilogue_secure_rev0_block_t*>(
-      epilogue_bl.c_str());
+      rx_epilogue->c_str());
   return !(epilogue->late_flags & FRAME_LATE_FLAG_ABORTED);
+}
+
+void FrameAssembler::disasm_first_crc_rev1(rx_buffer_t& rx_preamble,
+                                           bufferlist&  segment_bl) const {
+  ceph_assert(rx_preamble->length() == sizeof(preamble_block_t));
+  if (m_descs[0].logical_len > 0) {
+    ceph_assert(segment_bl.length() == m_descs[0].logical_len +
+                                       FRAME_CRC_SIZE);
+    bufferlist::const_iterator it(&segment_bl, m_descs[0].logical_len);
+    uint32_t expected_crc;
+    decode(expected_crc, it);
+    segment_bl.splice(m_descs[0].logical_len, FRAME_CRC_SIZE);
+    if (m_with_data_crc) {
+      check_segment_crc(segment_bl, expected_crc);
+    }
+  } else {
+    ceph_assert(segment_bl.length() == 0);
+  }
 }
 
 void FrameAssembler::disasm_first_crc_rev1(bufferlist& preamble_bl,
@@ -386,10 +463,10 @@ void FrameAssembler::disasm_first_crc_rev1(bufferlist& preamble_bl,
 }
 
 bool FrameAssembler::disasm_remaining_crc_rev1(bufferlist segment_bls[],
-                                               bufferlist& epilogue_bl) const {
-  ceph_assert(epilogue_bl.length() == sizeof(epilogue_crc_rev1_block_t));
+                                               rx_buffer_t& rx_epilogue) const {
+  ceph_assert(rx_epilogue->length() == sizeof(epilogue_crc_rev1_block_t));
   auto epilogue = reinterpret_cast<const epilogue_crc_rev1_block_t*>(
-      epilogue_bl.c_str());
+      rx_epilogue->c_str());
 
   for (size_t i = 1; i < m_descs.size(); i++) {
     ceph_assert(segment_bls[i].length() == m_descs[i].logical_len);
@@ -398,6 +475,32 @@ bool FrameAssembler::disasm_remaining_crc_rev1(bufferlist segment_bls[],
     }
   }
   return check_epilogue_late_status(epilogue->late_status);
+}
+
+void FrameAssembler::disasm_first_secure_rev1(rx_buffer_t& rx_preamble,
+                                              bufferlist& segment_bl, bool& no_pad) const {
+  no_pad = false;
+  ceph_assert(rx_preamble->length() == FRAME_PREAMBLE_WITH_INLINE_SIZE);
+  uint32_t padded_len = get_segment_padded_len(0);
+  if (padded_len > FRAME_PREAMBLE_INLINE_SIZE) {
+    ceph_assert(segment_bl.length() == padded_len + get_auth_tag_len() -
+                                       FRAME_PREAMBLE_INLINE_SIZE);
+    m_crypto->rx->reset_rx_handler();
+    m_crypto->rx->authenticated_decrypt_update_final(segment_bl);
+    // prepend the inline buffer (already decrypted) to segment_bl
+    bufferlist tmp;
+    segment_bl.swap(tmp);
+    segment_bl.append(rx_preamble->c_str()+sizeof(preamble_block_t), FRAME_PREAMBLE_INLINE_SIZE);
+    rx_preamble->set_length(sizeof(preamble_block_t));
+    segment_bl.claim_append(std::move(tmp));
+  } else {
+    no_pad = true;
+    ceph_assert(segment_bl.length() == 0);
+    segment_bl.append(rx_preamble->c_str()+sizeof(preamble_block_t), FRAME_PREAMBLE_INLINE_SIZE);
+    rx_preamble->set_length(sizeof(preamble_block_t));
+  }
+  unpad_zero(segment_bl, m_descs[0].logical_len);
+  ceph_assert(segment_bl.length() == m_descs[0].logical_len);
 }
 
 void FrameAssembler::disasm_first_secure_rev1(bufferlist& preamble_bl,
@@ -425,7 +528,7 @@ void FrameAssembler::disasm_first_secure_rev1(bufferlist& preamble_bl,
 }
 
 bool FrameAssembler::disasm_remaining_secure_rev1(
-    bufferlist segment_bls[], bufferlist& epilogue_bl) const {
+    bufferlist segment_bls[], rx_buffer_t& rx_epilogue) const {
   m_crypto->rx->reset_rx_handler();
   for (size_t i = 1; i < m_descs.size(); i++) {
     ceph_assert(segment_bls[i].length() == get_segment_padded_len(i));
@@ -435,18 +538,71 @@ bool FrameAssembler::disasm_remaining_secure_rev1(
     }
   }
 
-  ceph_assert(epilogue_bl.length() == sizeof(epilogue_secure_rev1_block_t) +
+  ceph_assert(rx_epilogue->length() == sizeof(epilogue_secure_rev1_block_t) +
                                       get_auth_tag_len());
-  m_crypto->rx->authenticated_decrypt_update_final(epilogue_bl);
+  m_crypto->rx->authenticated_decrypt_update_final(rx_epilogue);
   auto epilogue = reinterpret_cast<const epilogue_secure_rev1_block_t*>(
-      epilogue_bl.c_str());
+    rx_epilogue->c_str());
   return check_epilogue_late_status(epilogue->late_status);
 }
 
+bool FrameAssembler::disassemble_segments(rx_buffer_t& rx_preamble,
+  bufferlist segments_bls[], rx_buffer_t& rx_epilogue, bool& no_pad, bool& no_epilogue) const {
+  no_pad = no_epilogue = false;
+  disassemble_first_segment(rx_preamble, segments_bls[0], no_pad);
+  if (disassemble_remaining_segments(segments_bls, rx_epilogue, no_epilogue)) {
+    if (is_compressed()) {
+      disassemble_decompress(segments_bls);
+    }
+    return true;
+  }
+
+  return false;
+}
+
+void FrameAssembler::disassemble_first_segment(rx_buffer_t& rx_preamble,
+                                               bufferlist&  segment_bl, bool& no_pad) const {
+  ceph_assert(rx_preamble);
+  ceph_assert(!m_descs.empty());
+  if (m_is_rev1) {
+    if (m_crypto->rx) {
+      ceph_assert(rx_preamble->length() == FRAME_PREAMBLE_WITH_INLINE_SIZE);
+      disasm_first_secure_rev1(rx_preamble, segment_bl, no_pad);
+    } else {
+      disasm_first_crc_rev1(rx_preamble, segment_bl);
+    }
+  } else {
+    // noop, everything is handled in disassemble_remaining_segments()
+  }
+}
+
+bool FrameAssembler::disassemble_remaining_segments(
+  bufferlist segment_bls[], rx_buffer_t& rx_epilogue, bool& no_epilogue) const {
+  ceph_assert(!m_descs.empty());
+  ceph_assert(rx_epilogue != nullptr);
+  no_epilogue =  false;
+  if (m_is_rev1) {
+    if (m_descs.size() == 1) {
+      // no epilogue if only one segment
+      ceph_assert(rx_epilogue->length() == 0);
+      no_epilogue =  true;
+      return true;
+    } else if (m_crypto->rx) {
+      return disasm_remaining_secure_rev1(segment_bls, rx_epilogue);
+    } else {
+      return disasm_remaining_crc_rev1(segment_bls, rx_epilogue);
+    }
+  } else if (m_crypto->rx) {
+    return disasm_all_secure_rev0(segment_bls, rx_epilogue);
+  } 
+  
+  return disasm_all_crc_rev0(segment_bls, rx_epilogue);
+}
+
 bool FrameAssembler::disassemble_segments(bufferlist& preamble_bl, 
-  bufferlist segments_bls[], bufferlist& epilogue_bl) const {
+  bufferlist segments_bls[], rx_buffer_t& rx_epilogue) const {
   disassemble_first_segment(preamble_bl, segments_bls[0]);
-  if (disassemble_remaining_segments(segments_bls, epilogue_bl)) {
+  if (disassemble_remaining_segments(segments_bls, rx_epilogue)) {
     if (is_compressed()) {
       disassemble_decompress(segments_bls);
     }
@@ -471,23 +627,23 @@ void FrameAssembler::disassemble_first_segment(bufferlist& preamble_bl,
 }
 
 bool FrameAssembler::disassemble_remaining_segments(
-    bufferlist segment_bls[], bufferlist& epilogue_bl) const {
+    bufferlist segment_bls[], rx_buffer_t& rx_epilogue) const {
   ceph_assert(!m_descs.empty());
   if (m_is_rev1) {
     if (m_descs.size() == 1) {
       // no epilogue if only one segment
-      ceph_assert(epilogue_bl.length() == 0);
+      ceph_assert(rx_epilogue->length() == 0);
       return true;
     } else if (m_crypto->rx) {
-      return disasm_remaining_secure_rev1(segment_bls, epilogue_bl);
+      return disasm_remaining_secure_rev1(segment_bls, rx_epilogue);
     } else {
-      return disasm_remaining_crc_rev1(segment_bls, epilogue_bl);
+      return disasm_remaining_crc_rev1(segment_bls, rx_epilogue);
     }
   } else if (m_crypto->rx) {
-    return disasm_all_secure_rev0(segment_bls, epilogue_bl);
+    return disasm_all_secure_rev0(segment_bls, rx_epilogue);
   } 
   
-  return disasm_all_crc_rev0(segment_bls, epilogue_bl);
+  return disasm_all_crc_rev0(segment_bls, rx_epilogue);
 }
 
 std::ostream& operator<<(std::ostream& os, const FrameAssembler& frame_asm) {

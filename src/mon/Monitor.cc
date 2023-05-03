@@ -6171,13 +6171,16 @@ int Monitor::get_auth_request(
   vector<uint32_t> *preferred_modes,
   bufferlist *out)
 {
+  ldout(cct, 0) << "::GBH::MSG::Monitor::get_auth_request()" << dendl;
   std::scoped_lock l(auth_lock);
   if (con->get_peer_type() != CEPH_ENTITY_TYPE_MON &&
       con->get_peer_type() != CEPH_ENTITY_TYPE_MGR) {
+    ldout(cct, 0) << "::GBH::MSG::Monitor::get_auth_request()::peer_type=" << con->get_peer_type() << dendl;
     return -EACCES;
   }
   AuthAuthorizer *auth;
   if (!get_authorizer(con->get_peer_type(), &auth)) {
+    ldout(cct, 0) << "::GBH::MSG::Monitor::get_auth_request()::get_auth_request" << dendl;
     return -EACCES;
   }
   auth_meta->authorizer.reset(auth);

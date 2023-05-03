@@ -581,6 +581,11 @@ static ceph::spinlock debug_lock;
     memset(c_str()+o, 0, l);
   }
 
+  void buffer::ptr::invalidate_crc()
+  {
+    _raw->invalidate_crc();
+  }
+
   template<bool B>
   buffer::ptr::iterator_impl<B>& buffer::ptr::iterator_impl<B>::operator +=(size_t len) {
     pos += len;

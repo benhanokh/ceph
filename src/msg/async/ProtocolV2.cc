@@ -17,6 +17,10 @@
 #undef dout_prefix
 #define dout_prefix _conn_prefix(_dout)
 std::ostream &ProtocolV2::_conn_prefix(std::ostream *_dout) {
+  //#ifndef USE_BUFFER_LIST_RX
+#if 1
+  return *_dout << __func__  << "::";
+#else
   return *_dout << "--2- " << messenger->get_myaddrs() << " >> "
                 << *connection->peer_addrs << " conn(" << connection << " "
                 << this
@@ -31,6 +35,7 @@ std::ostream &ProtocolV2::_conn_prefix(std::ostream *_dout) {
                 << " comp rx=" << session_compression_handlers.rx.get()
                 << " tx=" << session_compression_handlers.tx.get()
                 << ").";
+#endif
 }
 
 using namespace ceph::msgr::v2;
@@ -479,21 +484,27 @@ void ProtocolV2::read_event() {
 
   switch (state) {
     case START_CONNECT:
+      ldout(cct, 0) << "::GBH::MSG::ProtocolV2::read_event()::START_CONNECT" << dendl;
       run_continuation(CONTINUATION(start_client_banner_exchange));
       break;
     case START_ACCEPT:
+      ldout(cct, 0) << "::GBH::MSG::ProtocolV2::read_event()::START_ACCEPT" << dendl;
       run_continuation(CONTINUATION(start_server_banner_exchange));
       break;
     case READY:
+      ldout(cct, 0) << "::GBH::MSG::ProtocolV2::read_event()::READY" << dendl;
       run_continuation(CONTINUATION(read_frame));
       break;
     case THROTTLE_MESSAGE:
+      ldout(cct, 0) << "::GBH::MSG::ProtocolV2::read_event()::THROTTLE_MESSAGE" << dendl;
       run_continuation(CONTINUATION(throttle_message));
       break;
     case THROTTLE_BYTES:
+      ldout(cct, 0) << "::GBH::MSG::ProtocolV2::read_event()::THROTTLE_BYTES" << dendl;
       run_continuation(CONTINUATION(throttle_bytes));
       break;
     case THROTTLE_DISPATCH_QUEUE:
+      ldout(cct, 0) << "::GBH::MSG::ProtocolV2::read_event()::THROTTLE_DISPATCH_QUEUE" << dendl;
       run_continuation(CONTINUATION(throttle_dispatch_queue));
       break;
     default:
@@ -765,8 +776,10 @@ bool ProtocolV2::is_queued() {
 
 CtPtr ProtocolV2::read(CONTINUATION_RXBPTR_TYPE<ProtocolV2> &next,
                        rx_buffer_t &&buffer) {
+  ceph_assert(buffer);
   const auto len = buffer->length();
   const auto buf = buffer->c_str();
+  ceph_assert(buf);
   next.node = std::move(buffer);
   ssize_t r = connection->read(len, buf,
     [&next, this](char *buffer, int r) {
@@ -978,7 +991,7 @@ CtPtr ProtocolV2::_handle_peer_banner_payload(rx_buffer_t &&buffer, int r) {
                                   connection->target_addr);
 
   INTERCEPT(state == HELLO_CONNECTING ? 7 : 8);
-
+  //ldout(cct, 0) << "::GBH::MSG::ProtocolV2::_handle_peer_banner_payload::WRITE(hello, 'hello frame', read_frame)" << dendl;
   return WRITE(hello, "hello frame", read_frame);
 }
 
@@ -1074,18 +1087,200 @@ CtPtr ProtocolV2::handle_hello(ceph::bufferlist &payload)
   return callback;
 }
 
+//---------------------------------------------------------------------------
+void ProtocolV2::allocate_new_buffer(rx_buffer_t& rx_buff, unsigned onwire_len, const char* caller)
+{
+  const unsigned ALLOC_SIZE = 96;
+  rx_buff = ceph::buffer::ptr_node::create(ceph::buffer::create(std::max(ALLOC_SIZE, onwire_len)));
+  rx_buff->set_length(onwire_len);
+  ldout(cct, 0) << "::(X)GBH::MSG::ALLOCATE_NEW_BUFFER()::" << caller << " onwire_len=" << onwire_len
+		<< ", alloc_size=" << rx_buff->raw_length() << "\n" << dendl;
+}
+
+//---------------------------------------------------------------------------
+void ProtocolV2::recycle_buffer(rx_buffer_t& rx_buff, unsigned onwire_len)
+{
+  unsigned static cnt = 0;
+  cnt++;
+
+  for (unsigned i = 0; i < buffers_pool.size(); i++) {
+    if (rx_buff) {
+      if (buffers_pool[i] == nullptr) {
+	ldout(cct, 0) << "::(" << cnt << ")::(X)GBH::MSG::ProtocolV2::recycle_buffer() - store rx_buff (existing entry)" << dendl;
+	// store the rx_buff for future recycle (when nref goes down)
+	buffers_pool[i] = std::move(rx_buff);
+	continue;
+      }
+      else if (buffers_pool[i]->raw_nref() > 1 || buffers_pool[i]->raw_length() < onwire_len) {
+	ldout(cct, 0) << "::(" << cnt << ")::(X)GBH::MSG::ProtocolV2::recycle_buffer() - unsuitable candidate, nref="
+		      << buffers_pool[i]->raw_nref() << ", raw_length=" << buffers_pool[i]->raw_length() << dendl;
+	// unsuitable candidate -> skip to the next entry
+	continue;
+      }
+      else {
+	ldout(cct, 0) << "::(" << cnt << ")::(X)GBH::MSG::ProtocolV2::recycle_buffer() - exchange" << dendl;
+	rx_buffer_t tmp = std::move(rx_buff);
+	rx_buff = std::move(buffers_pool[i]);
+	buffers_pool[i] = std::move(tmp);
+	return;
+      }
+    }
+    else {			// rx_buff is null
+      if (buffers_pool[i] && buffers_pool[i]->raw_nref() == 1 && buffers_pool[i]->raw_length() >= onwire_len ) {
+	ldout(cct, 0) << "::(" << cnt << ")::(X)GBH::MSG::ProtocolV2::recycle_buffer() - recycle from buffers_pool" << dendl;
+	rx_buff = std::move(buffers_pool[i]);
+	return;
+      }
+    }
+  }
+
+  if (rx_buff) {
+    auto prev_size = buffers_pool.size();
+    buffers_pool.push_back(std::move(rx_buff));
+    ldout(cct, 0) << "::(" << cnt << ")::(X)GBH::MSG::ProtocolV2::recycle_buffer() - store in a new entry. size="
+		  << buffers_pool.size() << "/" << prev_size << dendl;
+  }
+  
+  allocate_new_buffer(rx_buff, onwire_len, __func__);
+}
+
 CtPtr ProtocolV2::read_frame() {
   if (state == CLOSED) {
     return nullptr;
   }
+  auto preamble_onwire_len = rx_frame_asm.get_preamble_onwire_len();
 
   ldout(cct, 20) << __func__ << dendl;
-  rx_preamble.clear();
-  rx_epilogue.clear();
+
   rx_segments_data.clear();
 
-  return READ(rx_frame_asm.get_preamble_onwire_len(),
-              handle_read_frame_preamble_main);
+  if (rx_preamble_ptr == nullptr) {
+    allocate_new_buffer(rx_preamble_ptr, preamble_onwire_len, "read_frame()::first alloc");
+  }  
+  else if (rx_preamble_ptr->raw_nref() > 1 ) {
+    recycle_buffer(rx_preamble_ptr, preamble_onwire_len);
+  }
+  else if (rx_preamble_ptr->raw_length() < preamble_onwire_len) {
+    rx_preamble_ptr.release();
+    allocate_new_buffer(rx_preamble_ptr, preamble_onwire_len, "read_frame()::realloc");
+  }
+  else {
+    // reset buffer
+    ldout(cct, 0) << "::(X)GBH::MSG::ProtocolV2::read_frame() reset() len=" << preamble_onwire_len << "/" << rx_preamble_ptr->raw_length() << dendl;
+    rx_preamble_ptr->set_offset(0);
+    rx_preamble_ptr->set_length(preamble_onwire_len);
+  }
+
+  return READ_RXBUF(std::move(rx_preamble_ptr), handle_read_frame_preamble_main_no_alloc);
+}
+
+
+
+#if 0
+CtPtr ProtocolV2::read_frame() {
+  if (state == CLOSED) {
+    return nullptr;
+  }
+  static int max_nref = 0;
+  static unsigned num_allocation = 0;
+  auto preamble_onwire_len = rx_frame_asm.get_preamble_onwire_len();
+#if 0
+  ldout(cct, 0) << "::(X)GBH::MSG::ProtocolV2::read_frame() preamble_onwire_len=" << preamble_onwire_len
+		<< (session_stream_handlers.rx.get() ? " CRYPTO_RX": "")
+		<< ", raw_nref=" << (rx_preamble_ptr ? rx_preamble_ptr->raw_nref() : -1)
+		<< ", num_alloc=" << num_allocation << ", max_nref=" << max_nref << dendl;
+#endif
+
+  ldout(cct, 20) << __func__ << dendl;
+
+  rx_segments_data.clear();
+#if 1
+  if (!recycle_preamble_buffer) {
+    rx_preamble_bl.clear();
+  }
+#endif
+  static unsigned max_preamble_onwire_len = 0;
+  if (max_preamble_onwire_len < preamble_onwire_len) {
+    max_preamble_onwire_len = preamble_onwire_len;
+    ldout(cct, 0) << "::(X)GBH::MSG::ProtocolV2::read_frame() *** max_preamble_onwire_len=" << max_preamble_onwire_len << dendl;
+  }
+
+  if (rx_preamble_ptr && rx_preamble_ptr->raw_nref() > 1 ) {
+#if 1
+    num_allocation++;
+    if (max_nref < rx_preamble_ptr->raw_nref()) {
+      max_nref = rx_preamble_ptr->raw_nref();
+      ldout(cct, 0) << "::(X)GBH::MSG::ProtocolV2::read_frame() **** max_raw_nref=" << max_nref << dendl;
+    }
+#endif
+    recycle_preamble_buffer = false;
+    return READ(rx_frame_asm.get_preamble_onwire_len(), handle_read_frame_preamble_main);
+  }
+
+  recycle_preamble_buffer = true;
+  if (rx_preamble_ptr == nullptr) {
+    rx_preamble_ptr = ceph::buffer::ptr_node::create(ceph::buffer::create(std::max(128, (int)preamble_onwire_len)));
+    rx_preamble_ptr->set_length(preamble_onwire_len);
+    //ldout(cct, 0) << "::(X)GBH::MSG::ProtocolV2::read_frame() **nullptr** rx_preamble_ptr.create() len=" << rx_preamble_ptr->length() << ", off=" << rx_preamble_ptr->offset() << dendl;
+  }
+  else if (rx_preamble_ptr->raw_length() < preamble_onwire_len) {
+    rx_preamble_ptr.release();
+    rx_preamble_ptr = ceph::buffer::ptr_node::create(ceph::buffer::create(preamble_onwire_len));
+    ldout(cct, 0) << "::(X)GBH::MSG::ProtocolV2::read_frame() rx_preamble_ptr release/create() len=" << rx_preamble_ptr->length() << ", off=" << rx_preamble_ptr->offset() << dendl;
+  }
+  else {
+    // reset buffer
+    //unsigned old_offset = rx_preamble_ptr->offset();
+    rx_preamble_ptr->set_offset(0);
+    rx_preamble_ptr->set_length(preamble_onwire_len);
+    //ldout(cct, 0) << "::(X)GBH::MSG::ProtocolV2::read_frame()  rx_preamble_ptr.reset() len=" << rx_preamble_ptr->length() << ", off=" << rx_preamble_ptr->offset() << "/" << old_offset << dendl;
+  }
+
+  return READ_RXBUF(std::move(rx_preamble_ptr), handle_read_frame_preamble_main_no_alloc);
+}
+#endif
+
+CtPtr ProtocolV2::handle_read_frame_preamble_main_no_alloc(rx_buffer_t &&buffer, int r) {
+  ldout(cct, 20) << __func__ << " r=" << r << dendl;
+
+  if (r < 0) {
+    ldout(cct, 1) << __func__ << " read frame preamble failed r=" << r
+                  << dendl;
+    return _fault();
+  }
+
+  rx_preamble_ptr = std::move(buffer);
+  ceph_assert(rx_preamble_ptr);
+  
+  try {
+    bool crypto = false, rev1 = false;
+    next_tag = rx_frame_asm.disassemble_preamble(rx_preamble_ptr, crypto, rev1);
+    ceph_assert(rx_preamble_ptr);
+    //ceph_assert(!crypto);
+  } catch (FrameError& e) {
+    ldout(cct, 1) << __func__ << " " << e.what() << dendl;
+    return _fault();
+  } catch (ceph::crypto::onwire::MsgAuthError&) {
+    ldout(cct, 1) << __func__ << "bad auth tag" << dendl;
+    return _fault();
+  }
+
+  ldout(cct, 25) << __func__ << " disassembled preamble " << rx_frame_asm
+                 << dendl;
+
+  // does it need throttle?
+  if (next_tag == Tag::MESSAGE) {
+    ldout(cct, 0) << "::(X)GBH::MSG::ProtocolV2::handle_read_frame_preamble_main_no_alloc():: Tag::MESSAGE" << dendl;
+    if (state != READY) {
+      lderr(cct) << __func__ << " not in ready state!" << dendl;
+      return _fault();
+    }
+    recv_stamp = ceph_clock_now();
+    state = THROTTLE_MESSAGE;
+    return CONTINUE(throttle_message);
+  } else {
+    return read_frame_segment();
+  }
 }
 
 CtPtr ProtocolV2::handle_read_frame_preamble_main(rx_buffer_t &&buffer, int r) {
@@ -1097,14 +1292,14 @@ CtPtr ProtocolV2::handle_read_frame_preamble_main(rx_buffer_t &&buffer, int r) {
     return _fault();
   }
 
-  rx_preamble.push_back(std::move(buffer));
+  rx_preamble_bl.push_back(std::move(buffer));
 
   ldout(cct, 30) << __func__ << " preamble\n";
-  rx_preamble.hexdump(*_dout);
+  rx_preamble_bl.hexdump(*_dout);
   *_dout << dendl;
 
   try {
-    next_tag = rx_frame_asm.disassemble_preamble(rx_preamble);
+    next_tag = rx_frame_asm.disassemble_preamble(rx_preamble_bl);
   } catch (FrameError& e) {
     ldout(cct, 1) << __func__ << " " << e.what() << dendl;
     return _fault();
@@ -1118,7 +1313,7 @@ CtPtr ProtocolV2::handle_read_frame_preamble_main(rx_buffer_t &&buffer, int r) {
 
   if (session_stream_handlers.rx) {
     ldout(cct, 30) << __func__ << " preamble after decrypt\n";
-    rx_preamble.hexdump(*_dout);
+    rx_preamble_bl.hexdump(*_dout);
     *_dout << dendl;
   }
 
@@ -1136,7 +1331,41 @@ CtPtr ProtocolV2::handle_read_frame_preamble_main(rx_buffer_t &&buffer, int r) {
   }
 }
 
+//---------------------------------------------------------------------------
+static const char* get_tag_name(unsigned index)
+{
+  static const char * tag_names [] = {
+    "UNKNOWN/BAD TAG 0",
+    "HELLO",
+    "AUTH_REQUEST",
+    "AUTH_BAD_METHOD",
+    "AUTH_REPLY_MORE",
+    "AUTH_REQUEST_MORE",
+    "AUTH_DONE",
+    "AUTH_SIGNATURE",
+    "CLIENT_IDENT" ,
+    "SERVER_IDENT",
+    "IDENT_MISSING_FEATURES",
+    "SESSION_RECONNECT",
+    "SESSION_RESET",
+    "SESSION_RETRY",
+    "SESSION_RETRY_GLOBAL",
+    "SESSION_RECONNECT_OK",
+    "WAIT",
+    "MESSAGE",
+    "KEEPALIVE2",
+    "KEEPALIVE2_ACK",
+    "ACK",
+    "COMPRESSION_REQUEST",
+    "COMPRESSION_DONE"
+  };
+
+  return tag_names[index];
+}  
+
 CtPtr ProtocolV2::handle_read_frame_dispatch() {
+  uint32_t tag_idx = static_cast<uint32_t>(next_tag);
+  ldout(cct, 0) << "::(3)GBH::MSG::ProtocolV2::handle_read_frame_dispatch() tag=" << tag_idx << "::" << get_tag_name(tag_idx) << dendl;
   ldout(cct, 10) << __func__
                  << " tag=" << static_cast<uint32_t>(next_tag) << dendl;
 
@@ -1183,12 +1412,14 @@ CtPtr ProtocolV2::read_frame_segment() {
 
   uint32_t onwire_len = rx_frame_asm.get_segment_onwire_len(seg_idx);
   if (onwire_len == 0) {
+    //ldout(cct, 0) << "::(Z)GBH::MSG::ProtocolV2::read_frame_segment() segment_onwire_len=0" << dendl;
     return _handle_read_frame_segment();
   }
 
   rx_buffer_t rx_buffer;
   uint16_t align = rx_frame_asm.get_segment_align(seg_idx);
   try {
+    //ldout(cct, 0) << "::(Z)GBH::MSG::ProtocolV2::read_frame_segment() segment_onwire_len=" << onwire_len << ", align=" << align << ", seg_idx=" << seg_idx << dendl;
     rx_buffer = ceph::buffer::ptr_node::create(ceph::buffer::create_aligned(
         onwire_len, align));
   } catch (const ceph::buffer::bad_alloc&) {
@@ -1221,21 +1452,50 @@ CtPtr ProtocolV2::_handle_read_frame_segment() {
     // OK, all segments planned to read are read. Can go with epilogue.
     uint32_t epilogue_onwire_len = rx_frame_asm.get_epilogue_onwire_len();
     if (epilogue_onwire_len == 0) {
+      if (rx_epilogue == nullptr) {
+	rx_epilogue = ceph::buffer::ptr_node::create(ceph::buffer::create(128));
+	rx_epilogue->set_length(epilogue_onwire_len);
+	//ldout(cct, 0) << "::(T)GBH::MSG::ProtocolV2::_handle_read_frame_segment(A) rx_epilogue.create() len=" << rx_epilogue->length() << ", off=" << rx_epilogue->offset() << dendl;
+      }
+      rx_epilogue->set_length(epilogue_onwire_len);
+      //ldout(cct, 0) << "::(T)GBH::MSG::ProtocolV2::_handle_read_frame_segment(B) rx_epilogue.set_length() len=" << rx_epilogue->length() << ", off=" << rx_epilogue->offset() << dendl;
       return _handle_read_frame_epilogue_main();
     }
-    return READ(epilogue_onwire_len, handle_read_frame_epilogue_main);
+
+    //ldout(cct, 0) << "::(T)GBH::MSG::ProtocolV2::_handle_read_frame_segment() epilogue_onwire_len=" << epilogue_onwire_len << dendl;
+    if (rx_epilogue == nullptr) {
+      rx_epilogue = ceph::buffer::ptr_node::create(ceph::buffer::create(std::max(128, (int)epilogue_onwire_len)));
+      //ldout(cct, 0) << "::(T)GBH::MSG::ProtocolV2::_handle_read_frame_segment() (1) rx_epilogue.create len=" << rx_epilogue->length() << ", off=" << rx_epilogue->offset() << dendl;
+    }
+    else if (rx_epilogue->raw_length() < epilogue_onwire_len) {
+      rx_epilogue.release();
+      rx_epilogue = ceph::buffer::ptr_node::create(ceph::buffer::create(epilogue_onwire_len));
+      ldout(cct, 0) << "::(T)GBH::MSG::ProtocolV2::_handle_read_frame_segment() (2) rx_epilogue.release/create len=" << rx_epilogue->length() << ", off=" << rx_epilogue->offset() << dendl;
+    }
+    else {
+      //unsigned old_offset = rx_epilogue->offset();
+      // reset buffer
+      rx_epilogue->set_offset(0);
+      rx_epilogue->set_length(epilogue_onwire_len);
+      //ldout(cct, 0) << "::(T)GBH::MSG::ProtocolV2::_handle_read_frame_segment() (3) rx_epilogue.reset len=" << rx_epilogue->length() << ", off=" << rx_epilogue->offset() << "/" << old_offset << dendl;
+    }
+    return READ_RXBUF(std::move(rx_epilogue), handle_read_frame_epilogue_main);
   }
   // TODO: for makeshift only. This will be more generic and throttled
   return read_frame_segment();
 }
 
 CtPtr ProtocolV2::handle_frame_payload() {
+  //uint32_t tag_idx = static_cast<uint32_t>(next_tag);
+  //ldout(cct, 0) << "::(3)GBH::MSG::ProtocolV2::handle_frame_payload() tag=" << tag_idx << "::" << get_tag_name(tag_idx) << dendl;
   ceph_assert(!rx_segments_data.empty());
   auto& payload = rx_segments_data.back();
 
-  ldout(cct, 30) << __func__ << "\n";
-  payload.hexdump(*_dout);
-  *_dout << dendl;
+  if (0 && next_tag == Tag::AUTH_SIGNATURE) {
+    ldout(cct, 0) << __func__ << "\n";
+    payload.hexdump(*_dout);
+    *_dout << dendl;
+  }
 
   switch (next_tag) {
     case Tag::HELLO:
@@ -1322,6 +1582,7 @@ CtPtr ProtocolV2::ready() {
 
 CtPtr ProtocolV2::handle_read_frame_epilogue_main(rx_buffer_t &&buffer, int r)
 {
+  //ldout(cct, 0) << "::(1)GBH::MSG::ProtocolV2::handle_read_frame_epilogue_main()" << dendl;
   ldout(cct, 20) << __func__ << " r=" << r << dendl;
 
   if (r < 0) {
@@ -1329,15 +1590,27 @@ CtPtr ProtocolV2::handle_read_frame_epilogue_main(rx_buffer_t &&buffer, int r)
                   << " (" << cpp_strerror(r) << ")" << dendl;
     return _fault();
   }
-
-  rx_epilogue.push_back(std::move(buffer));
+  rx_epilogue = std::move(buffer);
+  ceph_assert(rx_epilogue);
   return _handle_read_frame_epilogue_main();
 }
-
+#if 0
 CtPtr ProtocolV2::_handle_read_frame_epilogue_main() {
+  ldout(cct, 0) << "::(2)GBH::MSG::ProtocolV2::_handle_read_frame_epilogue_main(A):: data_len="
+		<< rx_segments_data.data()[0].length() << ", preamble_len=" << rx_preamble->length() << dendl;
   bool ok = false;
   try {
-    ok = rx_frame_asm.disassemble_segments(rx_preamble, rx_segments_data.data(), rx_epilogue);
+    ceph_assert(rx_preamble);
+    ceph_assert(rx_epilogue);
+    bool no_pad = false, no_epilogue = false;
+    ok = rx_frame_asm.disassemble_segments(rx_preamble, rx_segments_data.data(), rx_epilogue, no_pad, no_epilogue);
+    ceph_assert(rx_preamble);
+    ceph_assert(rx_epilogue);
+    if (session_stream_handlers.rx.get()) {
+      ldout(cct, 0) << "::(2)GBH::MSG::ProtocolV2::_handle_read_frame_epilogue_main(B):: data_len="
+		    << rx_segments_data.data()[0].length() << ", preamble_len=" << rx_preamble->length() 
+		    << (no_pad ? " -NO PADDING" : " +PADDING") << (no_epilogue ? " -NO EPILOGUE" : " +EPILOGUE")  << dendl;
+    }
   } catch (FrameError& e) {
     ldout(cct, 1) << __func__ << " " << e.what() << dendl;
     return _fault();
@@ -1356,12 +1629,44 @@ CtPtr ProtocolV2::_handle_read_frame_epilogue_main() {
   }
   return handle_read_frame_dispatch();
 }
+#else
+CtPtr ProtocolV2::_handle_read_frame_epilogue_main() {
+  bool ok = false;
+  try {
+    if (recycle_preamble_buffer) {
+      bool no_pad = false, no_epilogue = false;
+      ok = rx_frame_asm.disassemble_segments(rx_preamble_ptr, rx_segments_data.data(), rx_epilogue, no_pad, no_epilogue);
+    }
+    else {
+      ok = rx_frame_asm.disassemble_segments(rx_preamble_bl, rx_segments_data.data(), rx_epilogue);
+    }
+  } catch (FrameError& e) {
+    ldout(cct, 1) << __func__ << " " << e.what() << dendl;
+    return _fault();
+  } catch (ceph::crypto::onwire::MsgAuthError&) {
+    ldout(cct, 1) << __func__ << "bad auth tag" << dendl;
+    return _fault();
+  }
+
+  // we do have a mechanism that allows transmitter to start sending message
+  // and abort after putting entire data field on wire. This will be used by
+  // the kernel client to avoid unnecessary buffering.
+  if (!ok) {
+    reset_throttle();
+    state = READY;
+    return CONTINUE(read_frame);
+  }
+  return handle_read_frame_dispatch();
+}
+#endif
 
 CtPtr ProtocolV2::handle_message() {
+  ldout(cct, 0) << "::(4)GBH::MSG::ProtocolV2::handle_message()" << dendl;
   ldout(cct, 20) << __func__ << dendl;
   ceph_assert(state == THROTTLE_DONE);
 
   const size_t cur_msg_size = get_current_msg_size();
+  // GBH - here we allocate space for msg_frame.front()/ msg_frame.middle()/ msg_frame.data() buffer-list
   auto msg_frame = MessageFrame::Decode(rx_segments_data);
 
   // XXX: paranoid copy just to avoid oops
@@ -1394,6 +1699,7 @@ CtPtr ProtocolV2::handle_message() {
   ceph_msg_footer footer{ceph_le32(0), ceph_le32(0),
 	                 ceph_le32(0), ceph_le64(0), current_header.flags};
 
+  // will allocate the Message data-struct and copy buffer-list, header and footer into it
   Message *message = decode_message(cct, 0, header, footer,
       msg_frame.front(),
       msg_frame.middle(),
@@ -1507,6 +1813,7 @@ CtPtr ProtocolV2::handle_message() {
     connection->delay_state->queue(delay_period, message);
   } else if (messenger->ms_can_fast_dispatch(message)) {
     connection->lock.unlock();
+    ldout(cct, 0) << "::GBH::MSG::ProtocolV2::handle_message::connection->dispatch_queue->fast_dispatch(message)" << dendl;
     connection->dispatch_queue->fast_dispatch(message);
     connection->recv_start_time = ceph::mono_clock::now();
     connection->logger->tinc(l_msgr_running_fast_dispatch_time,
@@ -1696,7 +2003,7 @@ CtPtr ProtocolV2::start_client_banner_exchange() {
   ldout(cct, 20) << __func__ << dendl;
 
   INTERCEPT(1);
-
+  //ldout(cct, 0) << "::(33333)GBH::MSG::ProtocolV2::start_client_banner_exchange" << dendl;
   state = BANNER_CONNECTING;
 
   global_seq = messenger->get_global_seq();
@@ -1708,7 +2015,7 @@ CtPtr ProtocolV2::post_client_banner_exchange() {
   ldout(cct, 20) << __func__ << dendl;
 
   state = AUTH_CONNECTING;
-
+  //ldout(cct, 0) << "::(33333)GBH::MSG::ProtocolV2::post_client_banner_exchange" << dendl;
   return send_auth_request();
 }
 
@@ -1716,7 +2023,7 @@ CtPtr ProtocolV2::send_auth_request(std::vector<uint32_t> &allowed_methods) {
   ceph_assert(messenger->auth_client);
   ldout(cct, 20) << __func__ << " peer_type " << (int)connection->peer_type
 		 << " auth_client " << messenger->auth_client << dendl;
-
+  //ldout(cct, 0) << "::(33333)GBH::MSG::ProtocolV2::send_auth_request" << dendl;
   ceph::bufferlist bl;
   std::vector<uint32_t> preferred_modes;
   auto am = auth_meta;
@@ -1747,7 +2054,7 @@ CtPtr ProtocolV2::send_auth_request(std::vector<uint32_t> &allowed_methods) {
 CtPtr ProtocolV2::handle_auth_bad_method(ceph::bufferlist &payload) {
   ldout(cct, 20) << __func__
 		 << " payload.length()=" << payload.length() << dendl;
-
+  //ldout(cct, 0) << "::(3333)GBH::MSG::ProtocolV2::handle_auth_bad_method() payload.length()=" << payload.length() << dendl;
   if (state != AUTH_CONNECTING) {
     lderr(cct) << __func__ << " not in auth connect state!" << dendl;
     return _fault();
@@ -1811,6 +2118,7 @@ CtPtr ProtocolV2::handle_auth_reply_more(ceph::bufferlist &payload)
 
 CtPtr ProtocolV2::handle_auth_done(ceph::bufferlist &payload)
 {
+  //ldout(cct, 0) << "::GBH::MSG::ProtocolV2::handle_auth_done()::payload.length()=" << payload.length() << dendl;
   ldout(cct, 20) << __func__
 		 << " payload.length()=" << payload.length() << dendl;
 
@@ -1852,11 +2160,13 @@ CtPtr ProtocolV2::handle_auth_done(ceph::bufferlist &payload)
   auto sig_frame = AuthSignatureFrame::Encode(sig);
   pre_auth.enabled = false;
   pre_auth.rxbuf.clear();
+  //ldout(cct, 0) << "::GBH::MSG::ProtocolV2::()::handle_auth_done() auth signature::sig=" << sig << dendl;
   return WRITE(sig_frame, "auth signature", read_frame);
 }
 
 CtPtr ProtocolV2::finish_client_auth() {
   if (HAVE_MSGR2_FEATURE(peer_supported_features, COMPRESSION)) {
+    //ldout(cct, 0) << "::GBH::MSG::ProtocolV2::finish_client_auth():: calling send_compression_request()" << dendl;
     return send_compression_request();
   }
 
@@ -1882,10 +2192,13 @@ CtPtr ProtocolV2::start_session_connect() {
   if (!server_cookie) {
     ceph_assert(connect_seq == 0);
     state = SESSION_CONNECTING;
+    //ldout(cct, 0) << "::GBH::MSG::ProtocolV2::start_session_connect calling send_client_ident()" << dendl;
     return send_client_ident();
   } else {  // reconnecting to previous session
     state = SESSION_RECONNECTING;
     ceph_assert(connect_seq > 0);
+
+    //ldout(cct, 0) << "::GBH::MSG::ProtocolV2::start_session_connect calling send_reconnect()" << dendl;
     return send_reconnect();
   }
 }
@@ -1939,7 +2252,7 @@ CtPtr ProtocolV2::send_reconnect() {
                                           connect_seq,
                                           in_seq);
 
-  ldout(cct, 5) << __func__ << " reconnect to session: client_cookie="
+  ldout(cct, 0) << __func__ << " reconnect to session: client_cookie="
                 << std::hex << client_cookie << " server_cookie="
                 << server_cookie << std::dec
                 << " gs=" << global_seq << " cs=" << connect_seq
@@ -2193,6 +2506,7 @@ CtPtr ProtocolV2::post_server_banner_exchange() {
 }
 
 CtPtr ProtocolV2::handle_auth_request(ceph::bufferlist &payload) {
+  ldout(cct, 0) << "::(333)GBH::MSG::ProtocolV2::handle_auth_request() payload.length()=" << payload.length() << dendl;
   ldout(cct, 20) << __func__ << " payload.length()=" << payload.length()
                  << dendl;
 
@@ -2307,6 +2621,11 @@ CtPtr ProtocolV2::handle_auth_request_more(ceph::bufferlist &payload)
 
 CtPtr ProtocolV2::handle_auth_signature(ceph::bufferlist &payload)
 {
+#if 0
+  ldout(cct, 0) << "::GBH::MSG::ProtocolV2::handle_auth_signature()::payload.length()=" << payload.length()
+		<< (auth_meta->session_key.empty() ? "empty session_key" : " valid session_key")
+		<< "pre_auth.txbuf=" << pre_auth.txbuf << dendl;
+#endif
   ldout(cct, 20) << __func__
 		 << " payload.length()=" << payload.length() << dendl;
 
@@ -2316,18 +2635,25 @@ CtPtr ProtocolV2::handle_auth_signature(ceph::bufferlist &payload)
                << dendl;
     return _fault();
   }
-
+  //ldout(cct, 0) << "::GBH::MSG::ProtocolV2::handle_auth_signature()::payload:"  << dendl;
+  //payload.hexdump(*_dout);
   auto sig_frame = AuthSignatureFrame::Decode(payload);
 
   const auto actual_tx_sig = auth_meta->session_key.empty() ?
     sha256_digest_t() : auth_meta->session_key.hmac_sha256(cct, pre_auth.txbuf);
   if (sig_frame.signature() != actual_tx_sig) {
+    ldout(cct, 0) << "::GBH::MSG::ProtocolV2::handle_auth_signature()::pre-auth signature mismatch"
+                  << " actual_tx_sig=" << actual_tx_sig
+                  << " sig_frame.signature()=" << sig_frame.signature() << dendl;
+      
     ldout(cct, 2) << __func__ << " pre-auth signature mismatch"
                   << " actual_tx_sig=" << actual_tx_sig
                   << " sig_frame.signature()=" << sig_frame.signature()
                   << dendl;
     return _fault();
   } else {
+    ldout(cct, 0) << "::GBH::MSG::ProtocolV2::handle_auth_signature()::pre-auth signature success !!!"
+                   << " sig_frame.signature()=" << sig_frame.signature() << dendl;
     ldout(cct, 20) << __func__ << " pre-auth signature success"
                    << " sig_frame.signature()=" << sig_frame.signature()
                    << dendl;
@@ -2335,9 +2661,11 @@ CtPtr ProtocolV2::handle_auth_signature(ceph::bufferlist &payload)
   }
 
   if (state == AUTH_ACCEPTING_SIGN) {
+    //ldout(cct, 0) << "::GBH::MSG::ProtocolV2::handle_auth_signature()::server side" <<dendl;
     // this happened on server side
     return finish_server_auth();
   } else if (state == AUTH_CONNECTING_SIGN) {
+    //ldout(cct, 0) << "::GBH::MSG::ProtocolV2::handle_auth_signature()::client side" << dendl;
     // this happened at client side
     return finish_client_auth();
   } else {

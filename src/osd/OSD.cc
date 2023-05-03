@@ -7065,6 +7065,7 @@ void OSD::handle_command(MCommand *m)
 {
   ConnectionRef con = m->get_connection();
   auto session = ceph::ref_cast<Session>(con->get_priv());
+  dout(0) << "OSD::GBH::MSG::handle_command: message=" << *m << ", session=" << session << dendl;
   if (!session) {
     con->send_message(new MCommandReply(m, -EACCES));
     m->put();
@@ -7317,6 +7318,8 @@ void OSD::dispatch_session_waiting(const ceph::ref_t<Session>& session, OSDMapRe
 
 void OSD::ms_fast_dispatch(Message *m)
 {
+  dout(0) << "(8)OSD::GBH::MSG::ms_fast_dispatch: " << *m << dendl;
+  //ceph_abort_msg("OSD::ms_fast_dispatch");
   FUNCTRACE(cct);
   if (service.is_stopping()) {
     m->put();

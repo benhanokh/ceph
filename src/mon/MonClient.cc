@@ -1393,16 +1393,20 @@ int MonClient::get_auth_request(
   std::vector<uint32_t> *preferred_modes,
   ceph::buffer::list *bl)
 {
+  //ldout(cct,0) << "::GBH::MSG::MonClient::get_auth_request():: con " << con << " auth_method " << *auth_method << dendl;
+
   std::lock_guard l(monc_lock);
   ldout(cct,10) << __func__ << " con " << con << " auth_method " << *auth_method
 		<< dendl;
 
   // connection to mon?
   if (con->get_peer_type() == CEPH_ENTITY_TYPE_MON) {
+    //ldout(cct,0) << "::GBH::MSG::MonClient::get_auth_request()::CEPH_ENTITY_TYPE_MON start" << dendl;
     ceph_assert(!auth_meta->authorizer);
     if (con->is_anon()) {
       for (auto& i : mon_commands) {
 	if (i.second->target_con == con) {
+	  ldout(cct,0) << "::GBH::MSG::MonClient::get_auth_request()::CEPH_ENTITY_TYPE_MON calling get_auth_request()" << dendl;
 	  return i.second->target_session->get_auth_request(
 	    auth_method, preferred_modes, bl,
 	    entity_name, want_keys, rotating_secrets.get());
@@ -1411,21 +1415,25 @@ int MonClient::get_auth_request(
     }
     for (auto& i : pending_cons) {
       if (i.second.is_con(con)) {
+	//ldout(cct,0) << "::GBH::MSG::MonClient::get_auth_request()::pending_cons calling get_auth_request()" << dendl;
 	return i.second.get_auth_request(
 	  auth_method, preferred_modes, bl,
 	  entity_name, want_keys, rotating_secrets.get());
       }
     }
+    ldout(cct, 0) << "::GBH::MSG::MonClient::get_auth_request()::failed get_auth_request()" << dendl;
     return -ENOENT;
   }
 
   // generate authorizer
   if (!auth) {
+    ldout(cct, 0) << "::GBH::MSG::MonClient::get_auth_request() !auth" << dendl;
     lderr(cct) << __func__ << " but no auth handler is set up" << dendl;
     return -EACCES;
   }
   auth_meta->authorizer.reset(auth->build_authorizer(con->get_peer_type()));
   if (!auth_meta->authorizer) {
+    ldout(cct, 0) << "::GBH::MSG::MonClient::get_auth_request():: failed to build_authorizer" << dendl;
     lderr(cct) << __func__ << " failed to build_authorizer for type "
 	       << ceph_entity_type_name(con->get_peer_type()) << dendl;
     return -EACCES;
@@ -1435,6 +1443,7 @@ int MonClient::get_auth_request(
 				    auth_meta->auth_method,
 				    preferred_modes);
   *bl = auth_meta->authorizer->bl;
+  //ldout(cct,0) << "::GBH::MSG::MonClient::get_auth_request()::done" << dendl;
   return 0;
 }
 
@@ -1727,12 +1736,14 @@ int MonConnection::get_auth_request(
   uint32_t want_keys,
   RotatingKeyRing* keyring)
 {
+  //ldout(cct, 0) << "::GBH::MSG::MonConnection::get_auth_request()" << dendl;
   using ceph::encode;
   // choose method
   if (auth_method < 0) {
     std::vector<uint32_t> as;
     auth_registry->get_supported_methods(con->get_peer_type(), &as);
     if (as.empty()) {
+      ldout(cct, 0) << "::GBH::MSG::MonConnection::get_auth_request():: as.empty()" << dendl;
       return -EACCES;
     }
     auth_method = as.front();
@@ -1743,9 +1754,9 @@ int MonConnection::get_auth_request(
   ldout(cct,10) << __func__ << " method " << *method
 		<< " preferred_modes " << *preferred_modes << dendl;
   if (preferred_modes->empty()) {
+    ldout(cct, 0) << "::GBH::MSG::MonConnection::get_auth_request():: preferred_modes::empty()" << dendl;
     return -EACCES;
   }
-
   int r = _init_auth(*method, entity_name, want_keys, keyring, true);
   ceph_assert(r == 0);
 

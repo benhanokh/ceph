@@ -963,6 +963,8 @@ Message *decode_message(CephContext *cct,
   m->set_payload(front);
   m->set_middle(middle);
   m->set_data(data);
+  ldout(cct, 1) << "::(M)GBH::MSG::Message.cc::decode_message() payload.len=" << m->get_payload().length()
+		<< ", middle.len=" << m->get_middle().length() << ", data.len=" << m->get_data().length()<< dendl;
 
   try {
     m->decode_payload();

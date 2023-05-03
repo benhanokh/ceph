@@ -682,6 +682,7 @@ public:
    * If none of our Dispatchers can handle it, ceph_abort().
    */
   void ms_fast_dispatch(const ceph::ref_t<Message> &m) {
+    lsubdout(cct, ms, 0) << "(6)GBH::MSG::Messenger::ms_fast_dispatch:()" << dendl;
     m->set_dispatch_stamp(ceph_clock_now());
     for (const auto &dispatcher : fast_dispatchers) {
       if (dispatcher->ms_can_fast_dispatch2(m)) {

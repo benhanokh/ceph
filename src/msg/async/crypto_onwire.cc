@@ -83,6 +83,7 @@ void AES128GCM_OnWireTxHandler::reset_tx_handler(const uint32_t* first,
 {
   if (nonce == initial_nonce) {
     if (used_initial_nonce) {
+      ceph_abort_msg(__func__);
       throw ceph::crypto::onwire::TxHandlerError("out of nonces");
     }
     used_initial_nonce = true;
@@ -90,6 +91,7 @@ void AES128GCM_OnWireTxHandler::reset_tx_handler(const uint32_t* first,
 
   if(1 != EVP_EncryptInit_ex(ectx.get(), nullptr, nullptr, nullptr,
       reinterpret_cast<const unsigned char*>(&nonce))) {
+    ceph_abort_msg(__func__);
     throw std::runtime_error("EVP_EncryptInit_ex failed");
   }
 
@@ -179,11 +181,13 @@ public:
 
     if (1 != EVP_DecryptInit_ex(ectx.get(), EVP_aes_128_gcm(),
 			        nullptr, nullptr, nullptr)) {
+      ceph_abort_msg(__func__);
       throw std::runtime_error("EVP_DecryptInit_ex failed");
     }
 
     if(1 != EVP_DecryptInit_ex(ectx.get(), nullptr, nullptr,
 			       key.data(), nullptr)) {
+      ceph_abort_msg(__func__);
       throw std::runtime_error("EVP_DecryptInit_ex failed");
     }
   }
@@ -196,14 +200,18 @@ public:
     return AESGCM_TAG_LEN;
   }
   void reset_rx_handler() override;
+  void __authenticated_decrypt_update(unsigned char* p, unsigned len);
   void authenticated_decrypt_update(ceph::bufferlist& bl) override;
+  void authenticated_decrypt_update(rx_buffer_t& buffer) override;
   void authenticated_decrypt_update_final(ceph::bufferlist& bl) override;
+  void authenticated_decrypt_update_final(rx_buffer_t& buffer) override;
 };
 
 void AES128GCM_OnWireRxHandler::reset_rx_handler()
 {
   if(1 != EVP_DecryptInit_ex(ectx.get(), nullptr, nullptr, nullptr,
 	reinterpret_cast<const unsigned char*>(&nonce))) {
+    ceph_abort_msg(__func__);
     throw std::runtime_error("EVP_DecryptInit_ex failed");
   }
 
@@ -216,6 +224,26 @@ void AES128GCM_OnWireRxHandler::reset_rx_handler()
   }
 }
 
+void AES128GCM_OnWireRxHandler::__authenticated_decrypt_update(unsigned char* p, unsigned len)
+{
+  int update_len = 0;
+
+  if (1 != EVP_DecryptUpdate(ectx.get(), p, &update_len, p, len)) {
+    ceph_abort_msg(__func__);
+    throw std::runtime_error("EVP_DecryptUpdate failed");
+  }
+  ceph_assert_always(update_len >= 0);
+  ceph_assert(static_cast<unsigned>(update_len) == len);
+}
+
+void AES128GCM_OnWireRxHandler::authenticated_decrypt_update(rx_buffer_t &buffer)
+{
+  // discard cached crcs as we will be writing through c_str()
+  buffer->invalidate_crc();
+  auto p = reinterpret_cast<unsigned char*>(const_cast<char*>(buffer->c_str()));
+  __authenticated_decrypt_update(p, buffer->length());
+}
+
 void AES128GCM_OnWireRxHandler::authenticated_decrypt_update(
   ceph::bufferlist& bl)
 {
@@ -223,13 +251,7 @@ void AES128GCM_OnWireRxHandler::authenticated_decrypt_update(
   bl.invalidate_crc();
   for (auto& buf : bl.buffers()) {
     auto p = reinterpret_cast<unsigned char*>(const_cast<char*>(buf.c_str()));
-    int update_len = 0;
-
-    if (1 != EVP_DecryptUpdate(ectx.get(), p, &update_len, p, buf.length())) {
-      throw std::runtime_error("EVP_DecryptUpdate failed");
-    }
-    ceph_assert_always(update_len >= 0);
-    ceph_assert(static_cast<unsigned>(update_len) == buf.length());
+    __authenticated_decrypt_update(p, buf.length());
   }
 }
 
@@ -263,6 +285,43 @@ void AES128GCM_OnWireRxHandler::authenticated_decrypt_update_final(
     }
     ceph_assert_always(final_len == 0);
     ceph_assert(bl.length() + AESGCM_TAG_LEN == orig_len);
+  }
+}
+
+void AES128GCM_OnWireRxHandler::authenticated_decrypt_update_final(rx_buffer_t& buffer)
+{
+  unsigned orig_len = buffer->length();
+  ceph_assert(orig_len >= AESGCM_TAG_LEN);
+
+  // decrypt optional data. Caller is obliged to provide only signature but it
+  // may supply ciphertext as well. Combining the update + final is reflected
+  // combined together.  
+  //char      auth_tag[AESGCM_TAG_LEN];
+  //memcpy(auth_tag, src, AESGCM_TAG_LEN);
+  unsigned  auth_tag_offset = (orig_len - AESGCM_TAG_LEN);
+  char     *auth_tag = buffer->c_str() + auth_tag_offset;
+  buffer->set_length(auth_tag_offset);
+  if (buffer->length() > 0) {
+    authenticated_decrypt_update(buffer);
+  }
+
+  // we need to ensure the tag is stored in continuous memory.
+  if (1 != EVP_CIPHER_CTX_ctrl(ectx.get(), EVP_CTRL_GCM_SET_TAG,
+	AESGCM_TAG_LEN, auth_tag)) {
+    ceph_abort_msg("bad auth tag");
+    throw std::runtime_error("EVP_CIPHER_CTX_ctrl failed");
+  }
+
+  // I expect that 0 bytes will be appended. The call is supposed solely to
+  // authenticate the message.
+  {
+    int final_len = 0;
+    if (0 >= EVP_DecryptFinal_ex(ectx.get(), nullptr, &final_len)) {
+      ceph_abort_msg("bad auth tag2");
+      throw MsgAuthError();
+    }
+    ceph_assert_always(final_len == 0);
+    ceph_assert(buffer->length() + AESGCM_TAG_LEN == orig_len);
   }
 }
 
