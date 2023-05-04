@@ -312,15 +312,11 @@ public:
                             const uint16_t segment_aligns[],
                             size_t segment_count);
 
-  Tag disassemble_preamble(rx_buffer_t& rx_preamble, bool &crypto, bool &rev1);
-  Tag disassemble_preamble(bufferlist& preamble_bl);
+  Tag disassemble_preamble(rx_buffer_t& rx_preamble);
 
   bool disassemble_segments(rx_buffer_t& rx_preamble, 
                             bufferlist segments_bls[], 
                             rx_buffer_t& rx_epilogue, bool& no_pad, bool& no_epilogue) const;
-  bool disassemble_segments(bufferlist & rx_preamble, 
-                            bufferlist segments_bls[], 
-                            rx_buffer_t& rx_epilogue) const;
 
 private:
   struct segment_desc_t {
@@ -382,13 +378,9 @@ private:
   // and must be dropped.
   void disassemble_first_segment(rx_buffer_t& rx_preamble,
                                  bufferlist& segment_bl, bool& no_pad) const;
-  void disassemble_first_segment(bufferlist& rx_preamble,
-                                 bufferlist& segment_bl) const;
   
   bool disassemble_remaining_segments(bufferlist segment_bls[],
                                       rx_buffer_t& rx_epilogue, bool& no_epilogue) const;
-  bool disassemble_remaining_segments(bufferlist segment_bls[],
-                                      rx_buffer_t& rx_epilogue) const;
   void disassemble_decompress(bufferlist segment_bls[]) const;
 
   bool disasm_all_crc_rev0(bufferlist segment_bls[],
@@ -397,15 +389,11 @@ private:
                               rx_buffer_t& rx_epilogue) const;
   void disasm_first_crc_rev1(rx_buffer_t& rx_preamble,
                              bufferlist& segment_bl) const;
-  void disasm_first_crc_rev1(bufferlist& rx_preamble,
-                             bufferlist& segment_bl) const;
 
   bool disasm_remaining_crc_rev1(bufferlist segment_bls[],
                                  rx_buffer_t& rx_epilogue) const;
   void disasm_first_secure_rev1(rx_buffer_t& rx_preamble,
                                 bufferlist& segment_bl, bool& no_pad) const;
-  void disasm_first_secure_rev1(bufferlist& rx_preamble,
-                                bufferlist& segment_bl) const;
   bool disasm_remaining_secure_rev1(bufferlist segment_bls[],
                                     rx_buffer_t& rx_epilogue) const;
 

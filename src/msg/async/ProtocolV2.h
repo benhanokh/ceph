@@ -40,36 +40,7 @@ private:
     WAIT,
     CLOSED
   };
-
-  static const char *get_state_name(int state) {
-    const char *const statenames[] = {"NONE",
-                                      "START_CONNECT",
-                                      "BANNER_CONNECTING",
-                                      "HELLO_CONNECTING",
-                                      "AUTH_CONNECTING",
-                                      "AUTH_CONNECTING_SIGN",
-                                      "COMPRESSION_CONNECTING",
-                                      "SESSION_CONNECTING",
-                                      "SESSION_RECONNECTING",
-                                      "START_ACCEPT",
-                                      "BANNER_ACCEPTING",
-                                      "HELLO_ACCEPTING",
-                                      "AUTH_ACCEPTING",
-                                      "AUTH_ACCEPTING_MORE",
-                                      "AUTH_ACCEPTING_SIGN",
-                                      "COMPRESSION_ACCEPTING",
-                                      "SESSION_ACCEPTING",
-                                      "READY",
-                                      "THROTTLE_MESSAGE",
-                                      "THROTTLE_BYTES",
-                                      "THROTTLE_DISPATCH_QUEUE",
-                                      "THROTTLE_DONE",
-                                      "READ_MESSAGE_COMPLETE",
-                                      "STANDBY",
-                                      "WAIT",
-                                      "CLOSED"};
-    return statenames[state];
-  }
+  static const char *get_state_name(int state) ;
 
   // TODO: move into auth_meta?
   ceph::crypto::onwire::rxtx_t session_stream_handlers;
@@ -105,11 +76,9 @@ private:
   ceph::msgr::v2::FrameAssembler tx_frame_asm;
   ceph::msgr::v2::FrameAssembler rx_frame_asm;
 
-  bool  recycle_preamble_buffer = true;
   std::vector<rx_buffer_t> buffers_pool;
-  ceph::bufferlist rx_preamble_bl;
   rx_buffer_t rx_preamble_ptr;
-  rx_buffer_t rx_epilogue;
+  rx_buffer_t rx_epilogue_ptr;
   ceph::msgr::v2::segment_bls_t rx_segments_data; // vector of bufferlists
   ceph::msgr::v2::Tag next_tag;
   utime_t backoff;  // backoff time
@@ -174,7 +143,6 @@ private:
   CONTINUATION_DECL(ProtocolV2, read_frame);
   CONTINUATION_DECL(ProtocolV2, finish_auth);
   READ_BPTR_HANDLER_CONTINUATION_DECL(ProtocolV2, handle_read_frame_preamble_main);
-  READ_BPTR_HANDLER_CONTINUATION_DECL(ProtocolV2, handle_read_frame_preamble_main_no_alloc);
   READ_BPTR_HANDLER_CONTINUATION_DECL(ProtocolV2, handle_read_frame_segment);
   READ_BPTR_HANDLER_CONTINUATION_DECL(ProtocolV2, handle_read_frame_epilogue_main);
   CONTINUATION_DECL(ProtocolV2, throttle_message);
@@ -187,7 +155,6 @@ private:
   Ct<ProtocolV2> *finish_client_auth();
   Ct<ProtocolV2> *finish_server_auth();
   Ct<ProtocolV2> *handle_read_frame_preamble_main(rx_buffer_t &&buffer, int r);
-  Ct<ProtocolV2> *handle_read_frame_preamble_main_no_alloc(rx_buffer_t &&buffer, int r);
   Ct<ProtocolV2> *read_frame_segment();
   Ct<ProtocolV2> *handle_read_frame_segment(rx_buffer_t &&rx_buffer, int r);
   Ct<ProtocolV2> *_handle_read_frame_segment();
