@@ -105,6 +105,7 @@ ProtocolV2::ProtocolV2(AsyncConnection *connection)
                    &session_compression_handlers),
       rx_frame_asm(&session_stream_handlers, false, cct->_conf->ms_crc_data,
                    &session_compression_handlers),
+      buffer_cache(cct),
       next_tag(static_cast<Tag>(0)),
       keepalive(false) {
 }
@@ -484,27 +485,27 @@ void ProtocolV2::read_event() {
 
   switch (state) {
     case START_CONNECT:
-      ldout(cct, 0) << "::GBH::MSG::ProtocolV2::read_event()::START_CONNECT" << dendl;
+      //ldout(cct, 0) << "::GBH::MSG::ProtocolV2::read_event()::START_CONNECT" << dendl;
       run_continuation(CONTINUATION(start_client_banner_exchange));
       break;
     case START_ACCEPT:
-      ldout(cct, 0) << "::GBH::MSG::ProtocolV2::read_event()::START_ACCEPT" << dendl;
+      //ldout(cct, 0) << "::GBH::MSG::ProtocolV2::read_event()::START_ACCEPT" << dendl;
       run_continuation(CONTINUATION(start_server_banner_exchange));
       break;
     case READY:
-      ldout(cct, 0) << "::GBH::MSG::ProtocolV2::read_event()::READY" << dendl;
+      //ldout(cct, 0) << "::GBH::MSG::ProtocolV2::read_event()::READY" << dendl;
       run_continuation(CONTINUATION(read_frame));
       break;
     case THROTTLE_MESSAGE:
-      ldout(cct, 0) << "::GBH::MSG::ProtocolV2::read_event()::THROTTLE_MESSAGE" << dendl;
+      //ldout(cct, 0) << "::GBH::MSG::ProtocolV2::read_event()::THROTTLE_MESSAGE" << dendl;
       run_continuation(CONTINUATION(throttle_message));
       break;
     case THROTTLE_BYTES:
-      ldout(cct, 0) << "::GBH::MSG::ProtocolV2::read_event()::THROTTLE_BYTES" << dendl;
+      //ldout(cct, 0) << "::GBH::MSG::ProtocolV2::read_event()::THROTTLE_BYTES" << dendl;
       run_continuation(CONTINUATION(throttle_bytes));
       break;
     case THROTTLE_DISPATCH_QUEUE:
-      ldout(cct, 0) << "::GBH::MSG::ProtocolV2::read_event()::THROTTLE_DISPATCH_QUEUE" << dendl;
+      //ldout(cct, 0) << "::GBH::MSG::ProtocolV2::read_event()::THROTTLE_DISPATCH_QUEUE" << dendl;
       run_continuation(CONTINUATION(throttle_dispatch_queue));
       break;
     default:
@@ -1087,12 +1088,15 @@ CtPtr ProtocolV2::handle_hello(ceph::bufferlist &payload)
 }
 
 
+static constexpr uint32_t HEADER_SIZE         =  45;
+static constexpr uint32_t PAYLOAD_SIZE        = 232;
+static constexpr uint32_t MAX_DATA_BUFFER     = 320;
+static constexpr uint32_t MAX_PREAMBLE_BUFFER =  96;
 
 //---------------------------------------------------------------------------
 void ProtocolV2::allocate_new_buffer(rx_buffer_t& rx_buff, unsigned onwire_len, const char* caller)
 {
-  const unsigned ALLOC_SIZE = 96;
-  rx_buff = ceph::buffer::ptr_node::create(ceph::buffer::create(std::max(ALLOC_SIZE, onwire_len)));
+  rx_buff = ceph::buffer::ptr_node::create(ceph::buffer::create(std::max(MAX_DATA_BUFFER, onwire_len)));
   rx_buff->set_length(onwire_len);
   ldout(cct, 0) << "::(X)GBH::MSG::ALLOCATE_NEW_BUFFER()::" << caller << " onwire_len=" << onwire_len
 		<< ", alloc_size=" << rx_buff->raw_length() << "\n" << dendl;
@@ -1219,7 +1223,7 @@ CtPtr ProtocolV2::handle_read_frame_preamble_main(rx_buffer_t &&buffer, int r) {
     return read_frame_segment();
   }
 }
-
+#if 0
 //---------------------------------------------------------------------------
 static const char *get_state_name(int state) {
   const char *const statenames[] = {"NONE",
@@ -1250,7 +1254,7 @@ static const char *get_state_name(int state) {
     "CLOSED"};
   return statenames[state];
 }
-
+#endif
 //---------------------------------------------------------------------------
 static const char* get_tag_name(unsigned index)
 {
@@ -1313,6 +1317,7 @@ CtPtr ProtocolV2::handle_read_frame_dispatch() {
     case Tag::COMPRESSION_DONE:
       return handle_frame_payload();
     case Tag::MESSAGE:
+      //return handle_message(rx_segments_data.data());
       return handle_message();
     default: {
       lderr(cct) << __func__
@@ -1325,6 +1330,339 @@ CtPtr ProtocolV2::handle_read_frame_dispatch() {
   return nullptr;
 }
 
+//---------------------------------------------------------------------------
+CtPtr ProtocolV2::read_frame_segments_with_epilogue()
+{
+  //ldout(cct, 0) << "::(A)GBH::MSG::ProtocolV2::read_frame_segments_with_epilogue()" << dendl;
+  uint32_t header_len   = rx_frame_asm.get_header_segment_onwire_len();
+  uint32_t payload_len  = rx_frame_asm.get_payload_segment_onwire_len();
+  //ldout(cct, 0) << "::(A)GBH::MSG::ProtocolV2::read_frame_segments_with_epilogue() header_len=" << header_len << ", payload_len=" << payload_len << dendl;
+  uint32_t middle_len   = rx_frame_asm.get_middle_segment_onwire_len();
+  //ldout(cct, 0) << "::(A)GBH::MSG::ProtocolV2::read_frame_segments_with_epilogue() middle_len=" << middle_len << dendl;
+  uint32_t data_len     = rx_frame_asm.get_data_segment_onwire_len();
+  //ldout(cct, 0) << "::(A)GBH::MSG::ProtocolV2::read_frame_segments_with_epilogue() data_len=" << data_len << dendl;
+  uint32_t epilogue_len = rx_frame_asm.get_epilogue_onwire_len();
+  //ldout(cct, 0) << "::(A)GBH::MSG::ProtocolV2::read_frame_segments_with_epilogue() epilogue_len=" << epilogue_len << dendl;
+  uint32_t aggregated_len = header_len + payload_len;
+  ceph_assert(aggregated_len > 0);
+  ldout(cct, 0) << "::(A)GBH::MSG::ProtocolV2::read_frame_segments_with_epilogue(A):: aggregated_len=" << aggregated_len << dendl;
+
+  if ((middle_len == 0) && (epilogue_len > 0) && (aggregated_len+epilogue_len <= MAX_DATA_BUFFER)) {
+    // we can read header and payload in a single call
+    // if no data segment exist we can add the epilogue to the same call
+
+    if (data_len == 0) {
+      // This is a Read-Req which only has: HEADER, PAYLOAD and EPILOGUE
+      // fetch them all in a single call
+      aggregated_len += epilogue_len;
+    }
+    // otherwise,this is a Write-Req fetch only HEADER and PAYLOAD
+    // we will read the DATA and EPILOGUE with 2 extra calls
+  }
+  else {
+    // unfamiliar message -> use legacy code
+    ldout(cct, 0) << "::(A)GBH::MSG::ProtocolV2:: unfamiliar message -> redirect to read_frame_segment()" << dendl;
+    return read_frame_segment();
+  }
+
+  allocate_new_buffer(rx_segment_ptr, MAX_DATA_BUFFER, "rx_segment_ptr::alloc");
+  if (data_len == 0) {
+    return READ_RXBUF(std::move(rx_segment_ptr), handle_read_frame_segments_header_payload_and_epilogue);
+  }
+  else {
+    return READ_RXBUF(std::move(rx_segment_ptr), handle_read_frame_segments_data);
+  }
+}
+
+//--------------------------------------------------------------------------------
+CtPtr ProtocolV2::handle_read_frame_segments_header_payload_and_epilogue(rx_buffer_t &&rx_buffer, int r)
+{
+  ldout(cct, 0) << "::GBH::MSG::" << __func__ << " r=" << r << dendl;
+
+  if (unlikely(r < 0)) {
+    ldout(cct, 0) << __func__ << " read failed r=" << r << " (" << cpp_strerror(r) << ")" << dendl;
+    return _fault();
+  }
+
+  rx_segment_ptr = std::move(rx_buffer);
+  return handle_read_frame_segments_done(std::move(rx_segment_ptr), 0);
+}
+
+//--------------------------------------------------------------------------------
+CtPtr ProtocolV2::handle_read_frame_segments_data(rx_buffer_t &&rx_buffer, int r)
+{
+  ldout(cct, 0) << "::GBH::MSG::" << __func__ << " r=" << r << dendl;
+
+  if (unlikely(r < 0)) {
+    ldout(cct, 0) << __func__ << " read failed r=" << r << " (" << cpp_strerror(r) << ")" << dendl;
+    return _fault();
+  }
+
+  rx_segment_ptr = std::move(rx_buffer);
+
+  ceph_assert(rx_data_ptr == nullptr);
+  uint16_t align    = rx_frame_asm.get_segment_align(SegmentIndex::Msg::DATA);
+  uint32_t data_len = rx_frame_asm.get_data_segment_onwire_len();
+  ldout(cct, 0) << "::GBH::MSG::handle_read_frame_segments_data() len="
+		<< data_len << ", align=" << align << dendl;
+  rx_data_ptr = ceph::buffer::ptr_node::create(ceph::buffer::create_aligned(data_len, align));
+  return READ_RXBUF(std::move(rx_data_ptr), handle_read_frame_epilogue);
+}
+
+//--------------------------------------------------------------------------------
+CtPtr ProtocolV2::handle_read_frame_epilogue(rx_buffer_t &&rx_buffer, int r)
+{
+  ldout(cct, 0) << "::GBH::MSG::" << __func__ << " r=" << r << dendl;
+
+  if (unlikely(r < 0)) {
+    ldout(cct, 0) << __func__ << " read failed r=" << r << " (" << cpp_strerror(r) << ")" << dendl;
+    return _fault();
+  }
+
+  rx_data_ptr = std::move(rx_buffer);
+  uint32_t epilogue_len = rx_frame_asm.get_epilogue_onwire_len();
+  ceph_assert(epilogue_len);
+
+  if (unlikely(rx_epilogue_ptr2 == nullptr)) {
+    allocate_new_buffer(rx_epilogue_ptr2, epilogue_len, "rx_epilogue_ptr2::copy from buffer");
+  }
+  else {
+    ceph_assert(rx_epilogue_ptr2->raw_nref() == 1);
+    ceph_assert(rx_epilogue_ptr2->raw_length() >= epilogue_len);
+    // reset buffer
+    rx_epilogue_ptr2->set_offset(0);
+    rx_epilogue_ptr2->set_length(epilogue_len);
+  }
+
+  return READ_RXBUF(std::move(rx_epilogue_ptr2), handle_read_frame_epilogue_done);
+}
+
+//--------------------------------------------------------------------------------
+CtPtr ProtocolV2::handle_read_frame_epilogue_done(rx_buffer_t &&rx_buffer, int r)
+{
+  ldout(cct, 0) << "::GBH::MSG::" << __func__ << " r=" << r << dendl;
+
+  if (unlikely(r < 0)) {
+    ldout(cct, 0) << __func__ << " read failed r=" << r << " (" << cpp_strerror(r) << ")" << dendl;
+    return _fault();
+  }
+
+  rx_epilogue_ptr2 = std::move(rx_buffer);
+  return handle_read_frame_segments_done(std::move(rx_segment_ptr), 0);
+}
+
+#if 1
+//--------------------------------------------------------------------------------
+CtPtr ProtocolV2::handle_read_frame_segments_done(rx_buffer_t &&rx_buffer, int r)
+{
+  ldout(cct, 0) << "::GBH::MSG::handle_read_frame_segments_done() buffer_cache.entries_count()=" << buffer_cache.entries_count() << dendl;
+  std::array<bufferlist, MessageFrame::SegmentsNumV> segments_bls;
+  //bufferlist  segments_bls[MessageFrame::SegmentsNumV];
+  rx_segment_ptr = std::move(rx_buffer);
+  
+  bool ok = false;
+  ceph_assert(rx_segment_ptr);
+  ceph_assert(rx_preamble_ptr);
+  char* p = rx_segment_ptr->c_str();
+  auto preamble = reinterpret_cast<const preamble_block_t*>(rx_preamble_ptr->c_str());
+  unsigned total_len = 0;
+  ldout(cct, 0) << "::GBH::MSG::ProtocolV2::preamble->num_segments=" << (unsigned)preamble->num_segments << dendl;
+
+  // header segment has a built in CRC
+  // following segment got their crc in the epilogue  
+  unsigned len = preamble->segments[0].length + FRAME_CRC_SIZE;
+  segments_bls[SegmentIndex::Msg::HEADER].append(p, len);
+  p += len;
+  total_len += len;
+
+  // payload
+  len = preamble->segments[1].length;
+  unsigned alloc_len = round_up_to(len, 16);
+  alloc_len = std::max(alloc_len, MIN);
+  rx_buffer_t rx_payload = std::move(buffer_cache.alloc_rx(alloc_len));
+  ceph_assert(rx_payload);
+  ldout(cct, 0) << "::GBH::MSG::ProtocolV2::rx_payload .len=" << rx_payload->length() << ", .raw_len=" << rx_payload->raw_length() << dendl;
+  rx_payload->set_length(0);
+  rx_payload->set_offset(0);
+  segments_bls[SegmentIndex::Msg::FRONT].push_back(std::move(rx_payload));
+  segments_bls[1].append(p, len);
+  p += len;
+  total_len += len;
+  ceph_assert(total_len <= rx_segment_ptr->length());
+
+  // there is no middle frame so can safely skip it
+  ceph_assert(preamble->segments[SegmentIndex::Msg::MIDDLE].length == 0);
+
+  uint32_t data_len = rx_frame_asm.get_data_segment_onwire_len();
+  if (data_len == 0) {
+    // this was a read req with rx_buffer holding header/payload/epilogue
+    // Need to copy the epilogue from the rx_buffer
+    uint32_t epilogue_len = rx_frame_asm.get_epilogue_onwire_len();
+    if (epilogue_len > 0) {
+      total_len += epilogue_len;
+      ceph_assert(total_len <= rx_segment_ptr->length());
+      if (unlikely(rx_epilogue_ptr2 == nullptr)) {
+	allocate_new_buffer(rx_epilogue_ptr2, epilogue_len, "rx_epilogue_ptr2::copy from buffer");
+      }
+      else {
+	ceph_assert(rx_epilogue_ptr2->raw_nref() == 1);
+	ceph_assert(rx_epilogue_ptr2->raw_length() >= epilogue_len);
+	// reset buffer
+	//ldout(cct, 0) << "::(X)GBH::MSG::ProtocolV2::rx_epilogue_ptr: reset len=" << epilogue_len << "/" << rx_epilogue_ptr->raw_length() << dendl;
+	rx_epilogue_ptr2->set_offset(0);
+      }
+      // temporary code to allow copying into epilogue buffer
+      rx_epilogue_ptr2->set_length(0);
+      rx_epilogue_ptr2->append(p, epilogue_len);
+    }
+    ceph_assert(total_len == rx_segment_ptr->length());
+  }
+  else {
+    // data segment
+    segments_bls[SegmentIndex::Msg::DATA].push_back(std::move(rx_data_ptr));    
+  }
+  
+  try {
+#if 0
+    char* header = p;
+    unsigned header_len = 0;
+    p = rx_frame_asm.disasm_first_crc_rev1(rx_preamble_ptr, p, &header_len);
+#else
+    bool no_pad = false, no_epilogue = false;
+    ok = rx_frame_asm.disassemble_segments(rx_preamble_ptr, segments_bls.data(), rx_epilogue_ptr2, no_pad, no_epilogue);
+#endif
+  } catch (FrameError& e) {
+    ceph_abort_msg("FrameError");
+    ldout(cct, 1) << __func__ << " " << e.what() << dendl;
+    return _fault();
+  } catch (ceph::crypto::onwire::MsgAuthError&) {
+    ceph_abort_msg("MsgAuthError");
+    ldout(cct, 1) << __func__ << "bad auth tag" << dendl;
+    return _fault();
+  }
+
+  if (ok) {
+    ceph_assert(next_tag == Tag::MESSAGE);
+    return handle_message(segments_bls.data());
+  }
+  
+  // we do have a mechanism that allows transmitter to start sending message
+  // and abort after putting entire data field on wire. This will be used by
+  // the kernel client to avoid unnecessary buffering.
+
+  ldout(cct, 0) << "::=============   NOT OK ====================" << dendl;
+  reset_throttle();
+  state = READY;
+  ceph_abort_msg("NOT IMPLEMENETED YET");
+  return CONTINUE(read_frame);
+}
+#else
+//--------------------------------------------------------------------------------
+CtPtr ProtocolV2::handle_read_frame_segments_done(rx_buffer_t &&rx_buffer, int r)
+{
+  ldout(cct, 0) << "::GBH::MSG::handle_read_frame_segments_done() r="
+		<< r << ", buffer_cache.entries_count()=" << buffer_cache.entries_count() << dendl;
+
+  if (unlikely(r < 0)) {
+    ldout(cct, 0) << __func__ << " read failed r=" << r << " (" << cpp_strerror(r) << ")" << dendl;
+    return _fault();
+  }
+
+  std::array<bufferlist, MessageFrame::SegmentsNumV> segments_bls;
+  //bufferlist  segments_bls[MessageFrame::SegmentsNumV];
+  rx_segment_ptr = std::move(rx_buffer);
+
+  bool ok = false;
+  try {
+    ceph_assert(rx_segment_ptr);
+    ceph_assert(rx_preamble_ptr);
+    char* p = rx_segment_ptr->c_str();
+#if 0
+    char* header = p;
+    unsigned header_len = 0;
+    p = rx_frame_asm.disasm_first_crc_rev1(rx_preamble_ptr, p, &header_len);
+    if (header.type == CEPH_MSG_OSD_OP)
+
+#else
+    auto preamble = reinterpret_cast<const preamble_block_t*>(rx_preamble_ptr->c_str());
+    unsigned total_len = 0;
+    ldout(cct, 0) << "::GBH::MSG::ProtocolV2::preamble->num_segments=" << (unsigned)preamble->num_segments << dendl;
+    for (unsigned i = 0; i < preamble->num_segments; i++) {      
+      unsigned len = preamble->segments[i].length;
+      if (i == 0) {
+	// the first segment has a built in CRC
+	// following segment got theur crc in the epilogue
+	len += FRAME_CRC_SIZE;
+      }
+      else if (i == 1) {
+	unsigned alloc_len = round_up_to(len, 16);
+	ldout(cct, 0) << "::GBH::MSG::ProtocolV2::allocate from buffer_cache len=" << len << ", alloc_len=" << alloc_len << dendl;
+	rx_buffer_t rx_buffer = std::move(buffer_cache.alloc_rx(alloc_len));
+	ceph_assert(rx_buffer);
+	ldout(cct, 0) << "::GBH::MSG::ProtocolV2::rx_buffer .len=" << rx_buffer->length() << ", .raw_len=" << rx_buffer->raw_length() << dendl;
+	segments_bls[i].push_back(std::move(rx_buffer));
+      }
+      if (len > 0) {
+	total_len += len;
+	//ldout(cct, 0) << "::GBH::MSG::ProtocolV2::[" << i << "] len=" << len << ", total_len=" << total_len << dendl;
+	ceph_assert(total_len <= rx_segment_ptr->length());
+	ldout(cct, 0) << "::GBH::MSG::ProtocolV2::bl.length(X1)=" << segments_bls[i].length() << dendl;
+	segments_bls[i].append(p, len);
+	ldout(cct, 0) << "::GBH::MSG::ProtocolV2::bl.length(X2)=" << segments_bls[i].length() << dendl;
+	p += len;
+      }
+    }
+    
+    uint32_t epilogue_onwire_len = rx_frame_asm.get_epilogue_onwire_len();
+    if (epilogue_onwire_len > 0) {
+      total_len += epilogue_onwire_len;
+      ceph_assert(total_len <= rx_segment_ptr->length());
+      if (unlikely(rx_epilogue_ptr2 == nullptr)) {
+	allocate_new_buffer(rx_epilogue_ptr2, epilogue_onwire_len, "rx_epilogue_ptr2::copy from buffer");
+      }
+      else {
+	ceph_assert(rx_epilogue_ptr2->raw_nref() == 1);
+	ceph_assert(rx_epilogue_ptr2->raw_length() >= epilogue_onwire_len);
+	// reset buffer
+	//ldout(cct, 0) << "::(X)GBH::MSG::ProtocolV2::rx_epilogue_ptr: reset len=" << epilogue_onwire_len << "/" << rx_epilogue_ptr->raw_length() << dendl;
+	rx_epilogue_ptr2->set_offset(0);
+      }
+      // temporary code to allow copying into epilogue buffer
+      rx_epilogue_ptr2->set_length(0);
+      rx_epilogue_ptr2->append(p, epilogue_onwire_len);
+    }
+    ceph_assert(total_len == rx_segment_ptr->length());
+    bool no_pad = false, no_epilogue = false;
+    ok = rx_frame_asm.disassemble_segments(rx_preamble_ptr, segments_bls.data(), rx_epilogue_ptr2, no_pad, no_epilogue);
+#endif
+  } catch (FrameError& e) {
+    ceph_abort_msg("FrameError");
+    ldout(cct, 1) << __func__ << " " << e.what() << dendl;
+    return _fault();
+  } catch (ceph::crypto::onwire::MsgAuthError&) {
+    ceph_abort_msg("MsgAuthError");
+    ldout(cct, 1) << __func__ << "bad auth tag" << dendl;
+    return _fault();
+  }
+
+  if (ok) {
+    ceph_assert(next_tag == Tag::MESSAGE);
+    return handle_message(segments_bls.data());
+  }
+  
+  // we do have a mechanism that allows transmitter to start sending message
+  // and abort after putting entire data field on wire. This will be used by
+  // the kernel client to avoid unnecessary buffering.
+
+  ldout(cct, 0) << "::=============   NOT OK ====================" << dendl;
+  reset_throttle();
+  state = READY;
+  ceph_abort_msg("NOT IMPLEMENETED YET");
+  return CONTINUE(read_frame);
+}
+#endif
+
+//--------------------------------------------------------------------------------
 CtPtr ProtocolV2::read_frame_segment() {
   size_t seg_idx = rx_segments_data.size();
   ldout(cct, 20) << __func__ << " seg_idx=" << seg_idx << dendl;
@@ -1339,7 +1677,7 @@ CtPtr ProtocolV2::read_frame_segment() {
   rx_buffer_t rx_buffer;
   uint16_t align = rx_frame_asm.get_segment_align(seg_idx);
   try {
-    ldout(cct, 0) << "::(Z)GBH::MSG::ProtocolV2::read_frame_segment() segment_onwire_len=" << onwire_len << ", align=" << align << ", seg_idx=" << seg_idx << dendl;
+    //ldout(cct, 0) << "::(Z)GBH::MSG::ProtocolV2::read_frame_segment() segment_onwire_len=" << onwire_len << ", align=" << align << ", seg_idx=" << seg_idx << dendl;
     rx_buffer = ceph::buffer::ptr_node::create(ceph::buffer::create_aligned(
         onwire_len, align));
   } catch (const ceph::buffer::bad_alloc&) {
@@ -1385,7 +1723,7 @@ CtPtr ProtocolV2::_handle_read_frame_segment() {
     }
     else {
       // reset buffer
-      ldout(cct, 0) << "::(X)GBH::MSG::ProtocolV2::rx_epilogue_ptr: reset len=" << epilogue_onwire_len << "/" << rx_epilogue_ptr->raw_length() << dendl;
+      //ldout(cct, 0) << "::(X)GBH::MSG::ProtocolV2::rx_epilogue_ptr: reset len=" << epilogue_onwire_len << "/" << rx_epilogue_ptr->raw_length() << dendl;
       rx_epilogue_ptr->set_offset(0);
       rx_epilogue_ptr->set_length(epilogue_onwire_len);
     }
@@ -1528,8 +1866,205 @@ CtPtr ProtocolV2::_handle_read_frame_epilogue_main() {
   return handle_read_frame_dispatch();
 }
 
+CtPtr ProtocolV2::handle_message(bufferlist segments_bls[]) {
+  ldout(cct, 0) << "::(4)GBH::MSG::handle_message()::SegmentsNumV=" << MessageFrame::SegmentsNumV
+		<< ", size(rx_segments_data)=" << std::size(rx_segments_data) << dendl;
+
+  ldout(cct, 20) << __func__ << dendl;
+  ceph_assert(state == THROTTLE_DONE);
+
+  const size_t cur_msg_size = get_current_msg_size();
+
+
+#if 0
+  //static constexpr size_t SegmentsNumV = sizeof...(SegmentAlignmentVs);
+  //static_assert(SegmentsNumV > 0 && SegmentsNumV <= MAX_NUM_SEGMENTS);
+
+  ldout(cct, 0) << "::(4)GBH::MSG::ProtocolV2::handle_message()::MessageFrame::SegmentsNumV="
+		<< MessageFrame::SegmentsNumV << ", std::size(rx_segments_data)=" << std::size(rx_segments_data) << dendl;
+
+  std::array<ceph::bufferlist, MessageFrame::SegmentsNumV> segments;
+  for (__u8 idx = 0; idx < std::size(rx_segments_data); idx++) {
+    segments[idx] = std::move(rx_segments_data[idx]);
+  }
+#endif
+
+  // XXX: paranoid copy just to avoid oops
+  auto& hdrbl = segments_bls[SegmentIndex::Msg::HEADER];
+  ceph_msg_header2 current_header = reinterpret_cast<const ceph_msg_header2&>(*hdrbl.c_str());
+  bufferlist front  = std::move(segments_bls[SegmentIndex::Msg::FRONT]);
+  bufferlist middle = std::move(segments_bls[SegmentIndex::Msg::MIDDLE]);
+  bufferlist data   = std::move(segments_bls[SegmentIndex::Msg::DATA]);
+
+  ldout(cct, 5) << __func__
+		<< " got " << front.length()
+		<< " + "   << middle.length()
+		<< " + "   << data.length()
+		<< " byte message."
+		<< " envelope type=" << current_header.type
+		<< " src " << peer_name
+		<< " off " << current_header.data_off
+		<< dendl;
+
+  INTERCEPT(16);
+  ceph_msg_header header{current_header.seq,
+    current_header.tid,
+    current_header.type,
+    current_header.priority,
+    current_header.version,
+    ceph_le32(front.length()),
+    ceph_le32(middle.length()),
+    ceph_le32(data.length()),
+    current_header.data_off,
+    peer_name,
+    current_header.compat_version,
+    current_header.reserved,
+    ceph_le32(0)};
+  ceph_msg_footer footer{ceph_le32(0), ceph_le32(0),
+    ceph_le32(0), ceph_le64(0), current_header.flags};
+
+  // will allocate the Message data-struct and copy buffer-list, header and footer into it
+  ldout(cct, 0) << "::(4)GBH::MSG::ProtocolV2::calling fast_decode_message() b_cache.entries_count=" << buffer_cache.entries_count() << dendl;
+  Message *message = fast_decode_message(cct, &buffer_cache, header, footer, front, middle, data, connection);
+  if (!message) {
+    ldout(cct, 1) << __func__ << " decode message failed " << dendl;
+    return _fault();
+  } else {
+    state = READ_MESSAGE_COMPLETE;
+  }
+
+  INTERCEPT(17);
+  message->set_cct(cct);
+  message->set_byte_throttler(connection->policy.throttler_bytes);
+  message->set_message_throttler(connection->policy.throttler_messages);
+
+  // store reservation size in message, so we don't get confused
+  // by messages entering the dispatch queue through other paths.
+  message->set_dispatch_throttle_size(cur_msg_size);
+
+  message->set_recv_stamp(recv_stamp);
+  message->set_throttle_stamp(throttle_stamp);
+  message->set_recv_complete_stamp(ceph_clock_now());
+
+  // check received seq#.  if it is old, drop the message.
+  // note that incoming messages may skip ahead.  this is convenient for the
+  // client side queueing because messages can't be renumbered, but the (kernel)
+  // client will occasionally pull a message out of the sent queue to send
+  // elsewhere.  in that case it doesn't matter if we "got" it or not.
+  uint64_t cur_seq = in_seq;
+  if (message->get_seq() <= cur_seq) {
+    ldout(cct, 0) << __func__ << " got old message " << message->get_seq()
+		  << " <= " << cur_seq << " " << message << " " << *message
+		  << ", discarding" << dendl;
+    message->put();
+    if (connection->has_feature(CEPH_FEATURE_RECONNECT_SEQ) &&
+	cct->_conf->ms_die_on_old_message) {
+      ceph_assert(0 == "old msgs despite reconnect_seq feature");
+    }
+    return nullptr;
+  }
+  if (message->get_seq() > cur_seq + 1) {
+    ldout(cct, 0) << __func__ << " missed message?  skipped from seq "
+		  << cur_seq << " to " << message->get_seq() << dendl;
+    if (cct->_conf->ms_die_on_skipped_message) {
+      ceph_assert(0 == "skipped incoming seq");
+    }
+  }
+
+#if defined(WITH_EVENTTRACE)
+  if (message->get_type() == CEPH_MSG_OSD_OP ||
+      message->get_type() == CEPH_MSG_OSD_OPREPLY) {
+    utime_t ltt_processed_stamp = ceph_clock_now();
+    double usecs_elapsed =
+      ((double)(ltt_processed_stamp.to_nsec() - recv_stamp.to_nsec())) / 1000;
+    ostringstream buf;
+    if (message->get_type() == CEPH_MSG_OSD_OP)
+      OID_ELAPSED_WITH_MSG(message, usecs_elapsed, "TIME_TO_DECODE_OSD_OP",
+			   false);
+    else
+      OID_ELAPSED_WITH_MSG(message, usecs_elapsed, "TIME_TO_DECODE_OSD_OPREPLY",
+			   false);
+  }
+#endif
+
+  // note last received message.
+  in_seq = message->get_seq();
+  ldout(cct, 5) << __func__ << " received message m=" << message
+		<< " seq=" << message->get_seq()
+		<< " from=" << message->get_source() << " type=" << header.type
+		<< " " << *message << dendl;
+
+  bool need_dispatch_writer = false;
+  if (!connection->policy.lossy) {
+    ack_left++;
+    need_dispatch_writer = true;
+  }
+
+  state = READY;
+
+  ceph::mono_time fast_dispatch_time;
+
+  if (connection->is_blackhole()) {
+    ldout(cct, 10) << __func__ << " blackhole " << *message << dendl;
+    message->put();
+    goto out;
+  }
+
+  connection->logger->inc(l_msgr_recv_messages);
+  connection->logger->inc(l_msgr_recv_bytes,
+			  rx_frame_asm.get_frame_onwire_len());
+  if (session_stream_handlers.rx) {
+    connection->logger->inc(l_msgr_recv_encrypted_bytes,
+			    rx_frame_asm.get_frame_onwire_len());
+  }
+
+  messenger->ms_fast_preprocess(message);
+  fast_dispatch_time = ceph::mono_clock::now();
+  connection->logger->tinc(l_msgr_running_recv_time,
+			   fast_dispatch_time - connection->recv_start_time);
+  if (connection->delay_state) {
+    double delay_period = 0;
+    if (rand() % 10000 < cct->_conf->ms_inject_delay_probability * 10000.0) {
+      delay_period =
+	cct->_conf->ms_inject_delay_max * (double)(rand() % 10000) / 10000.0;
+      ldout(cct, 1) << "queue_received will delay after "
+		    << (ceph_clock_now() + delay_period) << " on " << message
+		    << " " << *message << dendl;
+    }
+    connection->delay_state->queue(delay_period, message);
+  } else if (messenger->ms_can_fast_dispatch(message)) {
+    connection->lock.unlock();
+    //ldout(cct, 0) << "::GBH::MSG::ProtocolV2::handle_message::connection->dispatch_queue->fast_dispatch(message)" << dendl;
+    connection->dispatch_queue->fast_dispatch(message);
+    connection->recv_start_time = ceph::mono_clock::now();
+    connection->logger->tinc(l_msgr_running_fast_dispatch_time,
+			     connection->recv_start_time - fast_dispatch_time);
+    connection->lock.lock();
+    // we might have been reused by another connection
+    // let's check if that is the case
+    if (state != READY) {
+      // yes, that was the case, let's do nothing
+      return nullptr;
+    }
+  } else {
+    connection->dispatch_queue->enqueue(message, message->get_priority(),
+					connection->conn_id);
+  }
+
+  handle_message_ack(current_header.ack_seq);
+
+ out:
+  if (need_dispatch_writer && connection->is_connected()) {
+    connection->center->dispatch_event_external(connection->write_handler);
+  }
+
+  return CONTINUE(read_frame);
+}
+#if 1
 CtPtr ProtocolV2::handle_message() {
-  ldout(cct, 0) << "::(4)GBH::MSG::ProtocolV2::handle_message()" << dendl;
+  ldout(cct, 0) << "::(4)GBH::MSG::handle_message()::SegmentsNumV=" << MessageFrame::SegmentsNumV
+		<< ", size(rx_segments_data)=" << std::size(rx_segments_data) << dendl;
+
   ldout(cct, 20) << __func__ << dendl;
   ceph_assert(state == THROTTLE_DONE);
 
@@ -1568,7 +2103,7 @@ CtPtr ProtocolV2::handle_message() {
 	                 ceph_le32(0), ceph_le64(0), current_header.flags};
 
   // will allocate the Message data-struct and copy buffer-list, header and footer into it
-  Message *message = decode_message(cct, 0, header, footer,
+  Message *message = decode_message(cct, nullptr, 0, header, footer,
       msg_frame.front(),
       msg_frame.middle(),
       msg_frame.data(),
@@ -1681,7 +2216,7 @@ CtPtr ProtocolV2::handle_message() {
     connection->delay_state->queue(delay_period, message);
   } else if (messenger->ms_can_fast_dispatch(message)) {
     connection->lock.unlock();
-    ldout(cct, 0) << "::GBH::MSG::ProtocolV2::handle_message::connection->dispatch_queue->fast_dispatch(message)" << dendl;
+    //ldout(cct, 0) << "::GBH::MSG::ProtocolV2::handle_message::connection->dispatch_queue->fast_dispatch(message)" << dendl;
     connection->dispatch_queue->fast_dispatch(message);
     connection->recv_start_time = ceph::mono_clock::now();
     connection->logger->tinc(l_msgr_running_fast_dispatch_time,
@@ -1707,7 +2242,7 @@ CtPtr ProtocolV2::handle_message() {
 
   return CONTINUE(read_frame);
 }
-
+#endif
 
 CtPtr ProtocolV2::throttle_message() {
   ldout(cct, 20) << __func__ << dendl;
@@ -1797,7 +2332,18 @@ CtPtr ProtocolV2::throttle_dispatch_queue() {
   throttle_stamp = ceph_clock_now();
   state = THROTTLE_DONE;
 
+#if 1
+  // no need to suppoprt encryption or rev0 yet
+  if (HAVE_MSGR2_FEATURE(peer_supported_features, REVISION_1) && !session_stream_handlers.rx.get()) {
+    ldout(cct, 0) << "::GBH::MSG::ProtocolV2::use new-code !!!" << dendl;
+    return read_frame_segments_with_epilogue();
+  }
+  else {
+    return read_frame_segment();
+  }
+#else
   return read_frame_segment();
+#endif
 }
 
 CtPtr ProtocolV2::handle_keepalive2(ceph::bufferlist &payload)

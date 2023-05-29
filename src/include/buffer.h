@@ -411,6 +411,7 @@ struct error_code;
    */
 
   class CEPH_BUFFER_API list {
+    using rx_buffer_t = std::unique_ptr<ceph::buffer::ptr_node, ceph::buffer::ptr_node::disposer>;
   public:
     // this the very low-level implementation of singly linked list
     // ceph::buffer::list is built on. We don't use intrusive slist
@@ -607,6 +608,12 @@ struct error_code;
 	auto ret = erase_after(it);
 	ptr_node::disposer()(to_dispose);
 	return ret;
+      }
+
+      void reset()
+      {
+	_tail = &_root;
+        _root.next = _tail;
       }
 
       void swap(buffers_t& other) {
@@ -1011,6 +1018,33 @@ struct error_code;
       return _len;
     }
 
+    unsigned raw_length() const;
+    int rewind();
+
+    //using rx_buffer_t = std::unique_ptr<ceph::buffer::ptr_node, ceph::buffer::ptr_node::disposer>;
+    //ptr_node* _carriage;
+    rx_buffer_t pop_back()
+    {
+      if (_carriage && (_num == 1) && (_carriage->raw_nref() == 1)) {
+	rx_buffer_t out;
+	out.reset(_carriage);
+	_carriage = &always_empty_bptr;
+	
+	out->set_length(0);
+	out->set_offset(0);
+	out->invalidate_crc();
+
+	_len = 0;
+	_num = 0;
+
+	_buffers.reset();
+	return (out);
+      }
+      else {
+	return nullptr;
+      }
+    }
+
     bool contents_equal(const buffer::list& other) const;
     bool contents_equal(const void* other, size_t length) const;
 
@@ -1046,6 +1080,7 @@ struct error_code;
       _buffers.push_back(*ptr_node::create(std::move(bp)).release());
       _carriage = &always_empty_bptr;
     }
+
     void push_back(const ptr_node&) = delete;
     void push_back(ptr_node&) = delete;
     void push_back(ptr_node&&) = delete;

@@ -39,6 +39,7 @@
 #include "msg/Connection.h"
 #include "msg/MessageRef.h"
 #include "msg_types.h"
+#include "buffer_cache.h"
 
 #ifdef WITH_SEASTAR
 #  include "crimson/net/SocketConnection.h"
@@ -246,7 +247,7 @@
 #define MSG_MGR_UPDATE     0x70b
 
 // ======================================================
-
+using rx_buffer_t = std::unique_ptr<ceph::buffer::ptr_node, ceph::buffer::ptr_node::disposer>;
 // abstract Message class
 
 class Message : public RefCountedObject {
@@ -260,6 +261,7 @@ public:
 #endif // WITH_SEASTAR
 
 protected:
+  //CephContext     *cct{nullptr};
   ceph_msg_header  header;      // headerelope
   ceph_msg_footer  footer;
   ceph::buffer::list       payload;  // "front" unaligned blob
@@ -278,7 +280,7 @@ protected:
   utime_t recv_complete_stamp;
 
   ConnectionFRef connection;
-
+  BufferCache *buffer_cache = nullptr;
   uint32_t magic = 0;
 
   boost::intrusive::list_member_hook<> dispatch_q;
@@ -347,6 +349,9 @@ public:
   }
 
 protected:
+#if 1
+  ~Message() override;
+#else
   ~Message() override {
     if (byte_throttler)
       byte_throttler->put(payload.length() + middle.length() + data.length());
@@ -356,10 +361,14 @@ protected:
     if (completion_hook)
       completion_hook->complete(0);
   }
+#endif
 public:
   const ConnectionFRef& get_connection() const { return connection; }
   void set_connection(ConnectionRef c) {
     connection = std::move(c);
+  }
+  void set_buffer_cache(BufferCache *_buffer_cache) {
+    this->buffer_cache = _buffer_cache;
   }
   CompletionHook* get_completion_hook() { return completion_hook; }
   void set_completion_hook(CompletionHook *hook) { completion_hook = hook; }
@@ -390,7 +399,10 @@ public:
    * there is no throttle being used. The other
    * functions are throttling-aware as appropriate.
    */
-
+#if 1
+  void clear_payload();
+  void clear_data();
+#else
   void clear_payload() {
     if (byte_throttler) {
       byte_throttler->put(payload.length() + middle.length());
@@ -399,13 +411,14 @@ public:
     middle.clear();
   }
 
-  virtual void clear_buffers() {}
   void clear_data() {
     if (byte_throttler)
       byte_throttler->put(data.length());
     data.clear();
     clear_buffers(); // let subclass drop buffers as well
   }
+#endif
+  virtual void clear_buffers() {}
   void release_message_throttle() {
     if (msg_throttler)
       msg_throttler->put();
@@ -421,6 +434,32 @@ public:
     payload = std::move(bl);
     if (byte_throttler)
       byte_throttler->take(payload.length());
+  }
+#if 0
+  void set_payload(ceph::buffer::ptr_node *pn) {
+    if (byte_throttler) {
+      byte_throttler->put(payload.length());
+      payload.push_back(pn);
+      //payload = std::move(bl);
+      byte_throttler->take(payload.length());
+    }
+    else {
+      payload.push_back(pn);
+      //payload = std::move(bl);
+    }
+  }
+#endif
+  void set_payload(rx_buffer_t && rx_buffer) {
+    if (byte_throttler) {
+      byte_throttler->put(payload.length());
+      payload.push_back(std::move(rx_buffer));
+      //payload = std::move(bl);
+      byte_throttler->take(payload.length());
+    }
+    else {
+      payload.push_back(std::move(rx_buffer));
+      //payload = std::move(bl);
+    }
   }
 
   void set_middle(ceph::buffer::list& bl) {
@@ -533,6 +572,7 @@ public:
 };
 
 extern Message *decode_message(CephContext *cct,
+			       BufferCache *buffer_cache,
                                int crcflags,
                                ceph_msg_header& header,
                                ceph_msg_footer& footer,
@@ -540,6 +580,17 @@ extern Message *decode_message(CephContext *cct,
                                ceph::buffer::list& middle,
                                ceph::buffer::list& data,
                                Message::ConnectionRef conn);
+
+extern Message *fast_decode_message(CephContext            *cct,
+				    BufferCache            *_buffer_cache,
+				    ceph_msg_header        &header,
+				    ceph_msg_footer        &footer,
+				    ceph::bufferlist       &front,
+				    //rx_buffer_t           &&payload,
+				    ceph::bufferlist       &middle,
+				    ceph::bufferlist       &data,
+				    Message::ConnectionRef  conn);
+
 inline std::ostream& operator<<(std::ostream& out, const Message& m) {
   m.print(out);
   if (m.get_header().version)

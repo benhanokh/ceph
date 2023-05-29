@@ -306,6 +306,7 @@ void Message::dump(ceph::Formatter *f) const
 }
 
 Message *decode_message(CephContext *cct,
+			BufferCache *_buffer_cache,
                         int crcflags,
                         ceph_msg_header& header,
                         ceph_msg_footer& footer,
@@ -314,6 +315,8 @@ Message *decode_message(CephContext *cct,
                         ceph::bufferlist& data,
                         Message::ConnectionRef conn)
 {
+  ldout(cct, 0) << "(11)OSD::GBH::Message::decode_message()::crcflags=" << crcflags << " "
+		<< (header.type == CEPH_MSG_OSD_OP ? "CEPH_MSG_OSD_OP" : "") << dendl;
   // verify crc
   if (crcflags & MSG_CRC_HEADER) {
     __u32 front_crc = front.crc32c(0);
@@ -341,6 +344,7 @@ Message *decode_message(CephContext *cct,
     }
   }
   if (crcflags & MSG_CRC_DATA) {
+    ldout(cct, 0) << "(11)OSD::GBH::MSG::decode_message()::MSG_CRC_DATA" << dendl;
     if ((footer.flags & CEPH_MSG_FOOTER_NOCRC) == 0) {
       __u32 data_crc = data.crc32c(0);
       if (data_crc != footer.data_crc) {
@@ -940,6 +944,10 @@ Message *decode_message(CephContext *cct,
   }
 
   m->set_cct(cct);
+  if (_buffer_cache) {
+    ldout(cct, 0) << "OSD::GBH::MSG::decode_message()::m->set_b_cache() .entries_count=" << _buffer_cache->entries_count() << dendl;
+    m->set_buffer_cache(_buffer_cache);
+  }
 
   // m->header.version, if non-zero, should be populated with the
   // newest version of the encoding the code supports.  If set, check
@@ -963,9 +971,10 @@ Message *decode_message(CephContext *cct,
   m->set_payload(front);
   m->set_middle(middle);
   m->set_data(data);
-  ldout(cct, 1) << "::(M)GBH::MSG::Message.cc::decode_message() payload.len=" << m->get_payload().length()
+#if 0
+  ldout(cct, 0) << "::(M)GBH::MSG::Message.cc::decode_message() payload.len=" << m->get_payload().length()
 		<< ", middle.len=" << m->get_middle().length() << ", data.len=" << m->get_data().length()<< dendl;
-
+#endif
   try {
     m->decode_payload();
   }
@@ -986,6 +995,735 @@ Message *decode_message(CephContext *cct,
 
   // done!
   return m.detach();
+}
+
+
+Message *fast_decode_message(CephContext *cct,
+			     BufferCache *_buffer_cache,
+			     ceph_msg_header& header,
+			     ceph_msg_footer& footer,
+			     ceph::bufferlist& front,
+			     ceph::bufferlist& middle,
+			     ceph::bufferlist& data,
+			     Message::ConnectionRef conn)
+{
+  ldout(cct, 0) << "(11)OSD::GBH::Message::fast_decode_message()::"
+		<< (header.type == CEPH_MSG_OSD_OP ? "CEPH_MSG_OSD_OP" : "") << dendl;
+  
+  // make message
+  ceph::ref_t<Message> m;
+  int type = header.type;
+  switch (type) {
+
+    // -- with payload --
+
+    using ceph::make_message;
+
+  case MSG_PGSTATS:
+    m = make_message<MPGStats>();
+    break;
+  case MSG_PGSTATSACK:
+    m = make_message<MPGStatsAck>();
+    break;
+
+  case CEPH_MSG_STATFS:
+    m = make_message<MStatfs>();
+    break;
+  case CEPH_MSG_STATFS_REPLY:
+    m = make_message<MStatfsReply>();
+    break;
+  case MSG_GETPOOLSTATS:
+    m = make_message<MGetPoolStats>();
+    break;
+  case MSG_GETPOOLSTATSREPLY:
+    m = make_message<MGetPoolStatsReply>();
+    break;
+  case CEPH_MSG_POOLOP:
+    m = make_message<MPoolOp>();
+    break;
+  case CEPH_MSG_POOLOP_REPLY:
+    m = make_message<MPoolOpReply>();
+    break;
+  case MSG_MON_COMMAND:
+    m = make_message<MMonCommand>();
+    break;
+  case MSG_MON_COMMAND_ACK:
+    m = make_message<MMonCommandAck>();
+    break;
+  case MSG_MON_PAXOS:
+    m = make_message<MMonPaxos>();
+    break;
+  case MSG_CONFIG:
+    m = make_message<MConfig>();
+    break;
+  case MSG_GET_CONFIG:
+    m = make_message<MGetConfig>();
+    break;
+  case MSG_KV_DATA:
+    m = make_message<MKVData>();
+    break;
+
+  case MSG_MON_PROBE:
+    m = make_message<MMonProbe>();
+    break;
+  case MSG_MON_JOIN:
+    m = make_message<MMonJoin>();
+    break;
+  case MSG_MON_ELECTION:
+    m = make_message<MMonElection>();
+    break;
+  case MSG_MON_SYNC:
+    m = make_message<MMonSync>();
+    break;
+  case MSG_MON_PING:
+    m = make_message<MMonPing>();
+    break;
+  case MSG_MON_SCRUB:
+    m = make_message<MMonScrub>();
+    break;
+
+  case MSG_LOG:
+    m = make_message<MLog>();
+    break;
+  case MSG_LOGACK:
+    m = make_message<MLogAck>();
+    break;
+
+  case CEPH_MSG_PING:
+    m = make_message<MPing>();
+    break;
+  case MSG_COMMAND:
+    m = make_message<MCommand>();
+    break;
+  case MSG_COMMAND_REPLY:
+    m = make_message<MCommandReply>();
+    break;
+  case MSG_OSD_BACKFILL_RESERVE:
+    m = make_message<MBackfillReserve>();
+    break;
+  case MSG_OSD_RECOVERY_RESERVE:
+    m = make_message<MRecoveryReserve>();
+    break;
+  case MSG_OSD_FORCE_RECOVERY:
+    m = make_message<MOSDForceRecovery>();
+    break;
+
+  case MSG_ROUTE:
+    m = make_message<MRoute>();
+    break;
+  case MSG_FORWARD:
+    m = make_message<MForward>();
+    break;
+    
+  case CEPH_MSG_MON_MAP:
+    m = make_message<MMonMap>();
+    break;
+  case CEPH_MSG_MON_GET_MAP:
+    m = make_message<MMonGetMap>();
+    break;
+  case CEPH_MSG_MON_GET_OSDMAP:
+    m = make_message<MMonGetOSDMap>();
+    break;
+  case MSG_MON_GET_PURGED_SNAPS:
+    m = make_message<MMonGetPurgedSnaps>();
+    break;
+  case MSG_MON_GET_PURGED_SNAPS_REPLY:
+    m = make_message<MMonGetPurgedSnapsReply>();
+    break;
+  case CEPH_MSG_MON_GET_VERSION:
+    m = make_message<MMonGetVersion>();
+    break;
+  case CEPH_MSG_MON_GET_VERSION_REPLY:
+    m = make_message<MMonGetVersionReply>();
+    break;
+
+  case MSG_OSD_BOOT:
+    m = make_message<MOSDBoot>();
+    break;
+  case MSG_OSD_ALIVE:
+    m = make_message<MOSDAlive>();
+    break;
+  case MSG_OSD_BEACON:
+    m = make_message<MOSDBeacon>();
+    break;
+  case MSG_OSD_PGTEMP:
+    m = make_message<MOSDPGTemp>();
+    break;
+  case MSG_OSD_FAILURE:
+    m = make_message<MOSDFailure>();
+    break;
+  case MSG_OSD_MARK_ME_DOWN:
+    m = make_message<MOSDMarkMeDown>();
+    break;
+  case MSG_OSD_MARK_ME_DEAD:
+    m = make_message<MOSDMarkMeDead>();
+    break;
+  case MSG_OSD_FULL:
+    m = make_message<MOSDFull>();
+    break;
+  case MSG_OSD_PING:
+    m = make_message<MOSDPing>();
+    break;
+  case CEPH_MSG_OSD_OP:
+    m = make_message<MOSDOp>();
+    break;
+  case CEPH_MSG_OSD_OPREPLY:
+    m = make_message<MOSDOpReply>();
+    break;
+  case MSG_OSD_REPOP:
+    m = make_message<MOSDRepOp>();
+    break;
+  case MSG_OSD_REPOPREPLY:
+    m = make_message<MOSDRepOpReply>();
+    break;
+  case MSG_OSD_PG_CREATED:
+    m = make_message<MOSDPGCreated>();
+    break;
+  case MSG_OSD_PG_UPDATE_LOG_MISSING:
+    m = make_message<MOSDPGUpdateLogMissing>();
+    break;
+  case MSG_OSD_PG_UPDATE_LOG_MISSING_REPLY:
+    m = make_message<MOSDPGUpdateLogMissingReply>();
+    break;
+  case CEPH_MSG_OSD_BACKOFF:
+    m = make_message<MOSDBackoff>();
+    break;
+
+  case CEPH_MSG_OSD_MAP:
+    m = make_message<MOSDMap>();
+    break;
+
+  case CEPH_MSG_WATCH_NOTIFY:
+    m = make_message<MWatchNotify>();
+    break;
+
+  case MSG_OSD_PG_NOTIFY:
+    m = make_message<MOSDPGNotify>();
+    break;
+  case MSG_OSD_PG_NOTIFY2:
+    m = make_message<MOSDPGNotify2>();
+    break;
+  case MSG_OSD_PG_QUERY:
+    m = make_message<MOSDPGQuery>();
+    break;
+  case MSG_OSD_PG_QUERY2:
+    m = make_message<MOSDPGQuery2>();
+    break;
+  case MSG_OSD_PG_LOG:
+    m = make_message<MOSDPGLog>();
+    break;
+  case MSG_OSD_PG_REMOVE:
+    m = make_message<MOSDPGRemove>();
+    break;
+  case MSG_OSD_PG_INFO:
+    m = make_message<MOSDPGInfo>();
+    break;
+  case MSG_OSD_PG_INFO2:
+    m = make_message<MOSDPGInfo2>();
+    break;
+  case MSG_OSD_PG_CREATE2:
+    m = make_message<MOSDPGCreate2>();
+    break;
+  case MSG_OSD_PG_TRIM:
+    m = make_message<MOSDPGTrim>();
+    break;
+  case MSG_OSD_PG_LEASE:
+    m = make_message<MOSDPGLease>();
+    break;
+  case MSG_OSD_PG_LEASE_ACK:
+    m = make_message<MOSDPGLeaseAck>();
+    break;
+
+  case MSG_OSD_SCRUB2:
+    m = make_message<MOSDScrub2>();
+    break;
+  case MSG_OSD_SCRUB_RESERVE:
+    m = make_message<MOSDScrubReserve>();
+    break;
+  case MSG_REMOVE_SNAPS:
+    m = make_message<MRemoveSnaps>();
+    break;
+  case MSG_OSD_REP_SCRUB:
+    m = make_message<MOSDRepScrub>();
+    break;
+  case MSG_OSD_REP_SCRUBMAP:
+    m = make_message<MOSDRepScrubMap>();
+    break;
+  case MSG_OSD_PG_SCAN:
+    m = make_message<MOSDPGScan>();
+    break;
+  case MSG_OSD_PG_BACKFILL:
+    m = make_message<MOSDPGBackfill>();
+    break;
+  case MSG_OSD_PG_BACKFILL_REMOVE:
+    m = make_message<MOSDPGBackfillRemove>();
+    break;
+  case MSG_OSD_PG_PUSH:
+    m = make_message<MOSDPGPush>();
+    break;
+  case MSG_OSD_PG_PULL:
+    m = make_message<MOSDPGPull>();
+    break;
+  case MSG_OSD_PG_PUSH_REPLY:
+    m = make_message<MOSDPGPushReply>();
+    break;
+  case MSG_OSD_PG_RECOVERY_DELETE:
+    m = make_message<MOSDPGRecoveryDelete>();
+    break;
+  case MSG_OSD_PG_RECOVERY_DELETE_REPLY:
+    m = make_message<MOSDPGRecoveryDeleteReply>();
+    break;
+  case MSG_OSD_PG_READY_TO_MERGE:
+    m = make_message<MOSDPGReadyToMerge>();
+    break;
+  case MSG_OSD_EC_WRITE:
+    m = make_message<MOSDECSubOpWrite>();
+    break;
+  case MSG_OSD_EC_WRITE_REPLY:
+    m = make_message<MOSDECSubOpWriteReply>();
+    break;
+  case MSG_OSD_EC_READ:
+    m = make_message<MOSDECSubOpRead>();
+    break;
+  case MSG_OSD_EC_READ_REPLY:
+    m = make_message<MOSDECSubOpReadReply>();
+    break;
+   // auth
+  case CEPH_MSG_AUTH:
+    m = make_message<MAuth>();
+    break;
+  case CEPH_MSG_AUTH_REPLY:
+    m = make_message<MAuthReply>();
+    break;
+
+  case MSG_MON_GLOBAL_ID:
+    m = make_message<MMonGlobalID>();
+    break; 
+  case MSG_MON_USED_PENDING_KEYS:
+    m = make_message<MMonUsedPendingKeys>();
+    break; 
+
+    // clients
+  case CEPH_MSG_MON_SUBSCRIBE:
+    m = make_message<MMonSubscribe>();
+    break;
+  case CEPH_MSG_MON_SUBSCRIBE_ACK:
+    m = make_message<MMonSubscribeAck>();
+    break;
+  case CEPH_MSG_CLIENT_SESSION:
+    m = make_message<MClientSession>();
+    break;
+  case CEPH_MSG_CLIENT_RECONNECT:
+    m = make_message<MClientReconnect>();
+    break;
+  case CEPH_MSG_CLIENT_REQUEST:
+    m = make_message<MClientRequest>();
+    break;
+  case CEPH_MSG_CLIENT_REQUEST_FORWARD:
+    m = make_message<MClientRequestForward>();
+    break;
+  case CEPH_MSG_CLIENT_REPLY:
+    m = make_message<MClientReply>();
+    break;
+  case CEPH_MSG_CLIENT_RECLAIM:
+    m = make_message<MClientReclaim>();
+    break;
+  case CEPH_MSG_CLIENT_RECLAIM_REPLY:
+    m = make_message<MClientReclaimReply>();
+    break;
+  case CEPH_MSG_CLIENT_CAPS:
+    m = make_message<MClientCaps>();
+    break;
+  case CEPH_MSG_CLIENT_CAPRELEASE:
+    m = make_message<MClientCapRelease>();
+    break;
+  case CEPH_MSG_CLIENT_LEASE:
+    m = make_message<MClientLease>();
+    break;
+  case CEPH_MSG_CLIENT_SNAP:
+    m = make_message<MClientSnap>();
+    break;
+  case CEPH_MSG_CLIENT_QUOTA:
+    m = make_message<MClientQuota>();
+    break;
+  case CEPH_MSG_CLIENT_METRICS:
+    m = make_message<MClientMetrics>();
+    break;
+
+    // mds
+  case MSG_MDS_PEER_REQUEST:
+    m = make_message<MMDSPeerRequest>();
+    break;
+
+  case CEPH_MSG_MDS_MAP:
+    m = make_message<MMDSMap>();
+    break;
+  case CEPH_MSG_FS_MAP:
+    m = make_message<MFSMap>();
+    break;
+  case CEPH_MSG_FS_MAP_USER:
+    m = make_message<MFSMapUser>();
+    break;
+  case MSG_MDS_BEACON:
+    m = make_message<MMDSBeacon>();
+    break;
+  case MSG_MDS_OFFLOAD_TARGETS:
+    m = make_message<MMDSLoadTargets>();
+    break;
+  case MSG_MDS_RESOLVE:
+    m = make_message<MMDSResolve>();
+    break;
+  case MSG_MDS_RESOLVEACK:
+    m = make_message<MMDSResolveAck>();
+    break;
+  case MSG_MDS_CACHEREJOIN:
+    m = make_message<MMDSCacheRejoin>();
+	break;
+  
+  case MSG_MDS_DIRUPDATE:
+    m = make_message<MDirUpdate>();
+    break;
+
+  case MSG_MDS_DISCOVER:
+    m = make_message<MDiscover>();
+    break;
+  case MSG_MDS_DISCOVERREPLY:
+    m = make_message<MDiscoverReply>();
+    break;
+
+  case MSG_MDS_FINDINO:
+    m = make_message<MMDSFindIno>();
+    break;
+  case MSG_MDS_FINDINOREPLY:
+    m = make_message<MMDSFindInoReply>();
+    break;
+
+  case MSG_MDS_OPENINO:
+    m = make_message<MMDSOpenIno>();
+    break;
+  case MSG_MDS_OPENINOREPLY:
+    m = make_message<MMDSOpenInoReply>();
+    break;
+
+  case MSG_MDS_SNAPUPDATE:
+    m = make_message<MMDSSnapUpdate>();
+    break;
+
+  case MSG_MDS_FRAGMENTNOTIFY:
+    m = make_message<MMDSFragmentNotify>();
+    break;
+
+  case MSG_MDS_FRAGMENTNOTIFYACK:
+    m = make_message<MMDSFragmentNotifyAck>();
+    break;
+
+  case MSG_MDS_SCRUB:
+    m = make_message<MMDSScrub>();
+    break;
+
+  case MSG_MDS_SCRUB_STATS:
+    m = make_message<MMDSScrubStats>();
+    break;
+
+  case MSG_MDS_EXPORTDIRDISCOVER:
+    m = make_message<MExportDirDiscover>();
+    break;
+  case MSG_MDS_EXPORTDIRDISCOVERACK:
+    m = make_message<MExportDirDiscoverAck>();
+    break;
+  case MSG_MDS_EXPORTDIRCANCEL:
+    m = make_message<MExportDirCancel>();
+    break;
+
+  case MSG_MDS_EXPORTDIR:
+    m = make_message<MExportDir>();
+    break;
+  case MSG_MDS_EXPORTDIRACK:
+    m = make_message<MExportDirAck>();
+    break;
+  case MSG_MDS_EXPORTDIRFINISH:
+    m = make_message<MExportDirFinish>();
+    break;
+
+  case MSG_MDS_EXPORTDIRNOTIFY:
+    m = make_message<MExportDirNotify>();
+    break;
+
+  case MSG_MDS_EXPORTDIRNOTIFYACK:
+    m = make_message<MExportDirNotifyAck>();
+    break;
+
+  case MSG_MDS_EXPORTDIRPREP:
+    m = make_message<MExportDirPrep>();
+    break;
+
+  case MSG_MDS_EXPORTDIRPREPACK:
+    m = make_message<MExportDirPrepAck>();
+    break;
+
+  case MSG_MDS_EXPORTCAPS:
+    m = make_message<MExportCaps>();
+    break;
+  case MSG_MDS_EXPORTCAPSACK:
+    m = make_message<MExportCapsAck>();
+    break;
+  case MSG_MDS_GATHERCAPS:
+    m = make_message<MGatherCaps>();
+    break;
+
+
+  case MSG_MDS_DENTRYUNLINK_ACK:
+    m = make_message<MDentryUnlinkAck>();
+    break;
+  case MSG_MDS_DENTRYUNLINK:
+    m = make_message<MDentryUnlink>();
+    break;
+  case MSG_MDS_DENTRYLINK:
+    m = make_message<MDentryLink>();
+    break;
+
+  case MSG_MDS_HEARTBEAT:
+    m = make_message<MHeartbeat>();
+    break;
+
+  case MSG_MDS_CACHEEXPIRE:
+    m = make_message<MCacheExpire>();
+    break;
+
+  case MSG_MDS_TABLE_REQUEST:
+    m = make_message<MMDSTableRequest>();
+    break;
+
+	/*  case MSG_MDS_INODEUPDATE:
+    m = make_message<MInodeUpdate>();
+    break;
+	*/
+
+  case MSG_MDS_INODEFILECAPS:
+    m = make_message<MInodeFileCaps>();
+    break;
+
+  case MSG_MDS_LOCK:
+    m = make_message<MLock>();
+    break;
+
+  case MSG_MDS_METRICS:
+    m = make_message<MMDSMetrics>();
+    break;
+
+  case MSG_MDS_PING:
+    m = make_message<MMDSPing>();
+    break;
+
+  case MSG_MGR_BEACON:
+    m = make_message<MMgrBeacon>();
+    break;
+
+  case MSG_MON_MGR_REPORT:
+    m = make_message<MMonMgrReport>();
+    break;
+
+  case MSG_SERVICE_MAP:
+    m = make_message<MServiceMap>();
+    break;
+
+  case MSG_MGR_MAP:
+    m = make_message<MMgrMap>();
+    break;
+
+  case MSG_MGR_DIGEST:
+    m = make_message<MMgrDigest>();
+    break;
+
+  case MSG_MGR_COMMAND:
+    m = make_message<MMgrCommand>();
+    break;
+
+  case MSG_MGR_COMMAND_REPLY:
+    m = make_message<MMgrCommandReply>();
+    break;
+
+  case MSG_MGR_OPEN:
+    m = make_message<MMgrOpen>();
+    break;
+
+  case MSG_MGR_UPDATE:
+    m = make_message<MMgrUpdate>();
+    break;
+
+  case MSG_MGR_CLOSE:
+    m = make_message<MMgrClose>();
+    break;
+
+  case MSG_MGR_REPORT:
+    m = make_message<MMgrReport>();
+    break;
+
+  case MSG_MGR_CONFIGURE:
+    m = make_message<MMgrConfigure>();
+    break;
+
+  case MSG_TIMECHECK:
+    m = make_message<MTimeCheck>();
+    break;
+  case MSG_TIMECHECK2:
+    m = make_message<MTimeCheck2>();
+    break;
+
+  case MSG_MON_HEALTH:
+    m = make_message<MMonHealth>();
+    break;
+
+  case MSG_MON_HEALTH_CHECKS:
+    m = make_message<MMonHealthChecks>();
+    break;
+
+    // -- simple messages without payload --
+
+  case CEPH_MSG_SHUTDOWN:
+    m = make_message<MGenericMessage>(type);
+    break;
+
+  default:
+    if (cct) {
+      ldout(cct, 0) << "can't decode unknown message type " << type << " MSG_AUTH=" << CEPH_MSG_AUTH << dendl;
+      if (cct->_conf->ms_die_on_bad_msg)
+	ceph_abort();
+    }
+    return 0;
+  }
+
+  m->set_cct(cct);
+  if (_buffer_cache) {
+    ldout(cct, 0) << "OSD::GBH::MSG::decode_message()::m->set_b_cache() .entries_count=" << _buffer_cache->entries_count() << dendl;
+    m->set_buffer_cache(_buffer_cache);
+  }
+
+  // m->header.version, if non-zero, should be populated with the
+  // newest version of the encoding the code supports.  If set, check
+  // it against compat_version.
+  if (m->get_header().version &&
+      m->get_header().version < header.compat_version) [[unlikely]] {
+    if (cct) {
+      ldout(cct, 0) << "will not decode message of type " << type
+		    << " version " << header.version
+		    << " because compat_version " << header.compat_version
+		    << " > supported version " << m->get_header().version << dendl;
+      if (cct->_conf->ms_die_on_bad_msg)
+	ceph_abort();
+    }
+    return 0;
+  }
+
+  m->set_connection(std::move(conn));
+  m->set_header(header);
+  m->set_footer(footer);
+#if 0
+  ldout(cct, 0) << "::(M)GBH::MSG::Message.cc::decode_message() set payload buffer!!" << dendl;
+  ptr_node* pn = front.pop_back();
+  m->set_payload(pn);
+#else
+  m->set_payload(front);
+#endif
+
+  m->set_middle(middle);
+  m->set_data(data);
+#if 0
+  ldout(cct, 0) << "::(M)GBH::MSG::Message.cc::decode_message() payload.len=" << m->get_payload().length()
+		<< ", middle.len=" << m->get_middle().length() << ", data.len=" << m->get_data().length()<< dendl;
+#endif
+  try {
+    m->decode_payload();
+  }
+  catch (const ceph::buffer::error &e) {
+    if (cct) {
+      lderr(cct) << "failed to decode message of type " << type
+		 << " v" << header.version
+		 << ": " << e.what() << dendl;
+      ldout(cct, ceph::dout::need_dynamic(
+	cct->_conf->ms_dump_corrupt_message_level)) << "dump: \n";
+      m->get_payload().hexdump(*_dout);
+      *_dout << dendl;
+      if (cct->_conf->ms_die_on_bad_msg)
+	ceph_abort();
+    }
+    return 0;
+  }
+
+  // done!
+  return m.detach();
+}
+
+#include <boost/stacktrace.hpp>
+
+void Message::clear_payload()
+{
+  if (byte_throttler) {
+    byte_throttler->put(payload.length() + middle.length());
+  }
+
+  if (this->buffer_cache && payload.length()) {
+    rx_buffer_t rx_buffer = payload.pop_back();
+    if (rx_buffer) {
+      if (cct) {
+	ldout(cct, 0) << "::GBH::MSG::clear_payload() .len=" << payload.length() << ", .raw_len=" << payload.raw_length() << dendl;
+      }
+      int ret = this->buffer_cache->free_rx(std::move(rx_buffer));
+      ceph_assert(ret == 0);
+    }
+    else {
+      if (cct) {
+	ldout(cct, 0) << "::(M*M)GBH::MSG::clear_payload() failed payload.pop_back()" << dendl;
+      }
+      payload.clear();
+    }
+  }
+  else {
+    payload.clear();
+  }
+  middle.clear();
+}
+
+void Message::clear_data() {
+  if (byte_throttler) {
+    byte_throttler->put(data.length());
+  }
+#if 0
+  if (cct) {
+    ldout(cct, 0) << "::(M)GBH::MSG::clear_data() data.len=" << get_data().length() << dendl;
+  }
+
+  if (this->buffer_cache && data.length()) {
+    this->buffer_cache->add_entry(std::move(data));
+  }
+  else {
+#endif
+  data.clear();
+  clear_buffers(); // let subclass drop buffers as well
+}
+
+Message::~Message()
+{
+  if (byte_throttler) {
+    byte_throttler->put(payload.length() + middle.length() + data.length());
+  }
+
+  if (this->buffer_cache && payload.length()) {
+    rx_buffer_t rx_buffer = payload.pop_back();
+    if (rx_buffer) {
+      if (cct) {
+	ldout(cct, 0) << "::GBH::MSG::~Message() payload.len=" << payload.length() << dendl;
+      }
+      int ret = this->buffer_cache->free_rx(std::move(rx_buffer));
+      ceph_assert(ret == 0);
+    }
+  }
+
+  release_message_throttle();
+  trace.event("message destructed");
+  /* call completion hooks (if any) */
+  if (completion_hook)
+    completion_hook->complete(0);
 }
 
 void Message::encode_trace(ceph::bufferlist &bl, uint64_t features) const
@@ -1083,5 +1821,5 @@ Message *decode_message(CephContext *cct, int crcflags, ceph::bufferlist::const_
   decode(fr, p);
   decode(mi, p);
   decode(da, p);
-  return decode_message(cct, crcflags, h, f, fr, mi, da, nullptr);
+  return decode_message(cct, nullptr, crcflags, h, f, fr, mi, da, nullptr);
 }

@@ -261,6 +261,47 @@ public:
     return m_descs[seg_idx].logical_len;
   }
 
+  uint32_t get_aggregated_segments_onwire_len() {
+    uint32_t aggregated_len = get_segment_onwire_len(0);
+    for (unsigned seg_idx = 1; seg_idx < m_descs.size(); seg_idx++) {
+      aggregated_len += get_segment_onwire_len(seg_idx);
+    }
+    return aggregated_len;
+  }
+
+  uint32_t get_header_segment_onwire_len() {
+    return get_segment_onwire_len(SegmentIndex::Msg::HEADER);
+  }
+
+  uint32_t get_non_header_segment_onwire_len(size_t seg_idx) const {
+    // if segment doesn't exist -> return 0 size
+    if (seg_idx >= m_descs.size() ) return 0;
+    
+    if (!m_crypto->rx) {
+      // non crypto code is simple -> do it here
+      return m_descs[seg_idx].logical_len;
+    }
+    else {
+      // crypto -> use the main code
+      return get_segment_onwire_len(seg_idx);
+    }
+  }
+  
+  // The Front segment holds the payload(i.e. meta-data) of this message 
+  uint32_t get_payload_segment_onwire_len() {
+    return get_non_header_segment_onwire_len(SegmentIndex::Msg::FRONT);
+  }
+
+  // The Middle segment is typically empty 
+  uint32_t get_middle_segment_onwire_len() {
+    return get_non_header_segment_onwire_len(SegmentIndex::Msg::MIDDLE);
+  }
+
+  // The DATA segment is the Read/Write buffer
+  uint32_t get_data_segment_onwire_len() {
+    return get_non_header_segment_onwire_len(SegmentIndex::Msg::DATA);
+  }
+  
   // Epilogue:
   //
   //   epilogue_*_block_t

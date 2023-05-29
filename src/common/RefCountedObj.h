@@ -70,7 +70,7 @@ protected:
   RefCountedObject(CephContext* c) : cct(c) {}
 
   virtual ~RefCountedObject();
-
+  CephContext *cct{nullptr};
 private:
   void _get() const;
 
@@ -80,7 +80,6 @@ private:
 #else
   mutable std::atomic<uint64_t> nref{1};
 #endif
-  CephContext *cct{nullptr};
 };
 
 class RefCountedObjectSafe : public RefCountedObject {

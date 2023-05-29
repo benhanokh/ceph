@@ -901,6 +901,50 @@ static ceph::spinlock debug_lock;
     _buffers.swap(other._buffers);
   }
 
+  int buffer::list::rewind()
+  {
+    _len = 0;
+    if (_num == 0) {
+      // nothing to do
+      return 0;
+    }
+    if ((_num == 1) && (_carriage->raw_nref() == 1)) {
+      // we got a single buffer -> reset that buffer and return
+      _carriage->set_length(0);
+      _carriage->set_offset(0);
+      _carriage->invalidate_crc();
+      //node._raw->invalidate_crc();
+      return 0;
+    }
+
+    // temporary solution -> always reset multiple buffers
+    // should keep the first/larger buffer
+    //clear();
+    return -1;
+#if 0
+    // we got multiple buffer -> need to reset them one by one
+    for (auto it = _buffers.begin(); it != _buffers.end(); it++) {
+      (*it).set_length(0);
+      (*it).set_offset(0);
+    }
+
+    // reset the _carriage
+    //_carriage = _buffers.begin().get();
+    //_buffers.push_back(*_carriage);
+#endif
+  }
+
+  unsigned buffer::list::raw_length() const
+  {
+    unsigned len = 0;
+    for (auto it = _buffers.begin(); it != _buffers.end(); it++) {
+      len += (*it).raw_length();
+    }
+
+    return len;
+  }
+
+
   bool buffer::list::contents_equal(const ceph::buffer::list& other) const
   {
     if (length() != other.length())

@@ -453,7 +453,15 @@ bool FrameAssembler::disasm_remaining_crc_rev1(bufferlist segment_bls[],
   for (size_t i = 1; i < m_descs.size(); i++) {
     ceph_assert(segment_bls[i].length() == m_descs[i].logical_len);
     if (m_with_data_crc) {
+      try {
       check_segment_crc(segment_bls[i], epilogue->crc_values[i - 1]);
+      }
+      catch (FrameError& e) {
+	char msg[1024];
+	sprintf(msg, "FrameError::disasm_remaining_crc_rev1::check_segment_crc for index=%lu", i);
+	ceph_abort_msg(msg);
+      }
+
     }
   }
   return check_epilogue_late_status(epilogue->late_status);

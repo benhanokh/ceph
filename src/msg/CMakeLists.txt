@@ -1,6 +1,7 @@
 set(msg_srcs
   DispatchQueue.cc
   Message.cc
+  buffer_cache.cc
   Messenger.cc
   Connection.cc
   msg_types.cc

@@ -9,6 +9,7 @@
 #include "compression_meta.h"
 #include "compression_onwire.h"
 #include "frames_v2.h"
+#include "../buffer_cache.h"
 
 class ProtocolV2 : public Protocol {
 private:
@@ -76,9 +77,13 @@ private:
   ceph::msgr::v2::FrameAssembler tx_frame_asm;
   ceph::msgr::v2::FrameAssembler rx_frame_asm;
 
+  BufferCache buffer_cache;
   std::vector<rx_buffer_t> buffers_pool;
   rx_buffer_t rx_preamble_ptr;
   rx_buffer_t rx_epilogue_ptr;
+  rx_buffer_t rx_epilogue_ptr2;
+  rx_buffer_t rx_data_ptr;
+  rx_buffer_t rx_segment_ptr;
   ceph::msgr::v2::segment_bls_t rx_segments_data; // vector of bufferlists
   ceph::msgr::v2::Tag next_tag;
   utime_t backoff;  // backoff time
@@ -144,6 +149,12 @@ private:
   CONTINUATION_DECL(ProtocolV2, finish_auth);
   READ_BPTR_HANDLER_CONTINUATION_DECL(ProtocolV2, handle_read_frame_preamble_main);
   READ_BPTR_HANDLER_CONTINUATION_DECL(ProtocolV2, handle_read_frame_segment);
+  READ_BPTR_HANDLER_CONTINUATION_DECL(ProtocolV2, handle_read_frame_segments_done);
+  READ_BPTR_HANDLER_CONTINUATION_DECL(ProtocolV2, handle_read_frame_epilogue_done);
+  READ_BPTR_HANDLER_CONTINUATION_DECL(ProtocolV2, handle_read_frame_segments_header_payload_and_epilogue);
+  READ_BPTR_HANDLER_CONTINUATION_DECL(ProtocolV2, handle_read_frame_segments_data);
+  READ_BPTR_HANDLER_CONTINUATION_DECL(ProtocolV2, handle_read_frame_epilogue);
+
   READ_BPTR_HANDLER_CONTINUATION_DECL(ProtocolV2, handle_read_frame_epilogue_main);
   CONTINUATION_DECL(ProtocolV2, throttle_message);
   CONTINUATION_DECL(ProtocolV2, throttle_bytes);
@@ -156,7 +167,13 @@ private:
   Ct<ProtocolV2> *finish_server_auth();
   Ct<ProtocolV2> *handle_read_frame_preamble_main(rx_buffer_t &&buffer, int r);
   Ct<ProtocolV2> *read_frame_segment();
+  Ct<ProtocolV2> *read_frame_segments_with_epilogue();
   Ct<ProtocolV2> *handle_read_frame_segment(rx_buffer_t &&rx_buffer, int r);
+  Ct<ProtocolV2> *handle_read_frame_segments_done(rx_buffer_t &&rx_buffer, int r);
+  Ct<ProtocolV2> *handle_read_frame_epilogue_done(rx_buffer_t &&rx_buffer, int r);
+  Ct<ProtocolV2> *handle_read_frame_segments_header_payload_and_epilogue(rx_buffer_t &&rx_buffer, int r);
+  Ct<ProtocolV2> *handle_read_frame_segments_data(rx_buffer_t &&rx_buffer, int r);
+  Ct<ProtocolV2> *handle_read_frame_epilogue(rx_buffer_t &&rx_buffer, int r);
   Ct<ProtocolV2> *_handle_read_frame_segment();
   Ct<ProtocolV2> *handle_read_frame_epilogue_main(rx_buffer_t &&buffer, int r);
   Ct<ProtocolV2> *_handle_read_frame_epilogue_main();
@@ -167,6 +184,7 @@ private:
   Ct<ProtocolV2> *ready();
 
   Ct<ProtocolV2> *handle_message();
+  Ct<ProtocolV2> *handle_message(bufferlist segments_bls[]);
   Ct<ProtocolV2> *throttle_message();
   Ct<ProtocolV2> *throttle_bytes();
   Ct<ProtocolV2> *throttle_dispatch_queue();
