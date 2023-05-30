@@ -7065,7 +7065,7 @@ void OSD::handle_command(MCommand *m)
 {
   ConnectionRef con = m->get_connection();
   auto session = ceph::ref_cast<Session>(con->get_priv());
-  dout(0) << "OSD::GBH::MSG::handle_command: message=" << *m << ", session=" << session << dendl;
+  //dout(0) << "OSD::GBH::MSG::handle_command: message=" << *m << ", session=" << session << dendl;
   if (!session) {
     con->send_message(new MCommandReply(m, -EACCES));
     m->put();
@@ -7319,8 +7319,10 @@ void OSD::dispatch_session_waiting(const ceph::ref_t<Session>& session, OSDMapRe
 void OSD::ms_fast_dispatch(Message *m)
 {
   // CEPH_MSG_OSD_OP 42
+#if 0
   dout(0) << "(8)OSD::GBH::MSG::ms_fast_dispatch: type=" << m->get_type() << " :: "
 	  << (m->get_type() == CEPH_MSG_OSD_OP ? "CEPH_MSG_OSD_OP" : "") << dendl;
+#endif
   //ceph_abort_msg("OSD::ms_fast_dispatch");
   FUNCTRACE(cct);
   if (service.is_stopping()) {
@@ -7396,7 +7398,7 @@ void OSD::ms_fast_dispatch(Message *m)
 
   if (m->get_connection()->has_features(CEPH_FEATUREMASK_RESEND_ON_SPLIT) ||
       m->get_type() != CEPH_MSG_OSD_OP) {
-    dout(0) << "(8)OSD::GBH::MSG::ms_fast_dispatch: queue it directly" << dendl;
+    //dout(0) << "(8)OSD::GBH::MSG::ms_fast_dispatch: queue it directly" << dendl;
     // queue it directly
     enqueue_op(
       static_cast<MOSDFastDispatchOp*>(m)->get_spg(),
@@ -9532,7 +9534,7 @@ void OSD::enqueue_op(spg_t pg, OpRequestRef&& op, epoch_t epoch)
   const uint64_t owner = op->get_req()->get_source().num();
   const int type = op->get_req()->get_type();
 
-  dout(0) << "(9)OSD::GBH::MSG::enqueue_op::type=" << type << dendl;
+  //dout(0) << "(9)OSD::GBH::MSG::enqueue_op::type=" << type << dendl;
   dout(15) << "enqueue_op " << *op->get_req() << " prio " << priority
            << " type " << type
 	   << " cost " << cost
@@ -9561,7 +9563,7 @@ void OSD::enqueue_op(spg_t pg, OpRequestRef&& op, epoch_t epoch)
         unique_ptr<OpSchedulerItem::OpQueueable>(new PGRecoveryMsg(pg, std::move(op))),
         cost, priority, stamp, owner, epoch));
   } else {
-    dout(0) << "(9)OSD::GBH::MSG::enqueue_op:: PGOpItem" << dendl;
+    //dout(0) << "(9)OSD::GBH::MSG::enqueue_op:: PGOpItem" << dendl;
     op_shardedwq.queue(
       OpSchedulerItem(
         unique_ptr<OpSchedulerItem::OpQueueable>(new PGOpItem(pg, std::move(op))),
@@ -11087,7 +11089,7 @@ void OSD::ShardedOpWQ::_enqueue(OpSchedulerItem&& item) {
   {
     std::lock_guard l{sdata->shard_lock};
     empty = sdata->scheduler->empty();
-    dout(0) << "(10)OSD::GBH::MSG::_enqueue" << dendl;
+    //dout(0) << "(10)OSD::GBH::MSG::_enqueue" << dendl;
     sdata->scheduler->enqueue(std::move(item));
   }
 

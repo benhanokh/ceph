@@ -949,10 +949,11 @@ static ceph::spinlock debug_lock;
   {
     if (_num == 1 && !_buffers.empty()) {
       ptr_node& pn = _buffers.back();
+#if 0
       if (unlikely(pn.raw_nref() > 1)) {
 	return nullptr;
       }
-
+#endif
       rx_buffer_t out;
       out.reset(&pn);
       _carriage = &always_empty_bptr;

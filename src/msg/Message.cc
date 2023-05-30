@@ -1707,9 +1707,18 @@ void Message::clear_data() {
     else {
       stats->popback_failure++;
       if (cct) {
-	ldout(cct, 0) << "::GBH::MSG::clear_data() failed data.pop_back() data.len=" << data.length()  << dendl;
+	auto & pn = data.buffers().back();
+	ldout(cct, 0) << "::GBH::MSG::clear_data() failed data.pop_back() data.len=" << data.length()
+		      << ", num_buffers=" << data.get_num_buffers()
+		      << (data.buffers().empty() ? " EMPTY": " NOT EMPTY")
+		      << " ref_count=" << pn.raw_nref() << dendl;
       }
       data.clear();
+    }
+  }
+  else if (this->data_cache) {
+    if (cct) {
+      ldout(cct, 0) << "::GBH::MSG::clear_data() EMPTY data.len=" << data.length() << dendl;
     }
   }
   else {
@@ -1740,7 +1749,7 @@ Message::~Message()
     }
   }
 
-  if (this->data_cache && data.length() && 0) {
+  if (this->data_cache && data.length()) {
     if (cct) {
       ldout(cct, 0) << "::GBH::MSG::~Message() data.len=" << data.length() << dendl;
     }
@@ -1751,10 +1760,18 @@ Message::~Message()
     }
     else {
       if (cct) {
-	ldout(cct, 0) << "::GBH::MSG::~Message() failed data.pop_back() .len=" << data.length() << dendl;
+	ldout(cct, 0) << "::GBH::MSG::~Message() failed data.pop_back() data.len=" << data.length()
+		      << ", num_buffers=" << data.get_num_buffers()
+		      << (data.buffers().empty() ? " EMPTY": " NOT EMPTY") << dendl;
       }
     }
   }
+  else if (this->data_cache) {
+    if (cct) {
+      ldout(cct, 0) << "::GBH::MSG::~Message() EMPTY data.len=" << data.length() << dendl;
+    }
+  }
+
 
   release_message_throttle();
   trace.event("message destructed");
