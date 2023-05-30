@@ -77,11 +77,11 @@ private:
   ceph::msgr::v2::FrameAssembler tx_frame_asm;
   ceph::msgr::v2::FrameAssembler rx_frame_asm;
 
-  BufferCache buffer_cache;
+  BufferCache payload_cache;
+  BufferCache data_cache;
   std::vector<rx_buffer_t> buffers_pool;
   rx_buffer_t rx_preamble_ptr;
   rx_buffer_t rx_epilogue_ptr;
-  rx_buffer_t rx_epilogue_ptr2;
   rx_buffer_t rx_data_ptr;
   rx_buffer_t rx_segment_ptr;
   ceph::msgr::v2::segment_bls_t rx_segments_data; // vector of bufferlists
@@ -184,7 +184,7 @@ private:
   Ct<ProtocolV2> *ready();
 
   Ct<ProtocolV2> *handle_message();
-  Ct<ProtocolV2> *handle_message(bufferlist segments_bls[]);
+  Ct<ProtocolV2> *handle_message(bufferlist segments_bls[], const ceph_msg_header2 *p_header);
   Ct<ProtocolV2> *throttle_message();
   Ct<ProtocolV2> *throttle_bytes();
   Ct<ProtocolV2> *throttle_dispatch_queue();

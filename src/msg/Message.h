@@ -280,7 +280,8 @@ protected:
   utime_t recv_complete_stamp;
 
   ConnectionFRef connection;
-  BufferCache *buffer_cache = nullptr;
+  BufferCache *payload_cache = nullptr;
+  BufferCache *data_cache = nullptr;
   uint32_t magic = 0;
 
   boost::intrusive::list_member_hook<> dispatch_q;
@@ -367,9 +368,13 @@ public:
   void set_connection(ConnectionRef c) {
     connection = std::move(c);
   }
-  void set_buffer_cache(BufferCache *_buffer_cache) {
-    this->buffer_cache = _buffer_cache;
+  void set_payload_cache(BufferCache *_payload_cache) {
+    this->payload_cache = _payload_cache;
   }
+  void set_data_cache(BufferCache *_data_cache) {
+    this->data_cache = _data_cache;
+  }
+
   CompletionHook* get_completion_hook() { return completion_hook; }
   void set_completion_hook(CompletionHook *hook) { completion_hook = hook; }
   void set_byte_throttler(ThrottleInterface *t) {
@@ -572,7 +577,6 @@ public:
 };
 
 extern Message *decode_message(CephContext *cct,
-			       BufferCache *buffer_cache,
                                int crcflags,
                                ceph_msg_header& header,
                                ceph_msg_footer& footer,
@@ -582,7 +586,8 @@ extern Message *decode_message(CephContext *cct,
                                Message::ConnectionRef conn);
 
 extern Message *fast_decode_message(CephContext            *cct,
-				    BufferCache            *_buffer_cache,
+				    BufferCache            *_payload_cache,
+				    BufferCache            *_data_cache,
 				    ceph_msg_header        &header,
 				    ceph_msg_footer        &footer,
 				    ceph::bufferlist       &front,

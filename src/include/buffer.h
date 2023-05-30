@@ -1020,30 +1020,7 @@ struct error_code;
 
     unsigned raw_length() const;
     int rewind();
-
-    //using rx_buffer_t = std::unique_ptr<ceph::buffer::ptr_node, ceph::buffer::ptr_node::disposer>;
-    //ptr_node* _carriage;
-    rx_buffer_t pop_back()
-    {
-      if (_carriage && (_num == 1) && (_carriage->raw_nref() == 1)) {
-	rx_buffer_t out;
-	out.reset(_carriage);
-	_carriage = &always_empty_bptr;
-	
-	out->set_length(0);
-	out->set_offset(0);
-	out->invalidate_crc();
-
-	_len = 0;
-	_num = 0;
-
-	_buffers.reset();
-	return (out);
-      }
-      else {
-	return nullptr;
-      }
-    }
+    rx_buffer_t pop_back();
 
     bool contents_equal(const buffer::list& other) const;
     bool contents_equal(const void* other, size_t length) const;

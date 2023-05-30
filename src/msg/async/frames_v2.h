@@ -353,11 +353,12 @@ public:
                             const uint16_t segment_aligns[],
                             size_t segment_count);
 
-  Tag disassemble_preamble(rx_buffer_t& rx_preamble);
-
+  Tag  disassemble_preamble(rx_buffer_t& rx_preamble);
+  void disasm_first_crc_rev1(rx_buffer_t& rx_preamble, const unsigned char *header, unsigned *header_len /*IN-OUT*/) const;
+  bool disassemble_remaining_segments(bufferlist segment_bls[], rx_buffer_t& rx_epilogue) const;
   bool disassemble_segments(rx_buffer_t& rx_preamble, 
                             bufferlist segments_bls[], 
-                            rx_buffer_t& rx_epilogue, bool& no_pad, bool& no_epilogue) const;
+                            rx_buffer_t& rx_epilogue) const;
 
 private:
   struct segment_desc_t {
@@ -418,10 +419,11 @@ private:
   // ready for dispatching, or false if it was aborted by the sender
   // and must be dropped.
   void disassemble_first_segment(rx_buffer_t& rx_preamble,
-                                 bufferlist& segment_bl, bool& no_pad) const;
-  
+                                 bufferlist& segment_bl) const;
+#if 0  
   bool disassemble_remaining_segments(bufferlist segment_bls[],
-                                      rx_buffer_t& rx_epilogue, bool& no_epilogue) const;
+                                      rx_buffer_t& rx_epilogue) const;
+#endif
   void disassemble_decompress(bufferlist segment_bls[]) const;
 
   bool disasm_all_crc_rev0(bufferlist segment_bls[],
@@ -434,7 +436,7 @@ private:
   bool disasm_remaining_crc_rev1(bufferlist segment_bls[],
                                  rx_buffer_t& rx_epilogue) const;
   void disasm_first_secure_rev1(rx_buffer_t& rx_preamble,
-                                bufferlist& segment_bl, bool& no_pad) const;
+                                bufferlist& segment_bl) const;
   bool disasm_remaining_secure_rev1(bufferlist segment_bls[],
                                     rx_buffer_t& rx_epilogue) const;
 

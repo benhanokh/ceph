@@ -925,7 +925,7 @@ CtPtr ProtocolV1::handle_message_footer(char *buffer, int r) {
   ldout(cct, 20) << __func__ << " got " << front.length() << " + "
                  << middle.length() << " + " << data.length() << " byte message"
                  << dendl;
-  Message *message = decode_message(cct, nullptr, messenger->crcflags, current_header,
+  Message *message = decode_message(cct, messenger->crcflags, current_header,
                                     footer, front, middle, data, connection);
   if (!message) {
     ldout(cct, 1) << __func__ << " decode message failed " << dendl;

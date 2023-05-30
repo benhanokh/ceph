@@ -943,6 +943,34 @@ static ceph::spinlock debug_lock;
 
     return len;
   }
+  using rx_buffer_t = std::unique_ptr<ceph::buffer::ptr_node, ceph::buffer::ptr_node::disposer>;
+  //ptr_node* _carriage;
+  rx_buffer_t buffer::list::pop_back()
+  {
+    if (_num == 1 && !_buffers.empty()) {
+      ptr_node& pn = _buffers.back();
+      if (unlikely(pn.raw_nref() > 1)) {
+	return nullptr;
+      }
+
+      rx_buffer_t out;
+      out.reset(&pn);
+      _carriage = &always_empty_bptr;
+
+      out->set_length(0);
+      out->set_offset(0);
+      out->invalidate_crc();
+
+      _len = 0;
+      _num = 0;
+
+      _buffers.reset();
+      return (out);
+    }
+    else {
+      return nullptr;
+    }
+  }
 
 
   bool buffer::list::contents_equal(const ceph::buffer::list& other) const

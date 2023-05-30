@@ -306,7 +306,6 @@ void Message::dump(ceph::Formatter *f) const
 }
 
 Message *decode_message(CephContext *cct,
-			BufferCache *_buffer_cache,
                         int crcflags,
                         ceph_msg_header& header,
                         ceph_msg_footer& footer,
@@ -944,10 +943,6 @@ Message *decode_message(CephContext *cct,
   }
 
   m->set_cct(cct);
-  if (_buffer_cache) {
-    ldout(cct, 0) << "OSD::GBH::MSG::decode_message()::m->set_b_cache() .entries_count=" << _buffer_cache->entries_count() << dendl;
-    m->set_buffer_cache(_buffer_cache);
-  }
 
   // m->header.version, if non-zero, should be populated with the
   // newest version of the encoding the code supports.  If set, check
@@ -999,7 +994,8 @@ Message *decode_message(CephContext *cct,
 
 
 Message *fast_decode_message(CephContext *cct,
-			     BufferCache *_buffer_cache,
+			     BufferCache *_payload_cache,
+			     BufferCache *_data_cache,
 			     ceph_msg_header& header,
 			     ceph_msg_footer& footer,
 			     ceph::bufferlist& front,
@@ -1594,9 +1590,13 @@ Message *fast_decode_message(CephContext *cct,
   }
 
   m->set_cct(cct);
-  if (_buffer_cache) {
-    ldout(cct, 0) << "OSD::GBH::MSG::decode_message()::m->set_b_cache() .entries_count=" << _buffer_cache->entries_count() << dendl;
-    m->set_buffer_cache(_buffer_cache);
+  if (_payload_cache) {
+    ldout(cct, 0) << "OSD::GBH::MSG::decode_message()::m->set_payload_cache() .entries_count=" << _payload_cache->entries_count() << dendl;
+    m->set_payload_cache(_payload_cache);
+  }
+  if (_data_cache) {
+    ldout(cct, 0) << "OSD::GBH::MSG::decode_message()::m->set_data_cache() .entries_count=" << _data_cache->entries_count() << dendl;
+    m->set_data_cache(_data_cache);
   }
 
   // m->header.version, if non-zero, should be populated with the
@@ -1662,18 +1662,21 @@ void Message::clear_payload()
     byte_throttler->put(payload.length() + middle.length());
   }
 
-  if (this->buffer_cache && payload.length()) {
+  if (this->payload_cache && payload.length()) {
+    BufferCacheStat* stats = this->payload_cache->get_stats();
+    if (cct) {
+      ldout(cct, 0) << "::GBH::MSG::clear_payload() .len=" << payload.length() << ", .raw_len=" << payload.raw_length() << dendl;
+    }
     rx_buffer_t rx_buffer = payload.pop_back();
     if (rx_buffer) {
-      if (cct) {
-	ldout(cct, 0) << "::GBH::MSG::clear_payload() .len=" << payload.length() << ", .raw_len=" << payload.raw_length() << dendl;
-      }
-      int ret = this->buffer_cache->free_rx(std::move(rx_buffer));
+      stats->popback_success++;
+      int ret = this->payload_cache->free_rx(std::move(rx_buffer));
       ceph_assert(ret == 0);
     }
     else {
+      stats->popback_failure++;
       if (cct) {
-	ldout(cct, 0) << "::(M*M)GBH::MSG::clear_payload() failed payload.pop_back()" << dendl;
+	ldout(cct, 0) << "::GBH::MSG::clear_payload() failed payload.pop_back() .len=" << payload.length() << dendl;
       }
       payload.clear();
     }
@@ -1688,17 +1691,30 @@ void Message::clear_data() {
   if (byte_throttler) {
     byte_throttler->put(data.length());
   }
-#if 0
-  if (cct) {
-    ldout(cct, 0) << "::(M)GBH::MSG::clear_data() data.len=" << get_data().length() << dendl;
-  }
 
-  if (this->buffer_cache && data.length()) {
-    this->buffer_cache->add_entry(std::move(data));
+  if (this->data_cache && data.length() ) {
+    BufferCacheStat* stats = this->data_cache->get_stats();
+    if (cct) {
+      ldout(cct, 0) << "::GBH::MSG::clear_data() data.len=" << data.length() << dendl;
+    }
+
+    rx_buffer_t rx_buffer = data.pop_back();
+    if (rx_buffer) {
+      stats->popback_success++;
+      int ret = this->data_cache->free_rx(std::move(rx_buffer));
+      ceph_assert(ret == 0);
+    }
+    else {
+      stats->popback_failure++;
+      if (cct) {
+	ldout(cct, 0) << "::GBH::MSG::clear_data() failed data.pop_back() data.len=" << data.length()  << dendl;
+      }
+      data.clear();
+    }
   }
   else {
-#endif
-  data.clear();
+    data.clear();
+  }
   clear_buffers(); // let subclass drop buffers as well
 }
 
@@ -1708,14 +1724,35 @@ Message::~Message()
     byte_throttler->put(payload.length() + middle.length() + data.length());
   }
 
-  if (this->buffer_cache && payload.length()) {
+  if (this->payload_cache && payload.length()) {
+    if (cct) {
+      ldout(cct, 0) << "::GBH::MSG::~Message() payload.len=" << payload.length() << dendl;
+    }
     rx_buffer_t rx_buffer = payload.pop_back();
     if (rx_buffer) {
-      if (cct) {
-	ldout(cct, 0) << "::GBH::MSG::~Message() payload.len=" << payload.length() << dendl;
-      }
-      int ret = this->buffer_cache->free_rx(std::move(rx_buffer));
+      int ret = this->payload_cache->free_rx(std::move(rx_buffer));
       ceph_assert(ret == 0);
+    }
+    else {
+      if (cct) {
+	ldout(cct, 0) << "::GBH::MSG::~Message() failed payload.pop_back() .len="<< payload.length() << dendl;
+      }
+    }
+  }
+
+  if (this->data_cache && data.length() && 0) {
+    if (cct) {
+      ldout(cct, 0) << "::GBH::MSG::~Message() data.len=" << data.length() << dendl;
+    }
+    rx_buffer_t rx_buffer = data.pop_back();
+    if (rx_buffer) {
+      int ret = this->data_cache->free_rx(std::move(rx_buffer));
+      ceph_assert(ret == 0);
+    }
+    else {
+      if (cct) {
+	ldout(cct, 0) << "::GBH::MSG::~Message() failed data.pop_back() .len=" << data.length() << dendl;
+      }
     }
   }
 
@@ -1821,5 +1858,5 @@ Message *decode_message(CephContext *cct, int crcflags, ceph::bufferlist::const_
   decode(fr, p);
   decode(mi, p);
   decode(da, p);
-  return decode_message(cct, nullptr, crcflags, h, f, fr, mi, da, nullptr);
+  return decode_message(cct, crcflags, h, f, fr, mi, da, nullptr);
 }
