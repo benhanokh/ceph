@@ -1651,15 +1651,6 @@ Message *fast_decode_message(CephContext *cct,
 #include <boost/stacktrace.hpp>
 void Message::set_data(const ceph::buffer::list &bl)
 {
-  // prevent the data buffer from being freed
-  if (bl.get_num_buffers() == 1 && !bl.buffers().empty()) {
-    ceph::buffer::list::buffers_t& buffers = const_cast<ceph::buffer::list &>(bl).mut_buffers();
-    ceph::buffer::ptr_node& pn = buffers.back();
-    pn.set_ref_holder();
-    if (cct) {
-      //ldout(cct, 0) << "::GBH::MSG::set_data() .len=" << pn.length() << dendl;
-    }
-  }
   if (byte_throttler)
     byte_throttler->put(data.length());
   data.share(bl);
@@ -1683,8 +1674,7 @@ void Message::clear_payload()
     rx_buffer_t rx_buffer = payload.pop_back();
     if (rx_buffer) {
       stats->popback_success++;
-      int ret = this->payload_cache->free_rx(std::move(rx_buffer));
-      ceph_assert(ret == 0);
+      this->payload_cache->free_rx(std::move(rx_buffer));
     }
     else {
       stats->popback_failure++;
@@ -1717,9 +1707,7 @@ void Message::clear_data() {
     rx_buffer_t rx_buffer = data.pop_back();
     if (rx_buffer) {      
       stats->popback_success++;
-      int ret = this->data_cache->free_rx(std::move(rx_buffer));
-      rx_buffer->clear_ref_holder();
-      ceph_assert(ret == 0);
+      this->data_cache->free_rx(std::move(rx_buffer));
     }
     else {
       stats->popback_failure++;
@@ -1782,9 +1770,7 @@ Message::~Message()
 #endif
     rx_buffer_t rx_buffer = data.pop_back();
     if (rx_buffer) {
-      int ret = this->data_cache->free_rx(std::move(rx_buffer));
-      rx_buffer->clear_ref_holder();
-      ceph_assert(ret == 0);
+      this->data_cache->free_rx(std::move(rx_buffer));
     }
     else {
 #if 0

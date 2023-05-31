@@ -57,12 +57,12 @@ public:
     ceph_assert_always(key.size() * CHAR_BIT == 128);
 
     if (1 != EVP_EncryptInit_ex(ectx.get(), EVP_aes_128_gcm(),
-			        nullptr, nullptr, nullptr)) {
+			        nullptr, nullptr, nullptr)) [[unlikely]] {
       throw std::runtime_error("EVP_EncryptInit_ex failed");
     }
 
     if(1 != EVP_EncryptInit_ex(ectx.get(), nullptr, nullptr,
-			       key.data(), nullptr)) {
+			       key.data(), nullptr)) [[unlikely]] {
       throw std::runtime_error("EVP_EncryptInit_ex failed");
     }
   }
@@ -121,7 +121,7 @@ void AES128GCM_OnWireTxHandler::authenticated_encrypt_update(
 	reinterpret_cast<unsigned char*>(filler.c_str()),
 	&update_len,
 	reinterpret_cast<const unsigned char*>(plainbuf.c_str()),
-	plainbuf.length())) {
+	plainbuf.length())) [[unlikely]] {
       throw std::runtime_error("EVP_EncryptUpdate failed");
     }
     ceph_assert_always(update_len >= 0);
@@ -143,7 +143,7 @@ ceph::bufferlist AES128GCM_OnWireTxHandler::authenticated_encrypt_final()
   auto filler = buffer.append_hole(AESGCM_BLOCK_LEN);
   if(1 != EVP_EncryptFinal_ex(ectx.get(),
 	reinterpret_cast<unsigned char*>(filler.c_str()),
-	&final_len)) {
+	&final_len)) [[unlikely]] {
     throw std::runtime_error("EVP_EncryptFinal_ex failed");
   }
   ceph_assert_always(final_len == 0);
@@ -228,7 +228,7 @@ void AES128GCM_OnWireRxHandler::__authenticated_decrypt_update(unsigned char* p,
 {
   int update_len = 0;
 
-  if (1 != EVP_DecryptUpdate(ectx.get(), p, &update_len, p, len)) {
+  if (1 != EVP_DecryptUpdate(ectx.get(), p, &update_len, p, len)) [[unlikely]] {
     ceph_abort_msg(__func__);
     throw std::runtime_error("EVP_DecryptUpdate failed");
   }
@@ -272,7 +272,7 @@ void AES128GCM_OnWireRxHandler::authenticated_decrypt_update_final(
 
   // we need to ensure the tag is stored in continuous memory.
   if (1 != EVP_CIPHER_CTX_ctrl(ectx.get(), EVP_CTRL_GCM_SET_TAG,
-	AESGCM_TAG_LEN, auth_tag.c_str())) {
+	AESGCM_TAG_LEN, auth_tag.c_str())) [[unlikely]] {
     throw std::runtime_error("EVP_CIPHER_CTX_ctrl failed");
   }
 
@@ -280,7 +280,7 @@ void AES128GCM_OnWireRxHandler::authenticated_decrypt_update_final(
   // authenticate the message.
   {
     int final_len = 0;
-    if (0 >= EVP_DecryptFinal_ex(ectx.get(), nullptr, &final_len)) {
+    if (0 >= EVP_DecryptFinal_ex(ectx.get(), nullptr, &final_len)) [[unlikely]] {
       throw MsgAuthError();
     }
     ceph_assert_always(final_len == 0);
@@ -307,7 +307,7 @@ void AES128GCM_OnWireRxHandler::authenticated_decrypt_update_final(rx_buffer_t& 
 
   // we need to ensure the tag is stored in continuous memory.
   if (1 != EVP_CIPHER_CTX_ctrl(ectx.get(), EVP_CTRL_GCM_SET_TAG,
-	AESGCM_TAG_LEN, auth_tag)) {
+	AESGCM_TAG_LEN, auth_tag)) [[unlikely]] {
     ceph_abort_msg("bad auth tag");
     throw std::runtime_error("EVP_CIPHER_CTX_ctrl failed");
   }
@@ -316,7 +316,7 @@ void AES128GCM_OnWireRxHandler::authenticated_decrypt_update_final(rx_buffer_t& 
   // authenticate the message.
   {
     int final_len = 0;
-    if (0 >= EVP_DecryptFinal_ex(ectx.get(), nullptr, &final_len)) {
+    if (0 >= EVP_DecryptFinal_ex(ectx.get(), nullptr, &final_len)) [[unlikely]] {
       ceph_abort_msg("bad auth tag2");
       throw MsgAuthError();
     }

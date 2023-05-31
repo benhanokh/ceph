@@ -44,7 +44,7 @@ int BufferCache::free_rx(rx_buffer_t && rx_buffer)
   //ceph_assert(rx_buffer->raw_nref() == 1);
   // first test without lock
   if (m_entries_count >= ARR_SIZE || (rx_buffer->raw_length() % 16 != 0)) [[unlikely]] {
-    ldout(cct, 0) << "::GBH::add_entry() FULL/Unaligned (unlocked)" << dendl;
+    //ldout(cct, 0) << "::GBH::add_entry() FULL/Unaligned (unlocked)" << dendl;
     // GBH::TBD - need to find a better way to release the ptr_node
     //rx_buffer.reset();
     m_stat.free_dispose++;
@@ -54,7 +54,7 @@ int BufferCache::free_rx(rx_buffer_t && rx_buffer)
   std::unique_lock lock(m_lock); // <<<<<<
   // repeat the test under lock
   if (m_entries_count >= ARR_SIZE) [[unlikely]] {
-    ldout(cct, 0) << "::GBH::add_entry() FULL (locked)" << dendl;
+    //ldout(cct, 0) << "::GBH::add_entry() FULL (locked)" << dendl;
     // GBH::TBD - need to find a better way to release the ptr_node
     //rx_buffer.reset();
     m_stat.free_dispose++;
@@ -93,7 +93,7 @@ rx_buffer_t&& BufferCache::alloc_cache_entry_locked(unsigned idx)
 //--------------------------------------------------------------------------------
 rx_buffer_t&& BufferCache::alloc_new_entry(unsigned alloc_size, unsigned align)
 {
-  ldout(cct, 0) << "::BufferCache::alloc_new_entry() alloc_size=" << alloc_size << ", align=" << align << dendl;
+  //ldout(cct, 0) << "::BufferCache::alloc_new_entry() alloc_size=" << alloc_size << ", align=" << align << dendl;
   rx_alloc_buffer = ceph::buffer::ptr_node::create(ceph::buffer::create_aligned(alloc_size, align));
   //rx_alloc_buffer->set_length(0);
   rx_alloc_buffer->set_offset(0);
@@ -119,7 +119,7 @@ rx_buffer_t&& BufferCache::alloc_rx(unsigned alloc_size, unsigned align)
   // ldout(cct, 0) << "::GBH::alloc() alloc_size=" << alloc_size << dendl;
   // first test without lock
   if (m_entries_count == 0) [[unlikely]] {
-    ldout(cct, 0) << "::GBH::alloc_rx() allocate new entry (unlocked)" << dendl;
+    //ldout(cct, 0) << "::GBH::alloc_rx() allocate new entry (unlocked)" << dendl;
     return alloc_new_entry(alloc_size, align);
   }
 
@@ -148,7 +148,7 @@ rx_buffer_t&& BufferCache::alloc_rx(unsigned alloc_size, unsigned align)
   }
 
   lock.unlock();
-  ldout(cct, 0) << "::GBH::alloc_rx() ALLOCATE NEW ENTRY busy_entries=" << m_entries_count << dendl;
+  //ldout(cct, 0) << "::GBH::alloc_rx() ALLOCATE NEW ENTRY busy_entries=" << m_entries_count << dendl;
   return alloc_new_entry(alloc_size, align);
 
   // should never happen since we checked count under lock

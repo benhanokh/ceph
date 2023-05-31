@@ -484,7 +484,7 @@ static ceph::spinlock debug_lock;
     ceph_assert(n < _len);
     return _raw->get_data()[_off + n];
   }
-
+#if 0
   void buffer::ptr::set_ref_holder() {
     if(!ref_holder && _raw) {
       ref_holder = true;
@@ -499,7 +499,7 @@ static ceph::spinlock debug_lock;
       ref_holder = false;
     }
   }
-
+#endif
   const char *buffer::ptr::raw_c_str() const { ceph_assert(_raw); return _raw->get_data(); }
   unsigned buffer::ptr::raw_length() const { ceph_assert(_raw); return _raw->get_len(); }
   int buffer::ptr::raw_nref() const { ceph_assert(_raw); return _raw->nref; }
@@ -915,7 +915,7 @@ static ceph::spinlock debug_lock;
     std::swap(_carriage, other._carriage);
     _buffers.swap(other._buffers);
   }
-
+#if 0
   int buffer::list::rewind()
   {
     _len = 0;
@@ -948,6 +948,7 @@ static ceph::spinlock debug_lock;
     //_buffers.push_back(*_carriage);
 #endif
   }
+#endif
 
   unsigned buffer::list::raw_length() const
   {
@@ -959,16 +960,10 @@ static ceph::spinlock debug_lock;
     return len;
   }
   using rx_buffer_t = std::unique_ptr<ceph::buffer::ptr_node, ceph::buffer::ptr_node::disposer>;
-  //ptr_node* _carriage;
   rx_buffer_t buffer::list::pop_back()
   {
     if (_num == 1 && !_buffers.empty()) {
       ptr_node& pn = _buffers.back();
-#if 0
-      if (unlikely(pn.raw_nref() > 1)) {
-	return nullptr;
-      }
-#endif
       rx_buffer_t out;
       out.reset(&pn);
       _carriage = &always_empty_bptr;

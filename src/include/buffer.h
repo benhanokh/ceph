@@ -168,7 +168,7 @@ struct error_code;
   protected:
     raw *_raw;
     unsigned _off, _len;
-    bool ref_holder = false;
+    //bool ref_holder = false;
   private:
     void release();
 
@@ -248,8 +248,8 @@ struct error_code;
     }
 
     bool have_raw() const { return _raw ? true:false; }
-    void set_ref_holder();
-    void clear_ref_holder();
+    //void set_ref_holder();
+    //void clear_ref_holder();
     
     void swap(ptr& other) noexcept;
 
@@ -1021,7 +1021,7 @@ struct error_code;
     }
 
     unsigned raw_length() const;
-    int rewind();
+    //int rewind();
     rx_buffer_t pop_back();
 
     bool contents_equal(const buffer::list& other) const;

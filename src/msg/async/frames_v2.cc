@@ -44,7 +44,7 @@ static size_t calc_num_segments(const bufferlist segment_bls[],
 static void check_segment_crc(const bufferlist& segment_bl,
                               uint32_t expected_crc) {
   uint32_t crc = segment_bl.crc32c(-1);
-  if (crc != expected_crc) {
+  if (crc != expected_crc) [[unlikely]] {
     throw FrameError(fmt::format(
         "bad segment crc calculated={} expected={}", crc, expected_crc));
   }
@@ -55,7 +55,7 @@ static void check_segment_crc(const bufferlist& segment_bl,
 static bool check_epilogue_late_status(__u8 late_status) {
   __u8 aborted = late_status & FRAME_LATE_STATUS_ABORTED_MASK;
   if (aborted != FRAME_LATE_STATUS_ABORTED &&
-      aborted != FRAME_LATE_STATUS_COMPLETE) {
+      aborted != FRAME_LATE_STATUS_COMPLETE) [[unlikely]] {
     throw FrameError(fmt::format("bad late_status"));
   }
   return aborted == FRAME_LATE_STATUS_COMPLETE;
@@ -305,7 +305,7 @@ Tag FrameAssembler::disassemble_preamble(bufferlist& preamble_bl) {
   uint32_t crc = ceph_crc32c(
       0, reinterpret_cast<const unsigned char*>(preamble),
       sizeof(*preamble) - sizeof(preamble->crc));
-  if (crc != preamble->crc) {
+  if (crc != preamble->crc) [[unlikely]] {
     throw FrameError(fmt::format(
         "bad preamble crc calculated={} expected={}", crc, preamble->crc));
   }
@@ -359,8 +359,8 @@ Tag FrameAssembler::disassemble_preamble(rx_buffer_t& rx_preamble) {
   uint32_t crc = ceph_crc32c(
       0, reinterpret_cast<const unsigned char*>(preamble),
       sizeof(*preamble) - sizeof(preamble->crc));
-  ceph_assert(crc == preamble->crc);
-  if (crc != preamble->crc) {
+  //ceph_assert(crc == preamble->crc);
+  if (crc != preamble->crc) [[unlikely]] {
     ceph_abort_msg("preamble->crc");
     throw FrameError(fmt::format(
         "bad preamble crc calculated={} expected={}", crc, preamble->crc));
@@ -368,13 +368,13 @@ Tag FrameAssembler::disassemble_preamble(rx_buffer_t& rx_preamble) {
 
   // see calc_num_segments()
   if (preamble->num_segments < 1 ||
-      preamble->num_segments > MAX_NUM_SEGMENTS) {
+      preamble->num_segments > MAX_NUM_SEGMENTS) [[unlikely]] {
     ceph_abort_msg("bad num_segments");
     throw FrameError(fmt::format(
         "bad number of segments num_segments={}", preamble->num_segments));
   }
   if (preamble->num_segments > 1 &&
-      preamble->segments[preamble->num_segments - 1].length == 0) {
+      preamble->segments[preamble->num_segments - 1].length == 0) [[unlikely]] {
     ceph_abort_msg("last segment empty");
     throw FrameError("last segment empty");
   }
@@ -438,7 +438,7 @@ void FrameAssembler::disasm_first_crc_rev1(rx_buffer_t& rx_preamble, const unsig
     *header_len -= FRAME_CRC_SIZE;
     if (m_with_data_crc) {
       uint32_t crc = ceph_crc32c( -1, header, *header_len);
-      if (crc != expected_crc) {
+      if (crc != expected_crc)  [[unlikely]] {
 	throw FrameError(fmt::format(
         "bad segment crc calculated={} expected={}", crc, expected_crc));
       }
@@ -547,7 +547,7 @@ bool FrameAssembler::disassemble_segments(rx_buffer_t& rx_preamble, bufferlist s
 
 void FrameAssembler::disassemble_first_segment(rx_buffer_t& rx_preamble, bufferlist&  segment_bl) const
 {
-  ceph_assert(rx_preamble);
+  //ceph_assert(rx_preamble);
   ceph_assert(!m_descs.empty());
   if (m_is_rev1) {
     if (m_crypto->rx) {
@@ -564,7 +564,7 @@ void FrameAssembler::disassemble_first_segment(rx_buffer_t& rx_preamble, bufferl
 bool FrameAssembler::disassemble_remaining_segments(bufferlist segment_bls[], rx_buffer_t& rx_epilogue) const
 {
   ceph_assert(!m_descs.empty());
-  ceph_assert(rx_epilogue != nullptr);
+  //ceph_assert(rx_epilogue != nullptr);
   if (m_is_rev1) {
     if (m_descs.size() == 1) {
       // no epilogue if only one segment

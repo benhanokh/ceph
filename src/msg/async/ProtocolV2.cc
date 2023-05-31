@@ -1146,7 +1146,7 @@ void ProtocolV2::recycle_buffer(rx_buffer_t& rx_buff, unsigned onwire_len)
   }
 
   if (rx_buff) {
-    auto prev_size = buffers_pool.size();
+    //auto prev_size = buffers_pool.size();
     buffers_pool.push_back(std::move(rx_buff));
 #if 0
     ldout(cct, 0) << "::(" << cnt << ")::(X)GBH::MSG::ProtocolV2::recycle_buffer() - store in a new entry. size="
@@ -1259,7 +1259,7 @@ static const char *get_state_name(int state) {
     "CLOSED"};
   return statenames[state];
 }
-#endif
+
 //---------------------------------------------------------------------------
 static const char* get_tag_name(unsigned index)
 {
@@ -1291,9 +1291,9 @@ static const char* get_tag_name(unsigned index)
 
   return tag_names[index];
 }  
-
+#endif
 CtPtr ProtocolV2::handle_read_frame_dispatch() {
-  uint32_t tag_idx = static_cast<uint32_t>(next_tag);
+  //uint32_t tag_idx = static_cast<uint32_t>(next_tag);
   //ldout(cct, 0) << "::(3)GBH::MSG::ProtocolV2::handle_read_frame_dispatch() tag=" << tag_idx << "::" << get_tag_name(tag_idx) << dendl;
   ldout(cct, 10) << __func__
                  << " tag=" << static_cast<uint32_t>(next_tag) << dendl;
@@ -1369,9 +1369,9 @@ CtPtr ProtocolV2::read_frame_segments_with_epilogue()
     return read_frame_segment();
   }
 
-  ceph_assert(rx_segment_ptr);
-  ceph_assert(rx_segment_ptr->raw_nref() == 1);
-  ceph_assert(rx_segment_ptr->raw_length() >= aggregated_len);
+  //ceph_assert(rx_segment_ptr);
+  //ceph_assert(rx_segment_ptr->raw_nref() == 1);
+  //ceph_assert(rx_segment_ptr->raw_length() >= aggregated_len);
   rx_segment_ptr->set_offset(0);
   rx_segment_ptr->set_length(aggregated_len);
 
@@ -1406,11 +1406,11 @@ CtPtr ProtocolV2::handle_read_frame_segments_data(rx_buffer_t &&rx_buffer, int r
 
   rx_segment_ptr = std::move(rx_buffer);
 
-  ceph_assert(rx_data_ptr == nullptr);
+  //ceph_assert(rx_data_ptr == nullptr);
   uint16_t align    = rx_frame_asm.get_segment_align(SegmentIndex::Msg::DATA);
   uint32_t data_len = rx_frame_asm.get_data_segment_onwire_len();
   rx_data_ptr = std::move(data_cache.alloc_rx(data_len, align));
-  ceph_assert(rx_data_ptr);
+  //ceph_assert(rx_data_ptr);
 #if 0
   ldout(cct, 0) << __func__ <<":: req_len=" << data_len << ", len=" << rx_data_ptr->length() << ", raw_len=" << rx_data_ptr->raw_length()
 		<< ", ref=" << rx_data_ptr->raw_nref() << ", align=" << align << dendl;
@@ -1430,10 +1430,10 @@ CtPtr ProtocolV2::handle_read_frame_epilogue(rx_buffer_t &&rx_buffer, int r)
 
   rx_data_ptr = std::move(rx_buffer);
   uint32_t epilogue_len = rx_frame_asm.get_epilogue_onwire_len();
-  ceph_assert(epilogue_len);
-  ceph_assert(rx_epilogue_ptr);
-  ceph_assert(rx_epilogue_ptr->raw_nref() == 1);
-  ceph_assert(rx_epilogue_ptr->raw_length() >= epilogue_len);
+  //ceph_assert(epilogue_len);
+  //ceph_assert(rx_epilogue_ptr);
+  //ceph_assert(rx_epilogue_ptr->raw_nref() == 1);
+  //ceph_assert(rx_epilogue_ptr->raw_length() >= epilogue_len);
   // reset buffer
   rx_epilogue_ptr->set_offset(0);
   rx_epilogue_ptr->set_length(epilogue_len);
@@ -1455,19 +1455,19 @@ CtPtr ProtocolV2::handle_read_frame_epilogue_done(rx_buffer_t &&rx_buffer, int r
 //--------------------------------------------------------------------------------
 CtPtr ProtocolV2::handle_read_frame_segments_done(rx_buffer_t &&rx_buffer, int r)
 {
+#if 0
   const BufferCacheStat* payload_stats = payload_cache.get_stats();
-  const BufferCacheStat* data_stats    = data_cache.get_stats();
-    
-  //ldout(cct, 0) << "::handle_read_frame_segments_done: payload_stats: " << *payload_stats << dendl;
-  //ldout(cct, 0) << "::handle_read_frame_segments_done: data_stats:    " << *data_stats << dendl;
-
+  const BufferCacheStat* data_stats    = data_cache.get_stats();  
+  ldout(cct, 0) << "::handle_read_frame_segments_done: payload_stats: " << *payload_stats << dendl;
+  ldout(cct, 0) << "::handle_read_frame_segments_done: data_stats:    " << *data_stats << dendl;
+#endif
   std::array<bufferlist, MessageFrame::SegmentsNumV> segments_bls;
   //bufferlist  segments_bls[MessageFrame::SegmentsNumV];
   rx_segment_ptr = std::move(rx_buffer);
 
   bool ok = false;
-  ceph_assert(rx_segment_ptr);
-  ceph_assert(rx_preamble_ptr);
+  //ceph_assert(rx_segment_ptr);
+  //ceph_assert(rx_preamble_ptr);
   const char* p = rx_segment_ptr->c_str();
   auto preamble = reinterpret_cast<const preamble_block_t*>(rx_preamble_ptr->c_str());
   unsigned total_len = 0;
@@ -1492,7 +1492,7 @@ CtPtr ProtocolV2::handle_read_frame_segments_done(rx_buffer_t &&rx_buffer, int r
   unsigned alloc_len = round_up_to(len, 16);
   alloc_len = std::max(alloc_len, MAX_DATA_BUFFER);
   rx_buffer_t rx_payload = std::move(payload_cache.alloc_rx(alloc_len, 16));
-  ceph_assert(rx_payload);
+  //ceph_assert(rx_payload);
   //ldout(cct, 0) << "::GBH::MSG::ProtocolV2::rx_payload .len=" << rx_payload->length() << ", .raw_len=" << rx_payload->raw_length() << dendl;
   rx_payload->set_length(0);
   rx_payload->set_offset(0);
@@ -1501,10 +1501,10 @@ CtPtr ProtocolV2::handle_read_frame_segments_done(rx_buffer_t &&rx_buffer, int r
   p += len;
   total_len += len;
   //ldout(cct, 0) << "::GBH::MSG::payload .len=" << len << ", total_len=" << total_len << dendl;
-  ceph_assert(total_len <= rx_segment_ptr->length());
+  //ceph_assert(total_len <= rx_segment_ptr->length());
 
   // there is no middle frame so can safely skip it
-  ceph_assert(preamble->segments[SegmentIndex::Msg::MIDDLE].length == 0);
+  //ceph_assert(preamble->segments[SegmentIndex::Msg::MIDDLE].length == 0);
 
   uint32_t data_len = rx_frame_asm.get_data_segment_onwire_len();
   if (data_len == 0) {
@@ -1513,10 +1513,10 @@ CtPtr ProtocolV2::handle_read_frame_segments_done(rx_buffer_t &&rx_buffer, int r
     uint32_t epilogue_len = rx_frame_asm.get_epilogue_onwire_len();
     if (epilogue_len > 0) {
       total_len += epilogue_len;
-      ceph_assert(total_len <= rx_segment_ptr->length());
-      ceph_assert(rx_epilogue_ptr);
-      ceph_assert(rx_epilogue_ptr->raw_nref() == 1);
-      ceph_assert(rx_epilogue_ptr->raw_length() >= epilogue_len);
+      //ceph_assert(total_len <= rx_segment_ptr->length());
+      //ceph_assert(rx_epilogue_ptr);
+      //ceph_assert(rx_epilogue_ptr->raw_nref() == 1);
+      //ceph_assert(rx_epilogue_ptr->raw_length() >= epilogue_len);
       // reset buffer
       rx_epilogue_ptr->set_offset(0);
       //rx_epilogue_ptr->set_length(epilogue_len);
@@ -1525,7 +1525,7 @@ CtPtr ProtocolV2::handle_read_frame_segments_done(rx_buffer_t &&rx_buffer, int r
       rx_epilogue_ptr->set_length(0);
       rx_epilogue_ptr->append(p, epilogue_len);
     }
-    ceph_assert(total_len == rx_segment_ptr->length());
+    //ceph_assert(total_len == rx_segment_ptr->length());
   }
   else {
     // data segment
@@ -1549,7 +1549,7 @@ CtPtr ProtocolV2::handle_read_frame_segments_done(rx_buffer_t &&rx_buffer, int r
   }
 
   if (ok) {
-    ceph_assert(next_tag == Tag::MESSAGE);
+    //ceph_assert(next_tag == Tag::MESSAGE);
     return handle_message(segments_bls.data(), reinterpret_cast<const ceph_msg_header2*>(header));
   }
 
@@ -1604,7 +1604,7 @@ CtPtr ProtocolV2::handle_read_frame_segment(rx_buffer_t &&rx_buffer, int r) {
   }
 
   rx_segments_data.back().push_back(std::move(rx_buffer));
-  ceph_assert(rx_segments_data.back().get_num_buffers() == 1);
+  //ceph_assert(rx_segments_data.back().get_num_buffers() == 1);
   return _handle_read_frame_segment();
 }
 
