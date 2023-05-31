@@ -498,27 +498,21 @@ void ProtocolV2::read_event() {
 
   switch (state) {
     case START_CONNECT:
-      //ldout(cct, 0) << "::GBH::MSG::ProtocolV2::read_event()::START_CONNECT" << dendl;
       run_continuation(CONTINUATION(start_client_banner_exchange));
       break;
     case START_ACCEPT:
-      //ldout(cct, 0) << "::GBH::MSG::ProtocolV2::read_event()::START_ACCEPT" << dendl;
       run_continuation(CONTINUATION(start_server_banner_exchange));
       break;
     case READY:
-      //ldout(cct, 0) << "::GBH::MSG::ProtocolV2::read_event()::READY" << dendl;
       run_continuation(CONTINUATION(read_frame));
       break;
     case THROTTLE_MESSAGE:
-      //ldout(cct, 0) << "::GBH::MSG::ProtocolV2::read_event()::THROTTLE_MESSAGE" << dendl;
       run_continuation(CONTINUATION(throttle_message));
       break;
     case THROTTLE_BYTES:
-      //ldout(cct, 0) << "::GBH::MSG::ProtocolV2::read_event()::THROTTLE_BYTES" << dendl;
       run_continuation(CONTINUATION(throttle_bytes));
       break;
     case THROTTLE_DISPATCH_QUEUE:
-      //ldout(cct, 0) << "::GBH::MSG::ProtocolV2::read_event()::THROTTLE_DISPATCH_QUEUE" << dendl;
       run_continuation(CONTINUATION(throttle_dispatch_queue));
       break;
     default:
@@ -1106,8 +1100,10 @@ void ProtocolV2::allocate_new_buffer(rx_buffer_t& rx_buff, unsigned onwire_len, 
   //rx_buff = ceph::buffer::ptr_node::create(ceph::buffer::create(std::max(MAX_DATA_BUFFER, onwire_len)));
   rx_buff = ceph::buffer::ptr_node::create(ceph::buffer::create(std::max(MAX_PREAMBLE_LEN, onwire_len)));
   rx_buff->set_length(onwire_len);
+#if 0
   ldout(cct, 0) << "::(X)GBH::MSG::ALLOCATE_NEW_BUFFER()::" << caller << " onwire_len=" << onwire_len
 		<< ", alloc_size=" << rx_buff->raw_length() << "\n" << dendl;
+#endif
 }
 
 //---------------------------------------------------------------------------
@@ -1119,19 +1115,21 @@ void ProtocolV2::recycle_buffer(rx_buffer_t& rx_buff, unsigned onwire_len)
   for (unsigned i = 0; i < buffers_pool.size(); i++) {
     if (rx_buff) {
       if (buffers_pool[i] == nullptr) {
-	ldout(cct, 0) << "::(" << cnt << ")::(X)GBH::MSG::ProtocolV2::recycle_buffer() - store rx_buff (existing entry)" << dendl;
+	//ldout(cct, 0) << "::(" << cnt << ")::(X)GBH::MSG::ProtocolV2::recycle_buffer() - store rx_buff (existing entry)" << dendl;
 	// store the rx_buff for future recycle (when nref goes down)
 	buffers_pool[i] = std::move(rx_buff);
 	continue;
       }
       else if (buffers_pool[i]->raw_nref() > 1 || buffers_pool[i]->raw_length() < onwire_len) {
+#if 0
 	ldout(cct, 0) << "::(" << cnt << ")::(X)GBH::MSG::ProtocolV2::recycle_buffer() - unsuitable candidate, nref="
 		      << buffers_pool[i]->raw_nref() << ", raw_length=" << buffers_pool[i]->raw_length() << dendl;
+#endif
 	// unsuitable candidate -> skip to the next entry
 	continue;
       }
       else {
-	ldout(cct, 0) << "::(" << cnt << ")::(X)GBH::MSG::ProtocolV2::recycle_buffer() - exchange" << dendl;
+	//ldout(cct, 0) << "::(" << cnt << ")::(X)GBH::MSG::ProtocolV2::recycle_buffer() - exchange" << dendl;
 	rx_buffer_t tmp = std::move(rx_buff);
 	rx_buff = std::move(buffers_pool[i]);
 	buffers_pool[i] = std::move(tmp);
@@ -1140,7 +1138,7 @@ void ProtocolV2::recycle_buffer(rx_buffer_t& rx_buff, unsigned onwire_len)
     }
     else {			// rx_buff is null
       if (buffers_pool[i] && buffers_pool[i]->raw_nref() == 1 && buffers_pool[i]->raw_length() >= onwire_len ) {
-	ldout(cct, 0) << "::(" << cnt << ")::(X)GBH::MSG::ProtocolV2::recycle_buffer() - recycle from buffers_pool" << dendl;
+	//ldout(cct, 0) << "::(" << cnt << ")::(X)GBH::MSG::ProtocolV2::recycle_buffer() - recycle from buffers_pool" << dendl;
 	rx_buff = std::move(buffers_pool[i]);
 	return;
       }
@@ -1150,8 +1148,10 @@ void ProtocolV2::recycle_buffer(rx_buffer_t& rx_buff, unsigned onwire_len)
   if (rx_buff) {
     auto prev_size = buffers_pool.size();
     buffers_pool.push_back(std::move(rx_buff));
+#if 0
     ldout(cct, 0) << "::(" << cnt << ")::(X)GBH::MSG::ProtocolV2::recycle_buffer() - store in a new entry. size="
 		  << buffers_pool.size() << "/" << prev_size << dendl;
+#endif
   }
 
   allocate_new_buffer(rx_buff, onwire_len, __func__);
@@ -1178,7 +1178,7 @@ CtPtr ProtocolV2::read_frame()
   }
   else {
     // reset buffer
-    ldout(cct, 0) << "::(X)GBH::MSG::ProtocolV2::rx_preamble_ptr reset() len=" << preamble_onwire_len << "/" << rx_preamble_ptr->raw_length() << dendl;
+    //ldout(cct, 0) << "::(X)GBH::MSG::ProtocolV2::rx_preamble_ptr reset() len=" << preamble_onwire_len << "/" << rx_preamble_ptr->raw_length() << dendl;
     rx_preamble_ptr->set_offset(0);
     rx_preamble_ptr->set_length(preamble_onwire_len);
   }
@@ -1294,7 +1294,7 @@ static const char* get_tag_name(unsigned index)
 
 CtPtr ProtocolV2::handle_read_frame_dispatch() {
   uint32_t tag_idx = static_cast<uint32_t>(next_tag);
-  ldout(cct, 0) << "::(3)GBH::MSG::ProtocolV2::handle_read_frame_dispatch() tag=" << tag_idx << "::" << get_tag_name(tag_idx) << dendl;
+  //ldout(cct, 0) << "::(3)GBH::MSG::ProtocolV2::handle_read_frame_dispatch() tag=" << tag_idx << "::" << get_tag_name(tag_idx) << dendl;
   ldout(cct, 10) << __func__
                  << " tag=" << static_cast<uint32_t>(next_tag) << dendl;
 
@@ -1365,7 +1365,7 @@ CtPtr ProtocolV2::read_frame_segments_with_epilogue()
   }
   else {
     // unfamiliar message -> use legacy code
-    ldout(cct, 0) << "::(A)GBH::MSG::ProtocolV2:: unfamiliar message -> redirect to read_frame_segment()" << dendl;
+    //ldout(cct, 0) << "::(A)GBH::MSG::ProtocolV2:: unfamiliar message -> redirect to read_frame_segment()" << dendl;
     return read_frame_segment();
   }
 
@@ -1387,8 +1387,6 @@ CtPtr ProtocolV2::read_frame_segments_with_epilogue()
 //--------------------------------------------------------------------------------
 CtPtr ProtocolV2::handle_read_frame_segments_header_payload_and_epilogue(rx_buffer_t &&rx_buffer, int r)
 {
-  //ldout(cct, 0) << "::GBH::MSG::" << __func__ << " r=" << r << dendl;
-
   if (unlikely(r < 0)) {
     ldout(cct, 0) << __func__ << " read failed r=" << r << " (" << cpp_strerror(r) << ")" << dendl;
     return _fault();
@@ -1401,8 +1399,6 @@ CtPtr ProtocolV2::handle_read_frame_segments_header_payload_and_epilogue(rx_buff
 //--------------------------------------------------------------------------------
 CtPtr ProtocolV2::handle_read_frame_segments_data(rx_buffer_t &&rx_buffer, int r)
 {
-  //ldout(cct, 0) << "::GBH::MSG::" << __func__ << " r=" << r << dendl;
-
   if (unlikely(r < 0)) {
     ldout(cct, 0) << __func__ << " read failed r=" << r << " (" << cpp_strerror(r) << ")" << dendl;
     return _fault();
@@ -1415,8 +1411,10 @@ CtPtr ProtocolV2::handle_read_frame_segments_data(rx_buffer_t &&rx_buffer, int r
   uint32_t data_len = rx_frame_asm.get_data_segment_onwire_len();
   rx_data_ptr = std::move(data_cache.alloc_rx(data_len, align));
   ceph_assert(rx_data_ptr);
+#if 0
   ldout(cct, 0) << __func__ <<":: req_len=" << data_len << ", len=" << rx_data_ptr->length() << ", raw_len=" << rx_data_ptr->raw_length()
 		<< ", ref=" << rx_data_ptr->raw_nref() << ", align=" << align << dendl;
+#endif
   rx_data_ptr->set_length(data_len);
   //rx_data_ptr = ceph::buffer::ptr_node::create(ceph::buffer::create_aligned(data_len, align));
   return READ_RXBUF(std::move(rx_data_ptr), handle_read_frame_epilogue);
@@ -1425,8 +1423,6 @@ CtPtr ProtocolV2::handle_read_frame_segments_data(rx_buffer_t &&rx_buffer, int r
 //--------------------------------------------------------------------------------
 CtPtr ProtocolV2::handle_read_frame_epilogue(rx_buffer_t &&rx_buffer, int r)
 {
-  ldout(cct, 0) << "::GBH::MSG::" << __func__ << " r=" << r << ", len=" << rx_buffer->length() << dendl;
-
   if (unlikely(r < 0)) {
     ldout(cct, 0) << __func__ << " read failed r=" << r << " (" << cpp_strerror(r) << ")" << dendl;
     return _fault();
@@ -1447,8 +1443,6 @@ CtPtr ProtocolV2::handle_read_frame_epilogue(rx_buffer_t &&rx_buffer, int r)
 //--------------------------------------------------------------------------------
 CtPtr ProtocolV2::handle_read_frame_epilogue_done(rx_buffer_t &&rx_buffer, int r)
 {
-  //ldout(cct, 0) << "::GBH::MSG::" << __func__ << " r=" << r << dendl;
-
   if (unlikely(r < 0)) {
     ldout(cct, 0) << __func__ << " read failed r=" << r << " (" << cpp_strerror(r) << ")" << dendl;
     return _fault();
@@ -1464,8 +1458,8 @@ CtPtr ProtocolV2::handle_read_frame_segments_done(rx_buffer_t &&rx_buffer, int r
   const BufferCacheStat* payload_stats = payload_cache.get_stats();
   const BufferCacheStat* data_stats    = data_cache.get_stats();
     
-  ldout(cct, 0) << "::handle_read_frame_segments_done: payload_stats: " << *payload_stats << dendl;
-  ldout(cct, 0) << "::handle_read_frame_segments_done: data_stats:    " << *data_stats << dendl;
+  //ldout(cct, 0) << "::handle_read_frame_segments_done: payload_stats: " << *payload_stats << dendl;
+  //ldout(cct, 0) << "::handle_read_frame_segments_done: data_stats:    " << *data_stats << dendl;
 
   std::array<bufferlist, MessageFrame::SegmentsNumV> segments_bls;
   //bufferlist  segments_bls[MessageFrame::SegmentsNumV];
@@ -1477,9 +1471,10 @@ CtPtr ProtocolV2::handle_read_frame_segments_done(rx_buffer_t &&rx_buffer, int r
   const char* p = rx_segment_ptr->c_str();
   auto preamble = reinterpret_cast<const preamble_block_t*>(rx_preamble_ptr->c_str());
   unsigned total_len = 0;
+#if 0
   ldout(cct, 0) << "::GBH::MSG::ProtocolV2::preamble->num_segments=" << (unsigned)preamble->num_segments
 		<< ", rx_segment_ptr->length()=" << rx_segment_ptr->length() << dendl;
-
+#endif
 
   // header segment has a built in CRC
   // following segment got their crc in the epilogue
@@ -1516,10 +1511,8 @@ CtPtr ProtocolV2::handle_read_frame_segments_done(rx_buffer_t &&rx_buffer, int r
     // this was a read req with rx_buffer holding header/payload/epilogue
     // Need to copy the epilogue from the rx_buffer
     uint32_t epilogue_len = rx_frame_asm.get_epilogue_onwire_len();
-    //ldout(cct, 0) << "::GBH::MSG::epilogue_onwire_len=" << epilogue_len << dendl;
     if (epilogue_len > 0) {
       total_len += epilogue_len;
-      //ldout(cct, 0) << "::GBH::MSG::epilogue .len=" << epilogue_len << ", total_len=" << total_len << dendl;
       ceph_assert(total_len <= rx_segment_ptr->length());
       ceph_assert(rx_epilogue_ptr);
       ceph_assert(rx_epilogue_ptr->raw_nref() == 1);
@@ -1532,7 +1525,6 @@ CtPtr ProtocolV2::handle_read_frame_segments_done(rx_buffer_t &&rx_buffer, int r
       rx_epilogue_ptr->set_length(0);
       rx_epilogue_ptr->append(p, epilogue_len);
     }
-    //ldout(cct, 0) << "::GBH::MSG::total_len=" << total_len << ", rx_segment_ptr->length()=" << rx_segment_ptr->length() << dendl;
     ceph_assert(total_len == rx_segment_ptr->length());
   }
   else {
@@ -1565,7 +1557,7 @@ CtPtr ProtocolV2::handle_read_frame_segments_done(rx_buffer_t &&rx_buffer, int r
   // and abort after putting entire data field on wire. This will be used by
   // the kernel client to avoid unnecessary buffering.
 
-  ldout(cct, 0) << "::=============   NOT OK ====================" << dendl;
+  //ldout(cct, 0) << "::=============   NOT OK ====================" << dendl;
   reset_throttle();
   state = READY;
   ceph_abort_msg("NOT IMPLEMENETED YET");
@@ -1800,8 +1792,10 @@ CtPtr ProtocolV2::handle_message(bufferlist segments_bls[], const ceph_msg_heade
     ceph_le32(0), ceph_le64(0), p_header->flags};
 
   // will allocate the Message data-struct and copy buffer-list, header and footer into it
+#if 0
   ldout(cct, 0) << "::(4)GBH::MSG::ProtocolV2::payload_cache.entries_count=" << payload_cache.entries_count()
 		<< ", data_cache.entries_count=" << data_cache.entries_count() << dendl;
+#endif
   Message *message = fast_decode_message(cct, &payload_cache, &data_cache, header, footer, front, middle, data, connection);
   if (!message) {
     ldout(cct, 1) << __func__ << " decode message failed " << dendl;
@@ -1939,9 +1933,10 @@ CtPtr ProtocolV2::handle_message(bufferlist segments_bls[], const ceph_msg_heade
 }
 #if 1
 CtPtr ProtocolV2::handle_message() {
+#if 0
   ldout(cct, 0) << "::(4)GBH::MSG::handle_message()::SegmentsNumV=" << MessageFrame::SegmentsNumV
 		<< ", size(rx_segments_data)=" << std::size(rx_segments_data) << dendl;
-
+#endif
   ldout(cct, 20) << __func__ << dendl;
   ceph_assert(state == THROTTLE_DONE);
 
@@ -2209,7 +2204,7 @@ CtPtr ProtocolV2::throttle_dispatch_queue() {
 #if 1
   // no need to suppoprt encryption or rev0 yet
   if (HAVE_MSGR2_FEATURE(peer_supported_features, REVISION_1) && !session_stream_handlers.rx.get()) {
-    ldout(cct, 0) << "::GBH::MSG::ProtocolV2::use new-code !!!" << dendl;
+    //ldout(cct, 0) << "::GBH::MSG::ProtocolV2::use new-code !!!" << dendl;
     return read_frame_segments_with_epilogue();
   }
   else {
@@ -2786,7 +2781,7 @@ CtPtr ProtocolV2::post_server_banner_exchange() {
 }
 
 CtPtr ProtocolV2::handle_auth_request(ceph::bufferlist &payload) {
-  ldout(cct, 0) << "::(333)GBH::MSG::ProtocolV2::handle_auth_request() payload.length()=" << payload.length() << dendl;
+  //ldout(cct, 0) << "::(333)GBH::MSG::ProtocolV2::handle_auth_request() payload.length()=" << payload.length() << dendl;
   ldout(cct, 20) << __func__ << " payload.length()=" << payload.length()
                  << dendl;
 
@@ -2922,18 +2917,12 @@ CtPtr ProtocolV2::handle_auth_signature(ceph::bufferlist &payload)
   const auto actual_tx_sig = auth_meta->session_key.empty() ?
     sha256_digest_t() : auth_meta->session_key.hmac_sha256(cct, pre_auth.txbuf);
   if (sig_frame.signature() != actual_tx_sig) {
-    ldout(cct, 0) << "::GBH::MSG::ProtocolV2::handle_auth_signature()::pre-auth signature mismatch"
-                  << " actual_tx_sig=" << actual_tx_sig
-                  << " sig_frame.signature()=" << sig_frame.signature() << dendl;
-      
     ldout(cct, 2) << __func__ << " pre-auth signature mismatch"
                   << " actual_tx_sig=" << actual_tx_sig
                   << " sig_frame.signature()=" << sig_frame.signature()
                   << dendl;
     return _fault();
   } else {
-    ldout(cct, 0) << "::GBH::MSG::ProtocolV2::handle_auth_signature()::pre-auth signature success !!!"
-                   << " sig_frame.signature()=" << sig_frame.signature() << dendl;
     ldout(cct, 20) << __func__ << " pre-auth signature success"
                    << " sig_frame.signature()=" << sig_frame.signature()
                    << dendl;
@@ -2941,12 +2930,8 @@ CtPtr ProtocolV2::handle_auth_signature(ceph::bufferlist &payload)
   }
 
   if (state == AUTH_ACCEPTING_SIGN) {
-    //ldout(cct, 0) << "::GBH::MSG::ProtocolV2::handle_auth_signature()::server side" <<dendl;
-    // this happened on server side
     return finish_server_auth();
   } else if (state == AUTH_CONNECTING_SIGN) {
-    //ldout(cct, 0) << "::GBH::MSG::ProtocolV2::handle_auth_signature()::client side" << dendl;
-    // this happened at client side
     return finish_client_auth();
   } else {
     ceph_abort("state corruption");

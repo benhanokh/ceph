@@ -314,8 +314,6 @@ Message *decode_message(CephContext *cct,
                         ceph::bufferlist& data,
                         Message::ConnectionRef conn)
 {
-  ldout(cct, 0) << "(11)OSD::GBH::Message::decode_message()::crcflags=" << crcflags << " "
-		<< (header.type == CEPH_MSG_OSD_OP ? "CEPH_MSG_OSD_OP" : "") << dendl;
   // verify crc
   if (crcflags & MSG_CRC_HEADER) {
     __u32 front_crc = front.crc32c(0);
@@ -343,7 +341,6 @@ Message *decode_message(CephContext *cct,
     }
   }
   if (crcflags & MSG_CRC_DATA) {
-    ldout(cct, 0) << "(11)OSD::GBH::MSG::decode_message()::MSG_CRC_DATA" << dendl;
     if ((footer.flags & CEPH_MSG_FOOTER_NOCRC) == 0) {
       __u32 data_crc = data.crc32c(0);
       if (data_crc != footer.data_crc) {
@@ -1003,9 +1000,6 @@ Message *fast_decode_message(CephContext *cct,
 			     ceph::bufferlist& data,
 			     Message::ConnectionRef conn)
 {
-  ldout(cct, 0) << "(11)OSD::GBH::Message::fast_decode_message()::"
-		<< (header.type == CEPH_MSG_OSD_OP ? "CEPH_MSG_OSD_OP" : "") << dendl;
-  
   // make message
   ceph::ref_t<Message> m;
   int type = header.type;
@@ -1591,11 +1585,11 @@ Message *fast_decode_message(CephContext *cct,
 
   m->set_cct(cct);
   if (_payload_cache) {
-    ldout(cct, 0) << "OSD::GBH::MSG::decode_message()::m->set_payload_cache() .entries_count=" << _payload_cache->entries_count() << dendl;
+    //ldout(cct, 0) << "OSD::GBH::MSG::decode_message()::m->set_payload_cache() .entries_count=" << _payload_cache->entries_count() << dendl;
     m->set_payload_cache(_payload_cache);
   }
   if (_data_cache) {
-    ldout(cct, 0) << "OSD::GBH::MSG::decode_message()::m->set_data_cache() .entries_count=" << _data_cache->entries_count() << dendl;
+    //ldout(cct, 0) << "OSD::GBH::MSG::decode_message()::m->set_data_cache() .entries_count=" << _data_cache->entries_count() << dendl;
     m->set_data_cache(_data_cache);
   }
 
@@ -1655,6 +1649,23 @@ Message *fast_decode_message(CephContext *cct,
 }
 
 #include <boost/stacktrace.hpp>
+void Message::set_data(const ceph::buffer::list &bl)
+{
+  // prevent the data buffer from being freed
+  if (bl.get_num_buffers() == 1 && !bl.buffers().empty()) {
+    ceph::buffer::list::buffers_t& buffers = const_cast<ceph::buffer::list &>(bl).mut_buffers();
+    ceph::buffer::ptr_node& pn = buffers.back();
+    pn.set_ref_holder();
+    if (cct) {
+      //ldout(cct, 0) << "::GBH::MSG::set_data() .len=" << pn.length() << dendl;
+    }
+  }
+  if (byte_throttler)
+    byte_throttler->put(data.length());
+  data.share(bl);
+  if (byte_throttler)
+    byte_throttler->take(data.length());
+}
 
 void Message::clear_payload()
 {
@@ -1664,9 +1675,11 @@ void Message::clear_payload()
 
   if (this->payload_cache && payload.length()) {
     BufferCacheStat* stats = this->payload_cache->get_stats();
+#if 0
     if (cct) {
       ldout(cct, 0) << "::GBH::MSG::clear_payload() .len=" << payload.length() << ", .raw_len=" << payload.raw_length() << dendl;
     }
+#endif
     rx_buffer_t rx_buffer = payload.pop_back();
     if (rx_buffer) {
       stats->popback_success++;
@@ -1675,9 +1688,11 @@ void Message::clear_payload()
     }
     else {
       stats->popback_failure++;
+#if 0
       if (cct) {
 	ldout(cct, 0) << "::GBH::MSG::clear_payload() failed payload.pop_back() .len=" << payload.length() << dendl;
       }
+#endif
       payload.clear();
     }
   }
@@ -1694,18 +1709,21 @@ void Message::clear_data() {
 
   if (this->data_cache && data.length() ) {
     BufferCacheStat* stats = this->data_cache->get_stats();
+#if 0
     if (cct) {
       ldout(cct, 0) << "::GBH::MSG::clear_data() data.len=" << data.length() << dendl;
     }
-
+#endif
     rx_buffer_t rx_buffer = data.pop_back();
-    if (rx_buffer) {
+    if (rx_buffer) {      
       stats->popback_success++;
       int ret = this->data_cache->free_rx(std::move(rx_buffer));
+      rx_buffer->clear_ref_holder();
       ceph_assert(ret == 0);
     }
     else {
       stats->popback_failure++;
+#if 0
       if (cct) {
 	auto & pn = data.buffers().back();
 	ldout(cct, 0) << "::GBH::MSG::clear_data() failed data.pop_back() data.len=" << data.length()
@@ -1713,13 +1731,16 @@ void Message::clear_data() {
 		      << (data.buffers().empty() ? " EMPTY": " NOT EMPTY")
 		      << " ref_count=" << pn.raw_nref() << dendl;
       }
+#endif
       data.clear();
     }
   }
   else if (this->data_cache) {
+#if 0
     if (cct) {
       ldout(cct, 0) << "::GBH::MSG::clear_data() EMPTY data.len=" << data.length() << dendl;
     }
+#endif
   }
   else {
     data.clear();
@@ -1734,44 +1755,54 @@ Message::~Message()
   }
 
   if (this->payload_cache && payload.length()) {
+#if 0
     if (cct) {
       ldout(cct, 0) << "::GBH::MSG::~Message() payload.len=" << payload.length() << dendl;
     }
+#endif
     rx_buffer_t rx_buffer = payload.pop_back();
     if (rx_buffer) {
       int ret = this->payload_cache->free_rx(std::move(rx_buffer));
       ceph_assert(ret == 0);
     }
     else {
+#if 0
       if (cct) {
 	ldout(cct, 0) << "::GBH::MSG::~Message() failed payload.pop_back() .len="<< payload.length() << dendl;
       }
+#endif
     }
   }
 
   if (this->data_cache && data.length()) {
+#if 0
     if (cct) {
       ldout(cct, 0) << "::GBH::MSG::~Message() data.len=" << data.length() << dendl;
     }
+#endif
     rx_buffer_t rx_buffer = data.pop_back();
     if (rx_buffer) {
       int ret = this->data_cache->free_rx(std::move(rx_buffer));
+      rx_buffer->clear_ref_holder();
       ceph_assert(ret == 0);
     }
     else {
+#if 0
       if (cct) {
 	ldout(cct, 0) << "::GBH::MSG::~Message() failed data.pop_back() data.len=" << data.length()
 		      << ", num_buffers=" << data.get_num_buffers()
 		      << (data.buffers().empty() ? " EMPTY": " NOT EMPTY") << dendl;
       }
+#endif
     }
   }
   else if (this->data_cache) {
+#if 0
     if (cct) {
       ldout(cct, 0) << "::GBH::MSG::~Message() EMPTY data.len=" << data.length() << dendl;
     }
+#endif
   }
-
 
   release_message_throttle();
   trace.event("message destructed");

@@ -476,14 +476,7 @@ public:
   }
   ceph::buffer::list& get_middle() { return middle; }
 
-  void set_data(const ceph::buffer::list &bl) {
-    if (byte_throttler)
-      byte_throttler->put(data.length());
-    data.share(bl);
-    if (byte_throttler)
-      byte_throttler->take(data.length());
-  }
-
+  void set_data(const ceph::buffer::list &bl);
   const ceph::buffer::list& get_data() const { return data; }
   ceph::buffer::list& get_data() { return data; }
   void claim_data(ceph::buffer::list& bl) {

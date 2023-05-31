@@ -168,8 +168,8 @@ struct error_code;
   protected:
     raw *_raw;
     unsigned _off, _len;
+    bool ref_holder = false;
   private:
-
     void release();
 
     template<bool is_const>
@@ -248,7 +248,9 @@ struct error_code;
     }
 
     bool have_raw() const { return _raw ? true:false; }
-
+    void set_ref_holder();
+    void clear_ref_holder();
+    
     void swap(ptr& other) noexcept;
 
     iterator begin(size_t offset=0) {

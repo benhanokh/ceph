@@ -485,6 +485,21 @@ static ceph::spinlock debug_lock;
     return _raw->get_data()[_off + n];
   }
 
+  void buffer::ptr::set_ref_holder() {
+    if(!ref_holder && _raw) {
+      ref_holder = true;
+      _raw->nref++;
+    }
+  }
+
+  void buffer::ptr::clear_ref_holder() {
+    if(ref_holder) {
+      ceph_assert(_raw);
+      _raw->nref--;
+      ref_holder = false;
+    }
+  }
+
   const char *buffer::ptr::raw_c_str() const { ceph_assert(_raw); return _raw->get_data(); }
   unsigned buffer::ptr::raw_length() const { ceph_assert(_raw); return _raw->get_len(); }
   int buffer::ptr::raw_nref() const { ceph_assert(_raw); return _raw->nref; }
