@@ -1738,6 +1738,11 @@ void Message::clear_data() {
 
 Message::~Message()
 {
+#if 0
+  if (cct) {
+    ldout(cct, 0) << "::GBH::MSG::~Message() Backtrace:\n" << boost::stacktrace::stacktrace() << dendl;
+  }
+#endif
   if (byte_throttler) {
     byte_throttler->put(payload.length() + middle.length() + data.length());
   }

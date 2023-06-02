@@ -354,7 +354,7 @@ public:
                             size_t segment_count);
 
   Tag  disassemble_preamble(rx_buffer_t& rx_preamble);
-  void disasm_first_crc_rev1(rx_buffer_t& rx_preamble, const unsigned char *header, unsigned *header_len /*IN-OUT*/) const;
+  void disasm_first_crc_rev1(rx_buffer_t& rx_preamble, const unsigned char *header, unsigned header_len) const;
   bool disassemble_remaining_segments(bufferlist segment_bls[], rx_buffer_t& rx_epilogue) const;
   bool disassemble_segments(rx_buffer_t& rx_preamble, 
                             bufferlist segments_bls[], 

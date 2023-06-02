@@ -119,8 +119,6 @@ ProtocolV2::ProtocolV2(AsyncConnection *connection)
 
   rx_epilogue_ptr = ceph::buffer::ptr_node::create(ceph::buffer::create(MAX_EPILOGUE_LEN));
   rx_preamble_ptr = ceph::buffer::ptr_node::create(ceph::buffer::create(MAX_PREAMBLE_LEN));
-  //rx_preamble_ptr = ceph::buffer::ptr_node::create(ceph::buffer::create(MAX_DATA_BUFFER));
-
 }
 
 ProtocolV2::~ProtocolV2() {
@@ -792,7 +790,8 @@ CtPtr ProtocolV2::read(CONTINUATION_RXBPTR_TYPE<ProtocolV2> &next,
   ssize_t r = connection->read(len, buf,
     [&next, this](char *buffer, int r) {
       if (unlikely(pre_auth.enabled) && r >= 0) {
-        pre_auth.rxbuf.append(*next.node);
+        //pre_auth.rxbuf.append(*next.node);
+	pre_auth.rxbuf.append(next.node->c_str(), next.node->length());
 	ceph_assert(!cct->_conf->ms_die_on_bug ||
 		    pre_auth.rxbuf.length() < 20000000);
       }
@@ -802,7 +801,8 @@ CtPtr ProtocolV2::read(CONTINUATION_RXBPTR_TYPE<ProtocolV2> &next,
   if (r <= 0) {
     // error or done synchronously
     if (unlikely(pre_auth.enabled) && r == 0) {
-      pre_auth.rxbuf.append(*next.node);
+      //pre_auth.rxbuf.append(*next.node);
+      pre_auth.rxbuf.append(next.node->c_str(), next.node->length());
       ceph_assert(!cct->_conf->ms_die_on_bug ||
 		  pre_auth.rxbuf.length() < 20000000);
     }
@@ -834,7 +834,8 @@ CtPtr ProtocolV2::write(const std::string &desc,
                         CONTINUATION_TYPE<ProtocolV2> &next,
                         ceph::bufferlist &buffer) {
   if (unlikely(pre_auth.enabled)) {
-    pre_auth.txbuf.append(buffer);
+    //pre_auth.txbuf.append(buffer);
+    pre_auth.txbuf.append(buffer.c_str(), buffer.length());
     ceph_assert(!cct->_conf->ms_die_on_bug ||
 		pre_auth.txbuf.length() < 20000000);
   }
@@ -1167,22 +1168,14 @@ CtPtr ProtocolV2::read_frame()
 
   ldout(cct, 20) << __func__ << dendl;
 
-  rx_segments_data.clear();
-
-  if (unlikely(rx_preamble_ptr->raw_nref() > 1 )) {
-    recycle_buffer(rx_preamble_ptr, preamble_onwire_len);
-  }
-  else if (unlikely(rx_preamble_ptr->raw_length() < preamble_onwire_len)) {
-    rx_preamble_ptr.release();
-    allocate_new_buffer(rx_preamble_ptr, preamble_onwire_len, "rx_preamble_ptr::realloc");
-  }
-  else {
-    // reset buffer
-    //ldout(cct, 0) << "::(X)GBH::MSG::ProtocolV2::rx_preamble_ptr reset() len=" << preamble_onwire_len << "/" << rx_preamble_ptr->raw_length() << dendl;
-    rx_preamble_ptr->set_offset(0);
-    rx_preamble_ptr->set_length(preamble_onwire_len);
+  if (unlikely(rx_segments_data.size() > 0)) {
+    rx_segments_data.clear();
   }
 
+  //ceph_assert(rx_preamble_ptr->raw_nref() == 1 );
+  //ceph_assert(rx_preamble_ptr->raw_length() >= preamble_onwire_len);
+  rx_preamble_ptr->set_offset(0);
+  rx_preamble_ptr->set_length(preamble_onwire_len);
   return READ_RXBUF(std::move(rx_preamble_ptr), handle_read_frame_preamble_main);
 }
 
@@ -1191,7 +1184,7 @@ CtPtr ProtocolV2::handle_read_frame_preamble_main(rx_buffer_t &&buffer, int r) {
 
   if (r < 0) {
     ldout(cct, 1) << __func__ << " read frame preamble failed r=" << r
-                  << dendl;
+		  << dendl;
     return _fault();
   }
 
@@ -1201,7 +1194,7 @@ CtPtr ProtocolV2::handle_read_frame_preamble_main(rx_buffer_t &&buffer, int r) {
   rx_preamble_bl.hexdump(*_dout);
   *_dout << dendl;
 #endif
-  
+
   try {
     next_tag = rx_frame_asm.disassemble_preamble(rx_preamble_ptr);
   } catch (FrameError& e) {
@@ -1213,7 +1206,7 @@ CtPtr ProtocolV2::handle_read_frame_preamble_main(rx_buffer_t &&buffer, int r) {
   }
 
   ldout(cct, 25) << __func__ << " disassembled preamble " << rx_frame_asm
-                 << dendl;
+		 << dendl;
 
   // does it need throttle?
   if (next_tag == Tag::MESSAGE) {
@@ -1290,13 +1283,13 @@ static const char* get_tag_name(unsigned index)
   };
 
   return tag_names[index];
-}  
+}
 #endif
 CtPtr ProtocolV2::handle_read_frame_dispatch() {
   //uint32_t tag_idx = static_cast<uint32_t>(next_tag);
   //ldout(cct, 0) << "::(3)GBH::MSG::ProtocolV2::handle_read_frame_dispatch() tag=" << tag_idx << "::" << get_tag_name(tag_idx) << dendl;
   ldout(cct, 10) << __func__
-                 << " tag=" << static_cast<uint32_t>(next_tag) << dendl;
+		 << " tag=" << static_cast<uint32_t>(next_tag) << dendl;
 
   switch (next_tag) {
     case Tag::HELLO:
@@ -1325,8 +1318,8 @@ CtPtr ProtocolV2::handle_read_frame_dispatch() {
       return handle_message();
     default: {
       lderr(cct) << __func__
-                 << " received unknown tag=" << static_cast<uint32_t>(next_tag)
-                 << dendl;
+		 << " received unknown tag=" << static_cast<uint32_t>(next_tag)
+		 << dendl;
       return _fault();
     }
   }
@@ -1457,20 +1450,18 @@ CtPtr ProtocolV2::handle_read_frame_segments_done(rx_buffer_t &&rx_buffer, int r
 {
 #if 0
   const BufferCacheStat* payload_stats = payload_cache.get_stats();
-  const BufferCacheStat* data_stats    = data_cache.get_stats();  
+  const BufferCacheStat* data_stats    = data_cache.get_stats();
   ldout(cct, 0) << "::handle_read_frame_segments_done: payload_stats: " << *payload_stats << dendl;
   ldout(cct, 0) << "::handle_read_frame_segments_done: data_stats:    " << *data_stats << dendl;
 #endif
   std::array<bufferlist, MessageFrame::SegmentsNumV> segments_bls;
   //bufferlist  segments_bls[MessageFrame::SegmentsNumV];
-  rx_segment_ptr = std::move(rx_buffer);
 
   bool ok = false;
   //ceph_assert(rx_segment_ptr);
   //ceph_assert(rx_preamble_ptr);
-  const char* p = rx_segment_ptr->c_str();
   auto preamble = reinterpret_cast<const preamble_block_t*>(rx_preamble_ptr->c_str());
-  unsigned total_len = 0;
+
 #if 0
   ldout(cct, 0) << "::GBH::MSG::ProtocolV2::preamble->num_segments=" << (unsigned)preamble->num_segments
 		<< ", rx_segment_ptr->length()=" << rx_segment_ptr->length() << dendl;
@@ -1478,18 +1469,21 @@ CtPtr ProtocolV2::handle_read_frame_segments_done(rx_buffer_t &&rx_buffer, int r
 
   // header segment has a built in CRC
   // following segment got their crc in the epilogue
-  unsigned             len        = preamble->segments[0].length + FRAME_CRC_SIZE;
-  unsigned             header_len = len;
+  unsigned header_len = preamble->segments[SegmentIndex::Msg::HEADER].length + FRAME_CRC_SIZE;
+  unsigned total_len  = header_len;
+
+  rx_segment_ptr = std::move(rx_buffer);
+  const char* p = rx_segment_ptr->c_str();
   const unsigned char* header     = (const unsigned char*)p;
-  rx_frame_asm.disasm_first_crc_rev1(rx_preamble_ptr, header, &header_len /*IN-OUT*/);
+  rx_frame_asm.disasm_first_crc_rev1(rx_preamble_ptr, header, header_len /*IN-OUT*/);
   //segments_bls[SegmentIndex::Msg::HEADER].append(p, header_len);
-  p += len;
-  total_len += len;
+  p += header_len;
   //ldout(cct, 0) << "::GBH::MSG::header .len=" << header_len << ", .raw_len=" << len << ", total_len=" << total_len << dendl;
-  
+
   // payload
-  len = preamble->segments[1].length;
-  unsigned alloc_len = round_up_to(len, 16);
+  unsigned payload_len = preamble->segments[SegmentIndex::Msg::FRONT].length;
+#if 0
+  unsigned alloc_len   = round_up_to(payload_len, 16);
   alloc_len = std::max(alloc_len, MAX_DATA_BUFFER);
   rx_buffer_t rx_payload = std::move(payload_cache.alloc_rx(alloc_len, 16));
   //ceph_assert(rx_payload);
@@ -1497,9 +1491,15 @@ CtPtr ProtocolV2::handle_read_frame_segments_done(rx_buffer_t &&rx_buffer, int r
   rx_payload->set_length(0);
   rx_payload->set_offset(0);
   segments_bls[SegmentIndex::Msg::FRONT].push_back(std::move(rx_payload));
-  segments_bls[1].append(p, len);
-  p += len;
-  total_len += len;
+  segments_bls[1].append(p, payload_len);
+#else
+  rx_segment_ptr->set_length(payload_len);
+  rx_segment_ptr->set_offset(header_len);
+  segments_bls[SegmentIndex::Msg::FRONT].push_back(std::move(rx_segment_ptr));
+  rx_segment_ptr = std::move(payload_cache.alloc_rx(MAX_DATA_BUFFER, 16));
+#endif
+  p += payload_len;
+  total_len += payload_len;
   //ldout(cct, 0) << "::GBH::MSG::payload .len=" << len << ", total_len=" << total_len << dendl;
   //ceph_assert(total_len <= rx_segment_ptr->length());
 
@@ -1581,13 +1581,13 @@ CtPtr ProtocolV2::read_frame_segment() {
   try {
     //ldout(cct, 0) << "::(Z)GBH::MSG::ProtocolV2::read_frame_segment() segment_onwire_len=" << onwire_len << ", align=" << align << ", seg_idx=" << seg_idx << dendl;
     rx_buffer = ceph::buffer::ptr_node::create(ceph::buffer::create_aligned(
-        onwire_len, align));
+	onwire_len, align));
   } catch (const ceph::buffer::bad_alloc&) {
     // Catching because of potential issues with satisfying alignment.
     ldout(cct, 1) << __func__ << " can't allocate aligned rx_buffer"
-                  << " len=" << onwire_len
-                  << " align=" << align
-                  << dendl;
+		  << " len=" << onwire_len
+		  << " align=" << align
+		  << dendl;
     return _fault();
   }
 
@@ -1599,7 +1599,7 @@ CtPtr ProtocolV2::handle_read_frame_segment(rx_buffer_t &&rx_buffer, int r) {
 
   if (r < 0) {
     ldout(cct, 1) << __func__ << " read frame segment failed r=" << r << " ("
-                  << cpp_strerror(r) << ")" << dendl;
+		  << cpp_strerror(r) << ")" << dendl;
     return _fault();
   }
 

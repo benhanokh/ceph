@@ -281,61 +281,6 @@ bufferlist FrameAssembler::assemble_frame(Tag tag, bufferlist segment_bls[],
   return asm_crc_rev0(preamble, segment_bls);
 }
 
-#if 0
-Tag FrameAssembler::disassemble_preamble(bufferlist& preamble_bl) {
-  if (m_crypto->rx) {
-    m_crypto->rx->reset_rx_handler();
-    if (m_is_rev1) {
-      ceph_assert(preamble_bl.length() == FRAME_PREAMBLE_WITH_INLINE_SIZE +
-                                          get_auth_tag_len());
-      m_crypto->rx->authenticated_decrypt_update_final(preamble_bl);
-    } else {
-      ceph_assert(preamble_bl.length() == sizeof(preamble_block_t));
-      m_crypto->rx->authenticated_decrypt_update(preamble_bl);
-    }
-  } else {
-    ceph_assert(preamble_bl.length() == sizeof(preamble_block_t));
-  }
-
-  // I expect ceph_le32 will make the endian conversion for me. Passing
-  // everything through ::Decode is unnecessary.
-  auto preamble = reinterpret_cast<const preamble_block_t*>(
-      preamble_bl.c_str());
-  // check preamble crc before any further processing
-  uint32_t crc = ceph_crc32c(
-      0, reinterpret_cast<const unsigned char*>(preamble),
-      sizeof(*preamble) - sizeof(preamble->crc));
-  if (crc != preamble->crc) [[unlikely]] {
-    throw FrameError(fmt::format(
-        "bad preamble crc calculated={} expected={}", crc, preamble->crc));
-  }
-
-  // see calc_num_segments()
-  if (preamble->num_segments < 1 ||
-      preamble->num_segments > MAX_NUM_SEGMENTS) {
-    throw FrameError(fmt::format(
-        "bad number of segments num_segments={}", preamble->num_segments));
-  }
-  if (preamble->num_segments > 1 &&
-      preamble->segments[preamble->num_segments - 1].length == 0) {
-    throw FrameError("last segment empty");
-  }
-
-  m_descs.resize(preamble->num_segments);
-  for (size_t i = 0; i < m_descs.size(); i++) {
-    m_descs[i].logical_len = preamble->segments[i].length;
-    m_descs[i].align = preamble->segments[i].alignment;
-  }
-
-  m_flags = preamble->flags;
-  // If frame has been compressed, 
-  // we need to make sure the compression handler has been setup
-  ceph_assert_always(!is_compressed() || m_compression->rx);
-
-  return static_cast<Tag>(preamble->tag);
-}
-#endif
-
 Tag FrameAssembler::disassemble_preamble(rx_buffer_t& rx_preamble) {
   if (m_crypto->rx) {
     m_crypto->rx->reset_rx_handler();
@@ -353,13 +298,11 @@ Tag FrameAssembler::disassemble_preamble(rx_buffer_t& rx_preamble) {
 
   // I expect ceph_le32 will make the endian conversion for me. Passing
   // everything through ::Decode is unnecessary.
-  auto preamble = reinterpret_cast<const preamble_block_t*>(
-      rx_preamble->c_str());
+  auto preamble = reinterpret_cast<const preamble_block_t*>(rx_preamble->c_str());
   // check preamble crc before any further processing
-  uint32_t crc = ceph_crc32c(
-      0, reinterpret_cast<const unsigned char*>(preamble),
-      sizeof(*preamble) - sizeof(preamble->crc));
-  //ceph_assert(crc == preamble->crc);
+  uint32_t crc = ceph_crc32c(0, reinterpret_cast<const unsigned char*>(preamble),
+			     sizeof(*preamble) - sizeof(preamble->crc));
+
   if (crc != preamble->crc) [[unlikely]] {
     ceph_abort_msg("preamble->crc");
     throw FrameError(fmt::format(
@@ -426,25 +369,25 @@ bool FrameAssembler::disasm_all_secure_rev0(bufferlist segment_bls[],
   return !(epilogue->late_flags & FRAME_LATE_FLAG_ABORTED);
 }
 
-void FrameAssembler::disasm_first_crc_rev1(rx_buffer_t& rx_preamble, const unsigned char *header, unsigned *header_len /*IN-OUT*/) const
+void FrameAssembler::disasm_first_crc_rev1(rx_buffer_t& rx_preamble, const unsigned char *header, unsigned header_len) const
 {
   ceph_assert(rx_preamble->length() == sizeof(preamble_block_t));
   if (m_descs[0].logical_len > 0) {
-    ceph_assert(*header_len == m_descs[0].logical_len + FRAME_CRC_SIZE);
+    ceph_assert(header_len == m_descs[0].logical_len + FRAME_CRC_SIZE);
     //decode(expected_crc, it);
     uint32_t expected_crc = *(uint32_t*)(header + m_descs[0].logical_len);
     expected_crc = le32toh(expected_crc);
     //segment_bl.splice(m_descs[0].logical_len, FRAME_CRC_SIZE);
-    *header_len -= FRAME_CRC_SIZE;
+    header_len -= FRAME_CRC_SIZE;
     if (m_with_data_crc) {
-      uint32_t crc = ceph_crc32c( -1, header, *header_len);
+      uint32_t crc = ceph_crc32c( -1, header, header_len);
       if (crc != expected_crc)  [[unlikely]] {
 	throw FrameError(fmt::format(
         "bad segment crc calculated={} expected={}", crc, expected_crc));
       }
     }
   } else {
-    ceph_assert(*header_len == 0);
+    ceph_assert(header_len == 0);
   }
 }
 
