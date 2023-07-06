@@ -978,6 +978,7 @@ struct error_code;
     }
 
     uint64_t get_wasted_space() const;
+    unsigned get_num_buffers_force() const;
     unsigned get_num_buffers() const { return _num; }
     const ptr_node& front() const { return _buffers.front(); }
     const ptr_node& back() const { return _buffers.back(); }
@@ -1206,7 +1207,8 @@ struct error_code;
     };
     using iov_vec_t = std::vector<iovec_t>;
     iov_vec_t prepare_iovs() const;
-
+    bool can_reuse_cached_crc(uint32_t crc) const;
+    int get_cached_crc32c(uint32_t crc, unsigned buf_count, std::pair<uint32_t, uint32_t> &out) const;
     uint32_t crc32c(uint32_t crc) const;
     void invalidate_crc();
 

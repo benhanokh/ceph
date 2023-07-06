@@ -315,7 +315,7 @@ public:
 
   bool disassemble_segments(bufferlist& preamble_bl, 
                             bufferlist segments_bls[], 
-                            bufferlist& epilogue_bl) const;
+                            bufferlist& epilogue_bl, bool & calc_crc) const;
 
 private:
   struct segment_desc_t {
@@ -378,7 +378,7 @@ private:
   void disassemble_first_segment(bufferlist& preamble_bl,
                                  bufferlist& segment_bl) const;
   bool disassemble_remaining_segments(bufferlist segment_bls[],
-                                      bufferlist& epilogue_bl) const;
+                                      bufferlist& epilogue_bl, bool & calc_crc) const;
   void disassemble_decompress(bufferlist segment_bls[]) const;
 
   bool disasm_all_crc_rev0(bufferlist segment_bls[],
@@ -388,7 +388,7 @@ private:
   void disasm_first_crc_rev1(bufferlist& preamble_bl,
                              bufferlist& segment_bl) const;
   bool disasm_remaining_crc_rev1(bufferlist segment_bls[],
-                                 bufferlist& epilogue_bl) const;
+                                 bufferlist& epilogue_bl, bool & calc_crc) const;
   void disasm_first_secure_rev1(bufferlist& preamble_bl,
                                 bufferlist& segment_bl) const;
   bool disasm_remaining_secure_rev1(bufferlist segment_bls[],

@@ -386,7 +386,7 @@ void FrameAssembler::disasm_first_crc_rev1(bufferlist& preamble_bl,
 }
 
 bool FrameAssembler::disasm_remaining_crc_rev1(bufferlist segment_bls[],
-                                               bufferlist& epilogue_bl) const {
+                                               bufferlist& epilogue_bl, bool & calc_crc) const {
   ceph_assert(epilogue_bl.length() == sizeof(epilogue_crc_rev1_block_t));
   auto epilogue = reinterpret_cast<const epilogue_crc_rev1_block_t*>(
       epilogue_bl.c_str());
@@ -394,6 +394,7 @@ bool FrameAssembler::disasm_remaining_crc_rev1(bufferlist segment_bls[],
   for (size_t i = 1; i < m_descs.size(); i++) {
     ceph_assert(segment_bls[i].length() == m_descs[i].logical_len);
     if (m_with_data_crc) {
+      calc_crc = true;
       check_segment_crc(segment_bls[i], epilogue->crc_values[i - 1]);
     }
   }
@@ -444,9 +445,9 @@ bool FrameAssembler::disasm_remaining_secure_rev1(
 }
 
 bool FrameAssembler::disassemble_segments(bufferlist& preamble_bl, 
-  bufferlist segments_bls[], bufferlist& epilogue_bl) const {
+  bufferlist segments_bls[], bufferlist& epilogue_bl, bool & calc_crc) const {
   disassemble_first_segment(preamble_bl, segments_bls[0]);
-  if (disassemble_remaining_segments(segments_bls, epilogue_bl)) {
+  if (disassemble_remaining_segments(segments_bls, epilogue_bl, calc_crc)) {
     if (is_compressed()) {
       disassemble_decompress(segments_bls);
     }
@@ -471,7 +472,7 @@ void FrameAssembler::disassemble_first_segment(bufferlist& preamble_bl,
 }
 
 bool FrameAssembler::disassemble_remaining_segments(
-    bufferlist segment_bls[], bufferlist& epilogue_bl) const {
+    bufferlist segment_bls[], bufferlist& epilogue_bl, bool & calc_crc) const {
   ceph_assert(!m_descs.empty());
   if (m_is_rev1) {
     if (m_descs.size() == 1) {
@@ -481,7 +482,7 @@ bool FrameAssembler::disassemble_remaining_segments(
     } else if (m_crypto->rx) {
       return disasm_remaining_secure_rev1(segment_bls, epilogue_bl);
     } else {
-      return disasm_remaining_crc_rev1(segment_bls, epilogue_bl);
+      return disasm_remaining_crc_rev1(segment_bls, epilogue_bl, calc_crc);
     }
   } else if (m_crypto->rx) {
     return disasm_all_secure_rev0(segment_bls, epilogue_bl);

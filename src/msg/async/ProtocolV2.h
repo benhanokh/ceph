@@ -138,7 +138,7 @@ private:
                         ceph::bufferlist &buffer);
 
   template <class F>
-  bool append_frame(F& frame);
+  bool append_frame(F& frame, bool trace_msg = false);
 
   void requeue_sent();
   uint64_t discard_requeued_up_to(uint64_t out_seq, uint64_t seq);

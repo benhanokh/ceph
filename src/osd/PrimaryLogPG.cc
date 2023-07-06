@@ -1811,6 +1811,17 @@ void PrimaryLogPG::do_request(
     op->pg_trace.event("do request");
   }
 
+#if 0
+  {
+    const Message *m = op->get_req();
+    if (m->get_data().length() >= 4*1024 ) {
+      unsigned num_buffers = m->get_data().get_num_buffers();
+      bool     cached_crc  = m->get_data().can_reuse_cached_crc(-1);
+      ldout(cct, 0) << __func__ << "::GBH::"<< m->get_type_name() << ", num_buffers=" << num_buffers << " seq=" << m->get_seq()
+		    << " length=" << m->get_data().length() << ", cached_crc=" << cached_crc << dendl;
+    }
+  }
+#endif
 
 // make sure we have a new enough map
   auto p = waiting_for_map.find(op->get_source());
@@ -1986,6 +1997,18 @@ void PrimaryLogPG::do_request(
  */
 void PrimaryLogPG::do_op(OpRequestRef& op)
 {
+#if 0
+  {
+    const Message *m = op->get_req();
+    if ( m->get_data().length() >= 4*1024 ) {
+      unsigned num_buffers = m->get_data().get_num_buffers();
+      bool     cached_crc  = m->get_data().can_reuse_cached_crc(-1);
+      ldout(cct, 0) << __func__ << "::GBH::"<< m->get_type_name() << ", num_buffers=" << num_buffers << " seq=" << m->get_seq()
+		    << " length=" << m->get_data().length() << ", cached_crc=" << cached_crc << dendl;
+    }
+  }
+#endif
+
   FUNCTRACE(cct);
   // NOTE: take a non-const pointer here; we must be careful not to
   // change anything that will break other reads on m (operator<<).
@@ -4147,6 +4170,18 @@ void PrimaryLogPG::execute_ctx(OpContext *ctx)
   ctx->reset_obs(ctx->obc);
   ctx->update_log_only = false; // reset in case finish_copyfrom() is re-running execute_ctx
   OpRequestRef op = ctx->op;
+#if 0
+  {
+    const Message *m = op->get_req();
+    if (m->get_data().length() >= 4*1024 ) {
+      unsigned num_buffers = m->get_data().get_num_buffers();
+      bool     cached_crc  = m->get_data().can_reuse_cached_crc(-1);
+      ldout(cct, 0) << __func__ << "::GBH::"<< m->get_type_name() << ", num_buffers=" << num_buffers << " seq=" << m->get_seq()
+		    << " length=" << m->get_data().length() << ", cached_crc=" << cached_crc << dendl;
+    }
+  }
+#endif
+
   auto m = op->get_req<MOSDOp>();
   ObjectContextRef obc = ctx->obc;
   const hobject_t& soid = obc->obs.oi.soid;
@@ -11399,6 +11434,18 @@ void PrimaryLogPG::issue_repop(RepGather *repop, OpContext *ctx)
           << " o " << soid
           << dendl;
 
+#if 0
+  {
+    OpRequestRef op = ctx->op;
+    const Message *m = op->get_req();
+    if (m->get_data().length() >= 4*1024 ) {
+      unsigned num_buffers = m->get_data().get_num_buffers();
+      bool     cached_crc  = m->get_data().can_reuse_cached_crc(-1);
+      ldout(cct, 0) << __func__ << "::GBH::"<< m->get_type_name() << ", num_buffers=" << num_buffers << " seq=" << m->get_seq()
+		    << " length=" << m->get_data().length() << ", cached_crc=" << cached_crc << dendl;
+    }
+  }
+#endif
 
   repop->v = ctx->at_version;
 

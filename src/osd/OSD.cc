@@ -1094,6 +1094,14 @@ float OSDService::compute_adjusted_ratio(osd_stat_t new_stat, float *pratio,
 
 void OSDService::send_message_osd_cluster(int peer, Message *m, epoch_t from_epoch)
 {
+#if 1
+  if (m->get_type() == MSG_OSD_REPOP && m->get_data().length() >= 4*1024 ) {
+    unsigned num_buffers = m->get_data().get_num_buffers();
+    bool     cached_crc  = m->get_data().can_reuse_cached_crc(-1);
+    ldout(cct, 0) << __func__ << "::GBH::"<< m->get_type_name() << ", num_buffers=" << num_buffers << " seq=" << m->get_seq()
+		  << " length=" << m->get_data().length() << ", cached_crc=" << cached_crc << dendl;
+  }
+#endif
   dout(20) << __func__ << " " << m->get_type_name() << " to osd." << peer
 	   << " from_epoch " << from_epoch << dendl;
   OSDMapRef next_map = get_nextmap_reserved();
@@ -7427,7 +7435,14 @@ void OSD::ms_fast_dispatch(Message *m)
   ceph_assert(op->min_epoch <= op->sent_epoch); // sanity check!
 
   service.maybe_inject_dispatch_delay();
-
+#if 1
+  if (m->get_type() == CEPH_MSG_OSD_OP && m->get_data().length() >= 4*1024 ) {
+    unsigned num_buffers = m->get_data().get_num_buffers();
+    bool     cached_crc  = m->get_data().can_reuse_cached_crc(-1);
+    ldout(cct, 0) << __func__ << "::GBH::"<< m->get_type_name() << ", num_buffers=" << num_buffers
+		  << " length=" << m->get_data().length() << ", cached_crc=" << cached_crc << dendl;
+  }
+#endif
   if (m->get_connection()->has_features(CEPH_FEATUREMASK_RESEND_ON_SPLIT) ||
       m->get_type() != CEPH_MSG_OSD_OP) {
     // queue it directly
@@ -9617,6 +9632,14 @@ void OSD::dequeue_op(
   ThreadPool::TPHandle &handle)
 {
   const Message *m = op->get_req();
+#if 1
+  if (m->get_data().length() >= 4*1024 ) {
+    unsigned num_buffers = m->get_data().get_num_buffers();
+    bool     cached_crc  = m->get_data().can_reuse_cached_crc(-1);
+    ldout(cct, 0) << __func__ << "::GBH::"<< m->get_type_name() << ", num_buffers=" << num_buffers << " seq=" << m->get_seq()
+		  << " length=" << m->get_data().length() << ", cached_crc=" << cached_crc << dendl;
+  }
+#endif
 
   FUNCTRACE(cct);
   OID_EVENT_TRACE_WITH_MSG(m, "DEQUEUE_OP_BEGIN", false);

@@ -2004,6 +2004,63 @@ buffer::list::iov_vec_t buffer::list::prepare_iovs() const
   return iovs;
 }
 
+unsigned buffer::list::get_num_buffers_force() const {
+  unsigned count = 0;
+  for (const auto& node : _buffers) {
+    if (node.length()) {
+      count++;
+      ceph_assert(count < 1000);
+    }
+  }
+  return count;
+}
+
+int buffer::list::get_cached_crc32c(uint32_t crc, unsigned buf_count, pair<uint32_t, uint32_t> &out) const {
+  unsigned count = get_num_buffers();
+  if (count != buf_count) {
+    return -4;
+  }
+
+  for (const auto& node : _buffers) {
+    if (node.length()) {
+      raw* const r = node._raw;
+      pair<size_t, size_t> ofs(node.offset(), node.offset() + node.length());
+      if (r->get_crc(ofs, &out)) {
+	if (out.first == crc) {
+	  // out cached crc is valid
+	  return 0;
+	}
+	else {
+	  return -1;
+	}
+      }
+      else {
+	// no cached crc was found
+	return -2;
+      }
+    }
+  }
+
+  // no buffer exists
+  return -4;
+}
+
+
+bool buffer::list::can_reuse_cached_crc(uint32_t crc) const {
+  for (const auto& node : _buffers) {
+    if (node.length()) {
+      raw* const r = node._raw;
+      pair<size_t, size_t> ofs(node.offset(), node.offset() + node.length());
+      pair<uint32_t, uint32_t> ccrc;
+      if (node.length() >= 4*1024 && r->get_crc(ofs, &ccrc) == true) {
+	return true;
+      }
+    }
+  }
+
+  return true;
+}
+
 __u32 buffer::list::crc32c(__u32 crc) const
 {
   int cache_misses = 0;

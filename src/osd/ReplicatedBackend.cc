@@ -476,6 +476,18 @@ void ReplicatedBackend::submit_transaction(
   osd_reqid_t reqid,
   OpRequestRef orig_op)
 {
+#if 0
+  {
+    const Message *m = orig_op->get_req();
+    if (m->get_data().length() >= 4*1024 ) {
+      unsigned num_buffers = m->get_data().get_num_buffers();
+      bool     cached_crc  = m->get_data().can_reuse_cached_crc(-1);
+      ldout(cct, 0) << __func__ << "::GBH::"<< m->get_type_name() << ", num_buffers=" << num_buffers << " seq=" << m->get_seq()
+		    << " length=" << m->get_data().length() << ", cached_crc=" << cached_crc << dendl;
+    }
+  }
+#endif
+
   parent->apply_stats(
     soid,
     delta_stats);
@@ -510,6 +522,18 @@ void ReplicatedBackend::submit_transaction(
   op.waiting_for_commit.insert(
     parent->get_acting_recovery_backfill_shards().begin(),
     parent->get_acting_recovery_backfill_shards().end());
+
+#if 0
+  {
+    const Message *m = op.get_req();
+    if (m->get_data().length() >= 4*1024 ) {
+      unsigned num_buffers = m->get_data().get_num_buffers();
+      bool     cached_crc  = m->get_data().can_reuse_cached_crc(-1);
+      ldout(cct, 0) << __func__ << "::GBH::"<< m->get_type_name() << ", num_buffers=" << num_buffers << " seq=" << m->get_seq()
+		    << " length=" << m->get_data().length() << ", cached_crc=" << cached_crc << dendl;
+    }
+  }
+#endif
 
   issue_op(
     soid,
@@ -981,6 +1005,18 @@ Message * ReplicatedBackend::generate_subop(
     wr->get_header().data_off = op_t.get_data_alignment();
   }
 
+#if 0
+  {
+    const Message *m = wr;
+    if (m->get_data().length() >= 4*1024 ) {
+      unsigned num_buffers = m->get_data().get_num_buffers();
+      bool     cached_crc  = m->get_data().can_reuse_cached_crc(-1);
+      ldout(cct, 0) << __func__ << "::GBH::"<< m->get_type_name() << ", num_buffers=" << num_buffers << " seq=" << m->get_seq()
+		    << " length=" << m->get_data().length() << ", cached_crc=" << cached_crc << dendl;
+    }
+  }
+#endif
+
   wr->logbl = log_entries;
 
   if (pinfo.is_incomplete())
@@ -1051,6 +1087,13 @@ void ReplicatedBackend::issue_op(
 	  op_t,
 	  shard,
 	  pinfo);
+      if (0 && wr->get_data().length() >= 4*1024 ) {
+	unsigned num_buffers = wr->get_data().get_num_buffers();
+	bool     cached_crc  = wr->get_data().can_reuse_cached_crc(-1);
+	ldout(cct, 0) << __func__ << "::GBH::"<< wr->get_type_name() << ", num_buffers=" << num_buffers
+		      << " length=" << wr->get_data().length() << ", cached_crc=" << cached_crc << dendl;
+      }
+
       if (op->op && op->op->pg_trace)
 	wr->trace.init("replicated op", nullptr, &op->op->pg_trace);
       get_parent()->send_message_osd_cluster(

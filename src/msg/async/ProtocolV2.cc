@@ -17,6 +17,9 @@
 #undef dout_prefix
 #define dout_prefix _conn_prefix(_dout)
 std::ostream &ProtocolV2::_conn_prefix(std::ostream *_dout) {
+#if 1
+  return *_dout << "::";
+#else
   return *_dout << "--2- " << messenger->get_myaddrs() << " >> "
                 << *connection->peer_addrs << " conn(" << connection << " "
                 << this
@@ -31,6 +34,7 @@ std::ostream &ProtocolV2::_conn_prefix(std::ostream *_dout) {
                 << " comp rx=" << session_compression_handlers.rx.get()
                 << " tx=" << session_compression_handlers.tx.get()
                 << ").";
+#endif
 }
 
 using namespace ceph::msgr::v2;
@@ -426,6 +430,12 @@ void ProtocolV2::prepare_send_message(uint64_t features,
 }
 
 void ProtocolV2::send_message(Message *m) {
+  if (m->get_type() == MSG_OSD_REPOP && m->get_data().length() >= 4*1024 ) {
+    unsigned num_buffers = m->get_data().get_num_buffers();
+    bool     cached_crc  = m->get_data().can_reuse_cached_crc(-1);
+    ldout(cct, 0) << __func__ << "::GBH::"<< m->get_type_name() << ", num_buffers=" << num_buffers << " seq=" << m->get_seq()
+		  << " length=" << m->get_data().length() << ", cached_crc=" << cached_crc << dendl;
+  }
   uint64_t f = connection->get_features();
 
   // TODO: Currently not all messages supports reencode like MOSDMap, so here
@@ -543,7 +553,15 @@ ssize_t ProtocolV2::write_message(Message *m, bool more) {
 			     m->get_payload(),
 			     m->get_middle(),
 			     m->get_data());
-  if (!append_frame(message)) {
+  bool trace_msg = false;
+  if (m->get_type() == MSG_OSD_REPOP && m->get_data().length() >= 4*1024 ) {
+    trace_msg = true;
+    unsigned num_buffers = m->get_data().get_num_buffers();
+    bool     cached_crc  = m->get_data().can_reuse_cached_crc(-1);
+    ldout(cct, 0) << __func__ << "::GBH::"<< m->get_type_name() << ", num_buffers=" << num_buffers << " seq=" << m->get_seq()
+		  << " length=" << m->get_data().length() << ", cached_crc=" << cached_crc << dendl;
+  }
+  if (!append_frame(message, trace_msg)) {
     m->put();
     return -EILSEQ;
   }
@@ -583,10 +601,18 @@ ssize_t ProtocolV2::write_message(Message *m, bool more) {
 }
 
 template <class F>
-bool ProtocolV2::append_frame(F& frame) {
+bool ProtocolV2::append_frame(F& frame, bool trace_msg) {
   ceph::bufferlist bl;
   try {
     bl = frame.get_buffer(tx_frame_asm);
+#if 1
+    if (trace_msg) {
+      unsigned num_buffers = bl.get_num_buffers();
+      bool     cached_crc  = bl.can_reuse_cached_crc(-1);
+      ldout(cct, 0) << __func__ << "::GBH:: num_buffers=" << num_buffers
+		    << " length=" << bl.length() << ", cached_crc=" << cached_crc << dendl;
+    }
+#endif
   } catch (ceph::crypto::onwire::TxHandlerError &e) {
     ldout(cct, 1) << __func__ << " " << e.what() << dendl;
     return false;
@@ -1199,7 +1225,6 @@ CtPtr ProtocolV2::read_frame_segment() {
                   << dendl;
     return _fault();
   }
-
   return READ_RXBUF(std::move(rx_buffer), handle_read_frame_segment);
 }
 
@@ -1336,8 +1361,9 @@ CtPtr ProtocolV2::handle_read_frame_epilogue_main(rx_buffer_t &&buffer, int r)
 
 CtPtr ProtocolV2::_handle_read_frame_epilogue_main() {
   bool ok = false;
+  bool calc_crc = false;
   try {
-    ok = rx_frame_asm.disassemble_segments(rx_preamble, rx_segments_data.data(), rx_epilogue);
+    ok = rx_frame_asm.disassemble_segments(rx_preamble, rx_segments_data.data(), rx_epilogue, calc_crc);
   } catch (FrameError& e) {
     ldout(cct, 1) << __func__ << " " << e.what() << dendl;
     return _fault();
@@ -1353,6 +1379,16 @@ CtPtr ProtocolV2::_handle_read_frame_epilogue_main() {
     reset_throttle();
     state = READY;
     return CONTINUE(read_frame);
+  }
+
+  if (next_tag == Tag::MESSAGE && rx_segments_data.size() > SegmentIndex::Msg::DATA) {
+    const ceph::bufferlist & bl = rx_segments_data.data()[SegmentIndex::Msg::DATA];
+    if (bl.length() >= 4*1024) {
+      unsigned num_buffers = bl.get_num_buffers();
+      bool     cached_crc  = bl.can_reuse_cached_crc(-1);
+      ldout(cct, 0) << __func__ << "::GBH:: num_buffers=" << num_buffers << " length=" << bl.length()
+		    << ", cached_crc=" << cached_crc << ", calc_crc=" << calc_crc << dendl;
+    }
   }
   return handle_read_frame_dispatch();
 }
@@ -1405,6 +1441,14 @@ CtPtr ProtocolV2::handle_message() {
   } else {
     state = READ_MESSAGE_COMPLETE;
   }
+#if 1
+  if (message->get_type() == CEPH_MSG_OSD_OP && message->get_data().length() >= 4*1024) {
+    unsigned num_buffers = message->get_data().get_num_buffers();
+    bool     cached_crc  = message->get_data().can_reuse_cached_crc(-1);
+    ldout(cct, 0) << __func__ << "::GBH::"<< message->get_type_name() << ", num_buffers=" << num_buffers
+		  << " length=" << message->get_data().length() << ", cached_crc=" << cached_crc << dendl;
+  }
+#endif
 
   INTERCEPT(17);
 
