@@ -17,6 +17,9 @@
 #undef dout_prefix
 #define dout_prefix _conn_prefix(_dout)
 std::ostream &ProtocolV2::_conn_prefix(std::ostream *_dout) {
+#if 1
+  return *_dout << ").";
+#else
   return *_dout << "--2- " << messenger->get_myaddrs() << " >> "
                 << *connection->peer_addrs << " conn(" << connection << " "
                 << this
@@ -31,6 +34,7 @@ std::ostream &ProtocolV2::_conn_prefix(std::ostream *_dout) {
                 << " comp rx=" << session_compression_handlers.rx.get()
                 << " tx=" << session_compression_handlers.tx.get()
                 << ").";
+#endif
 }
 
 using namespace ceph::msgr::v2;
@@ -1334,10 +1338,26 @@ CtPtr ProtocolV2::handle_read_frame_epilogue_main(rx_buffer_t &&buffer, int r)
   return _handle_read_frame_epilogue_main();
 }
 
+#if 1
 CtPtr ProtocolV2::_handle_read_frame_epilogue_main() {
   bool ok = false;
   try {
-    ok = rx_frame_asm.disassemble_segments(rx_preamble, rx_segments_data.data(), rx_epilogue);
+    utime_t  *p_crc_time = nullptr, *p_crypto_time = nullptr;
+    utime_t   crc_time, crypto_time;
+    unsigned  data_len = 0;
+    if (rx_segments_data.size() > SegmentIndex::Msg::DATA) {
+      data_len = rx_segments_data.data()[SegmentIndex::Msg::DATA].length();
+      if (data_len >= 4*1024) {
+	p_crc_time    = &crc_time;
+	p_crypto_time = &crypto_time;
+      }
+    }
+    utime_t start_time = ceph_clock_now();
+    ok = rx_frame_asm.disassemble_segments(rx_preamble, rx_segments_data.data(), rx_epilogue, p_crc_time, p_crypto_time);
+    utime_t duration = ceph_clock_now() - start_time;
+    if (p_crc_time || p_crypto_time) {
+      ldout(cct, 0) <<"disassemble_segments (" << data_len << ") duration total: (crc/crypto)" << crc_time   << " / " << crypto_time << " / " << duration <<  " seconds" << dendl;
+    }
   } catch (FrameError& e) {
     ldout(cct, 1) << __func__ << " " << e.what() << dendl;
     return _fault();
@@ -1356,6 +1376,30 @@ CtPtr ProtocolV2::_handle_read_frame_epilogue_main() {
   }
   return handle_read_frame_dispatch();
 }
+#else
+CtPtr ProtocolV2::_handle_read_frame_epilogue_main() {
+  bool ok = false;
+  try {
+    ok = rx_frame_asm.disassemble_segments(rx_preamble, rx_segments_data.data(), rx_epilogue, nullptr, nullptr);
+  } catch (FrameError& e) {
+    ldout(cct, 1) << __func__ << " " << e.what() << dendl;
+    return _fault();
+  } catch (ceph::crypto::onwire::MsgAuthError&) {
+    ldout(cct, 1) << __func__ << "bad auth tag" << dendl;
+    return _fault();
+  }
+
+  // we do have a mechanism that allows transmitter to start sending message
+  // and abort after putting entire data field on wire. This will be used by
+  // the kernel client to avoid unnecessary buffering.
+  if (!ok) {
+    reset_throttle();
+    state = READY;
+    return CONTINUE(read_frame);
+  }
+  return handle_read_frame_dispatch();
+}
+#endif
 
 CtPtr ProtocolV2::handle_message() {
   ldout(cct, 20) << __func__ << dendl;

@@ -315,7 +315,7 @@ public:
 
   bool disassemble_segments(bufferlist& preamble_bl, 
                             bufferlist segments_bls[], 
-                            bufferlist& epilogue_bl) const;
+                            bufferlist& epilogue_bl, utime_t *crc_time, utime_t *crypto_time) const;
 
 private:
   struct segment_desc_t {
@@ -378,7 +378,7 @@ private:
   void disassemble_first_segment(bufferlist& preamble_bl,
                                  bufferlist& segment_bl) const;
   bool disassemble_remaining_segments(bufferlist segment_bls[],
-                                      bufferlist& epilogue_bl) const;
+                                      bufferlist& epilogue_bl, utime_t *crc_time, utime_t *crypto_time) const;
   void disassemble_decompress(bufferlist segment_bls[]) const;
 
   bool disasm_all_crc_rev0(bufferlist segment_bls[],
@@ -388,11 +388,11 @@ private:
   void disasm_first_crc_rev1(bufferlist& preamble_bl,
                              bufferlist& segment_bl) const;
   bool disasm_remaining_crc_rev1(bufferlist segment_bls[],
-                                 bufferlist& epilogue_bl) const;
+                                 bufferlist& epilogue_bl, utime_t *crc_time) const;
   void disasm_first_secure_rev1(bufferlist& preamble_bl,
                                 bufferlist& segment_bl) const;
   bool disasm_remaining_secure_rev1(bufferlist segment_bls[],
-                                    bufferlist& epilogue_bl) const;
+                                    bufferlist& epilogue_bl, utime_t *crypto_time) const;
 
   void fill_preamble(Tag tag, preamble_block_t& preamble) const;
   friend std::ostream& operator<<(std::ostream& os,
