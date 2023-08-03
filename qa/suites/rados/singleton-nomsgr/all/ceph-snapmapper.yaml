@@ -22,5 +22,3 @@ tasks:
     - ceph_test_snap_mapper
 
 
-#run teuthology with --filter ceph-snapmapper
-
