@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab ft=cpp
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
 #include <boost/algorithm/string/case_conv.hpp>
 #include <cstdint>
@@ -42,7 +42,7 @@
 #include "rgw_auth_s3.h"
 #include "rgw_acl.h"
 #include "rgw_policy_s3.h"
-#include "rgw_user.h"
+#include "driver/rados/rgw_user.h"
 #include "rgw_cors.h"
 #include "rgw_cors_s3.h"
 #include "rgw_tag_s3.h"
@@ -72,7 +72,9 @@
 #include "rgw_rest_iam.h"
 #include "rgw_rest_bucket_logging.h"
 #include "rgw_sts.h"
+#ifdef WITH_RADOSGW_RADOS
 #include "rgw_sal_rados.h"
+#endif
 #include "rgw_cksum_pipe.h"
 #include "rgw_s3select.h"
 
@@ -369,6 +371,25 @@ inline bool str_has_cntrl(const char* s) {
   return str_has_cntrl(_s);
 }
 
+// remove any aws-chunked entries from the comma-separated list
+static std::string content_encoding_without_aws_chunked(std::string_view value)
+{
+  std::string result;
+  result.reserve(value.size());
+
+  for (std::string_view part : ceph::split(value, ", ")) {
+    if (part == "aws-chunked") {
+      continue;
+    }
+    if (!result.empty()) {
+      result += ", ";
+    }
+    result += part;
+  }
+
+  return result;
+}
+
 int RGWGetObj_ObjStore_S3::send_response_data(bufferlist& bl, off_t bl_ofs,
 					      off_t bl_len)
 {
@@ -534,18 +555,29 @@ int RGWGetObj_ObjStore_S3::send_response_data(bufferlist& bl, off_t bl_ofs,
 	try {
 	  rgw::cksum::Cksum cksum;
 	  decode(cksum, i->second);
-	  auto cksum_type =
-	    rgw::cksum::get_checksum_type(cksum,
-	      (multipart_parts_count && multipart_parts_count > 0) /* is_multipart */);
+	  rgw::cksum::ChecksumTypeResult cksum_type;
+	  if (multipart_part_num) {
+	    cksum_type = rgw::cksum::get_part_checksum_type(cksum);
+	  } else {
+	    cksum_type = rgw::cksum::get_checksum_type(cksum,
+		(multipart_parts_count && multipart_parts_count > 0) /* is_multipart */);
+	  }
 	  if (std::get<0>(cksum_type) == rgw::cksum::Cksum::FLAG_COMPOSITE) {
 	    /* cksum was computed with a digest algorithm, or predates the 2025
 	       update that introduced CRC combining */
-	    ldpp_dout_fmt(this, 16,
-			  "INFO: {} ChecksumMode==ENABLED element-name {} value {}-{}",
-			  __func__, cksum.element_name(), cksum.to_armor(),
-			  *multipart_parts_count);
-	    dump_header(s, cksum.header_name(),
-			fmt::format("{}-{}", cksum.to_armor(), *multipart_parts_count));
+	    if (multipart_part_num) {
+	      ldpp_dout_fmt(this, 16,
+		  "INFO: {} ChecksumMode==ENABLED element-name {} value {}",
+		  __func__, cksum.element_name(), cksum.to_armor());
+	      dump_header(s, cksum.header_name(), cksum.to_armor());
+	    } else {
+	      ldpp_dout_fmt(this, 16,
+		  "INFO: {} ChecksumMode==ENABLED element-name {} value {}-{}",
+		  __func__, cksum.element_name(), cksum.to_armor(),
+		  *multipart_parts_count);
+	      dump_header(s, cksum.header_name(),
+		  fmt::format("{}-{}", cksum.to_armor(), *multipart_parts_count));
+	    }
 	  } else {
 	    /* a full object checksum, if multipart, because the checksum is CRC family */
 	    auto elt_name = cksum.element_name();
@@ -652,7 +684,20 @@ int RGWGetObj_ObjStore_S3::send_response_data(bufferlist& bl, off_t bl_ofs,
             --len;
             s.resize(len);
           }
-          response_attrs[aiter->second] = s;
+
+          if (aiter->first == RGW_ATTR_CONTENT_ENC) {
+            // Amazon S3 stores the resulting object without the aws-chunked
+            // value in the content-encoding header. If aws-chunked is the only
+            // value that you pass in the content-encoding header, S3 considers
+            // the content-encoding header empty and does not return this header
+            // when your retrieve the object.
+            std::string encoding = content_encoding_without_aws_chunked(s);
+            if (!encoding.empty()) {
+              response_attrs[aiter->second] = std::move(encoding);
+            }
+          } else {
+            response_attrs[aiter->second] = std::move(s);
+          }
         }
       } else if (iter->first.compare(RGW_ATTR_CONTENT_TYPE) == 0) {
         /* Special handling for content_type. */
@@ -749,44 +794,10 @@ int RGWGetObj_ObjStore_S3::get_decrypt_filter(std::unique_ptr<RGWGetObj_Filter> 
     return 0;
   }
 
-  std::unique_ptr<BlockCrypt> block_crypt;
-  int res = rgw_s3_prepare_decrypt(s, s->yield, attrs, &block_crypt,
-                                   crypt_http_responses);
-  if (res < 0) {
-    return res;
-  }
-  if (block_crypt == nullptr) {
-    return 0;
-  }
-
-  // in case of a multipart upload, we need to know the part lengths to
-  // correctly decrypt across part boundaries
-  std::vector<size_t> parts_len;
-
-  // for replicated objects, the original part lengths are preserved in an xattr
-  if (auto i = attrs.find(RGW_ATTR_CRYPT_PARTS); i != attrs.end()) {
-    try {
-      auto p = i->second.cbegin();
-      using ceph::decode;
-      decode(parts_len, p);
-    } catch (const buffer::error&) {
-      ldpp_dout(this, 1) << "failed to decode RGW_ATTR_CRYPT_PARTS" << dendl;
-      return -EIO;
-    }
-  } else if (manifest_bl) {
-    // otherwise, we read the part lengths from the manifest
-    res = RGWGetObj_BlockDecrypt::read_manifest_parts(this, *manifest_bl,
-                                                      parts_len);
-    if (res < 0) {
-      return res;
-    }
-  }
-
-  *filter = std::make_unique<RGWGetObj_BlockDecrypt>(
-      s, s->cct, cb, std::move(block_crypt),
-      std::move(parts_len), s->yield);
-  return 0;
+  static constexpr bool copy_source = false;
+  return ::get_decrypt_filter(filter, cb, s, attrs, manifest_bl, &crypt_http_responses, copy_source);
 }
+
 int RGWGetObj_ObjStore_S3::verify_requester(const rgw::auth::StrategyRegistry& auth_registry, optional_yield y) 
 {
   int ret = -EINVAL;
@@ -1611,6 +1622,37 @@ void RGWDeleteBucketReplication_ObjStore_S3::send_response()
   dump_start(s);
 }
 
+int RGWListBuckets_ObjStore_S3::get_params(optional_yield y)
+{
+  auto continuation_token = s->info.args.get_optional("continuation-token");
+  if (continuation_token) {
+    marker = *continuation_token;
+  }
+
+  auto max_buckets = s->info.args.get_optional("max-buckets");
+  if (max_buckets) {
+    std::optional value = ceph::parse<int64_t>(*max_buckets);
+    if (!value) {
+      s->err.message = "max-buckets must be an integer";
+      return -EINVAL;
+    }
+    if (*value < 1 || *value > 10000) {
+      s->err.message = "max-buckets must be between 1 and 10000 inclusive";
+      return -EINVAL;
+    }
+    limit = *value;
+  }
+  // TODO: support "prefix" and "bucket-region" params?
+
+  // a request is only considered to be "paginated" if it specifies
+  // either "max-buckets" or "continuation-token"
+  if (!continuation_token && !max_buckets) {
+    limit = -1; /* no limit */
+  }
+
+  return 0;
+}
+
 void RGWListBuckets_ObjStore_S3::send_response_begin(bool has_buckets)
 {
   if (op_ret)
@@ -1643,7 +1685,10 @@ void RGWListBuckets_ObjStore_S3::send_response_data(std::span<const RGWBucketEnt
 void RGWListBuckets_ObjStore_S3::send_response_end()
 {
   if (sent_data) {
-    s->formatter->close_section();
+    s->formatter->close_section(); // Buckets
+    if (!marker.empty()) {
+      s->formatter->dump_string("ContinuationToken", marker);
+    }
     list_all_buckets_end(s);
     rgw_flush_formatter_and_reset(s, s->formatter);
   }
@@ -2526,7 +2571,8 @@ static int create_s3_policy(req_state *s, rgw::sal::Driver* driver,
   }
 
   return rgw::s3::create_canned_acl(owner, s->bucket_owner,
-                                    s->canned_acl, policy);
+                                    s->bucket_object_ownership,
+                                    s->canned_acl, policy, s->err.message);
 }
 
 class RGWLocationConstraint : public XMLObj
@@ -2690,6 +2736,15 @@ int RGWCreateBucket_ObjStore_S3::get_params(optional_yield y)
       return -EINVAL;
     }
     createparams.obj_lock_enabled = boost::algorithm::iequals(iter->second, "true");
+  }
+
+  if (auto i = s->info.x_meta_map.find("x-amz-object-ownership");
+      i != s->info.x_meta_map.end()) {
+    rgw::s3::ObjectOwnership tmp;
+    if (!rgw::s3::parse(i->second, tmp, s->err.message)) {
+      return -EINVAL;
+    }
+    object_ownership = std::move(tmp);
   }
   return 0;
 }
@@ -2902,6 +2957,9 @@ void RGWPutObj_ObjStore_S3::send_response()
 
     string expires = get_s3_expiration_header(s, mtime);
 
+    for (auto &it : crypt_http_responses)
+      dump_header(s, it.first, it.second);
+
     if (copy_source.empty()) {
       dump_errno(s);
       dump_etag(s, etag);
@@ -2912,8 +2970,6 @@ void RGWPutObj_ObjStore_S3::send_response()
 	dump_header(s, "x-amz-checksum-type", "FULL_OBJECT");
 	dump_header(s, cksum->header_name(), cksum->to_armor());
       }
-      for (auto &it : crypt_http_responses)
-        dump_header(s, it.first, it.second);
     } else {
       dump_errno(s);
       dump_header_if_nonempty(s, "x-amz-version-id", version_id);
@@ -2971,45 +3027,8 @@ int RGWPutObj_ObjStore_S3::get_decrypt_filter(
     map<string, bufferlist>& attrs,
     bufferlist* manifest_bl)
 {
-  std::map<std::string, std::string> crypt_http_responses_unused;
-
-  std::unique_ptr<BlockCrypt> block_crypt;
-  int res = rgw_s3_prepare_decrypt(s, s->yield, attrs, &block_crypt,
-                                   crypt_http_responses_unused);
-  if (res < 0) {
-    return res;
-  }
-  if (block_crypt == nullptr) {
-    return 0;
-  }
-
-  // in case of a multipart upload, we need to know the part lengths to
-  // correctly decrypt across part boundaries
-  std::vector<size_t> parts_len;
-
-  // for replicated objects, the original part lengths are preserved in an xattr
-  if (auto i = attrs.find(RGW_ATTR_CRYPT_PARTS); i != attrs.end()) {
-    try {
-      auto p = i->second.cbegin();
-      using ceph::decode;
-      decode(parts_len, p);
-    } catch (const buffer::error&) {
-      ldpp_dout(this, 1) << "failed to decode RGW_ATTR_CRYPT_PARTS" << dendl;
-      return -EIO;
-    }
-  } else if (manifest_bl) {
-    // otherwise, we read the part lengths from the manifest
-    res = RGWGetObj_BlockDecrypt::read_manifest_parts(this, *manifest_bl,
-                                                      parts_len);
-    if (res < 0) {
-      return res;
-    }
-  }
-
-  *filter = std::make_unique<RGWGetObj_BlockDecrypt>(
-      s, s->cct, cb, std::move(block_crypt),
-      std::move(parts_len), s->yield);
-  return 0;
+  static constexpr bool copy_source = true;
+  return ::get_decrypt_filter(filter, cb, s, attrs, manifest_bl, nullptr, copy_source);
 }
 
 int RGWPutObj_ObjStore_S3::get_encrypt_filter(
@@ -3028,8 +3047,9 @@ int RGWPutObj_ObjStore_S3::get_encrypt_filter(
       std::unique_ptr<BlockCrypt> block_crypt;
       /* We are adding to existing object.
        * We use crypto mode that configured as if we were decrypting. */
+      static constexpr bool copy_source = false;
       res = rgw_s3_prepare_decrypt(s, s->yield, obj->get_attrs(),
-                                   &block_crypt, crypt_http_responses);
+                                   &block_crypt, &crypt_http_responses, copy_source);
       if (res == 0 && block_crypt != nullptr)
         filter->reset(new RGWPutObj_BlockEncrypt(s, s->cct, cb, std::move(block_crypt), s->yield));
     }
@@ -3414,7 +3434,8 @@ int RGWPostObj_ObjStore_S3::get_policy(optional_yield y)
 
   ldpp_dout(this, 20) << "canned_acl=" << canned_acl << dendl;
   int r = rgw::s3::create_canned_acl(s->owner, s->bucket_owner,
-                                     canned_acl, policy);
+                                     s->bucket_object_ownership,
+                                     canned_acl, policy, s->err.message);
   if (r < 0) {
     err_msg = "Bad canned ACLs";
     return r;
@@ -3763,7 +3784,9 @@ int RGWDeleteObj_ObjStore_S3::get_params(optional_yield y)
     bypass_governance_mode = boost::algorithm::iequals(bypass_gov_decoded, "true");
   }
 
-  return 0;
+  // we're not reading any request body, so this should just match
+  // the sha256 hash of an empty buffer
+  return do_aws4_auth_completion();
 }
 
 void RGWDeleteObj_ObjStore_S3::send_response()
@@ -3883,6 +3906,9 @@ void RGWCopyObj_ObjStore_S3::send_partial_response(off_t ofs)
     if (op_ret)
     set_req_state_err(s, op_ret);
     dump_errno(s);
+
+    for (auto &it : crypt_http_responses)
+      dump_header(s, it.first, it.second);
 
     // Explicitly use chunked transfer encoding so that we can stream the result
     // to the user without having to wait for the full length of it.
@@ -4022,10 +4048,9 @@ int RGWGetObjAttrs_ObjStore_S3::get_decrypt_filter(
   //
   // in the SSE-KMS and SSE-S3 cases, this unfortunately causes us to fetch
   // decryption keys which we don't need :(
-  std::unique_ptr<BlockCrypt> block_crypt; // ignored
-  std::map<std::string, std::string> crypt_http_responses; // ignored
-  return rgw_s3_prepare_decrypt(s, s->yield, attrs, &block_crypt,
-                                crypt_http_responses);
+  static constexpr bool copy_source = false;
+  return rgw_s3_prepare_decrypt(s, s->yield, attrs, nullptr,
+                                nullptr, copy_source);
 }
 
 void RGWGetObjAttrs_ObjStore_S3::send_response()
@@ -4397,6 +4422,73 @@ void RGWDeleteBucketEncryption_ObjStore_S3::send_response()
   end_header(s);
 }
 
+int RGWPutBucketOwnershipControls_ObjStore_S3::get_params(optional_yield y)
+{
+  const auto max_size = s->cct->_conf->rgw_max_put_param_size;
+  int ret = 0;
+  std::tie(ret, data) = read_all_input(s, max_size, false);
+  if (ret < 0) {
+    return ret;
+  }
+
+  RGWXMLParser parser;
+  if (!parser.init()) {
+    return -EINVAL;
+  }
+  if (!parser.parse(data.c_str(), data.length(), 1)) {
+    ldpp_dout(this, 5) << "ERROR: malformed XML" << dendl;
+    return -ERR_MALFORMED_XML;
+  }
+  XMLObj* o = parser.find_first("OwnershipControls");
+  if (!o) {
+    s->err.message = "Missing required element OwnershipControls";
+    return -ERR_MALFORMED_XML;
+  }
+  if (!ownership.decode_xml(o, s->err.message)) {
+    return -ERR_MALFORMED_XML;
+  }
+  return 0;
+}
+
+void RGWPutBucketOwnershipControls_ObjStore_S3::send_response()
+{
+  if (op_ret) {
+    set_req_state_err(s, op_ret);
+  }
+  dump_errno(s);
+  end_header(s);
+}
+
+void RGWGetBucketOwnershipControls_ObjStore_S3::send_response()
+{
+  if (op_ret) {
+    if (op_ret == -ENOENT)
+      set_req_state_err(s, -ERR_NO_SUCH_OWNERSHIP_CONTROLS);
+    else
+      set_req_state_err(s, op_ret);
+  }
+
+  dump_errno(s);
+  end_header(s, this, to_mime_type(s->format));
+  dump_start(s);
+
+  if (!op_ret) {
+    encode_xml("OwnershipControls", XMLNS_AWS_S3, ownership, s->formatter);
+    rgw_flush_formatter_and_reset(s, s->formatter);
+  }
+}
+
+void RGWDeleteBucketOwnershipControls_ObjStore_S3::send_response()
+{
+  if (op_ret == 0) {
+    op_ret = STATUS_NO_CONTENT;
+  }
+
+  set_req_state_err(s, op_ret);
+  dump_errno(s);
+  end_header(s);
+}
+
 void RGWGetRequestPayment_ObjStore_S3::send_response()
 {
   dump_errno(s);
@@ -4600,7 +4692,34 @@ int RGWCompleteMultipart_ObjStore_S3::get_params(optional_yield y)
     return ret;
   }
 
+  if_match = s->info.env->get("HTTP_IF_MATCH");
+  if_nomatch = s->info.env->get("HTTP_IF_NONE_MATCH");
+
   map_qs_metadata(s, true);
+
+  // get encrypt headers to reflect from multipart upload
+  // mostly to verify sse-c here
+  std::unique_ptr<rgw::sal::MultipartUpload> upload =
+    s->bucket->get_multipart_upload(s->object->get_name(),
+        upload_id);
+  std::unique_ptr<rgw::sal::Object> obj = upload->get_meta_obj();
+  obj->set_in_extra_data(true);
+  int res = obj->get_obj_attrs(s->yield, this);
+  if (res < 0 && res != -ENOENT) {
+    ldpp_dout(this, 0) << "ERROR: " << __func__ << " failed to get object attrs for "
+                      << s->object->get_name() << ": " << cpp_strerror(res) << dendl;
+    return res;
+  }
+
+  // if we found attrs, populate crypt_http_responses
+  if (res == 0) {
+    static constexpr bool copy_source = false;
+    res = rgw_s3_prepare_decrypt(s, s->yield, obj->get_attrs(),
+                                nullptr, &crypt_http_responses, copy_source);
+    if (res < 0) {
+      return res;
+    }
+  }
 
   return do_aws4_auth_completion();
 }
@@ -4611,6 +4730,8 @@ void RGWCompleteMultipart_ObjStore_S3::send_response()
     set_req_state_err(s, op_ret);
   dump_errno(s);
   dump_header_if_nonempty(s, "x-amz-version-id", version_id);
+  for (auto &it : crypt_http_responses)
+    dump_header(s, it.first, it.second);
   end_header(s, this, to_mime_type(s->format));
   if (op_ret == 0) {
     dump_start(s);
@@ -5224,6 +5345,8 @@ RGWOp *RGWHandler_REST_Bucket_S3::op_get()
     return new RGWGetBucketPublicAccessBlock_ObjStore_S3;
   } else if (is_bucket_encryption_op()) {
     return new RGWGetBucketEncryption_ObjStore_S3;
+  } else if (is_bucket_ownership_op()) {
+    return new RGWGetBucketOwnershipControls_ObjStore_S3;
   }
   return get_obj_op(true);
 }
@@ -5282,6 +5405,8 @@ RGWOp *RGWHandler_REST_Bucket_S3::op_put()
     return new RGWPutBucketPublicAccessBlock_ObjStore_S3;
   } else if (is_bucket_encryption_op()) {
     return new RGWPutBucketEncryption_ObjStore_S3;
+  } else if (is_bucket_ownership_op()) {
+    return new RGWPutBucketOwnershipControls_ObjStore_S3;
   }
   return new RGWCreateBucket_ObjStore_S3;
 }
@@ -5307,6 +5432,8 @@ RGWOp *RGWHandler_REST_Bucket_S3::op_delete()
     return new RGWDeleteBucketPublicAccessBlock;
   } else if (is_bucket_encryption_op()) {
     return new RGWDeleteBucketEncryption_ObjStore_S3;
+  } else if (is_bucket_ownership_op()) {
+    return new RGWDeleteBucketOwnershipControls_ObjStore_S3;
   }
 
   if (s->info.args.sub_resource_exists("website")) {
@@ -6213,7 +6340,11 @@ AWSSignerV4::prepare(const DoutPrefixProvider *dpp,
   if (opt_content) {
     content_hash = rgw::auth::s3::calc_v4_payload_hash(opt_content->to_str());
     extra_headers["x-amz-content-sha256"] = content_hash;
-
+  } else {
+    /* Some S3-compatible services require x-amz-content-sha256 header to always
+     * be present and included in the signature, even for unsigned payload.
+     * AWS S3 specification states that this header is required for all requests. */
+    extra_headers["x-amz-content-sha256"] = AWS4_UNSIGNED_PAYLOAD_HASH;
   }
 
   /* craft canonical headers */
@@ -6469,6 +6600,7 @@ AWSGeneralAbstractor::get_auth_data_v4(const req_state* const s,
         case RGW_OP_INIT_MULTIPART: // in case that Init Multipart uses CHUNK encoding
         case RGW_OP_COMPLETE_MULTIPART:
         case RGW_OP_SET_BUCKET_VERSIONING:
+        case RGW_OP_DELETE_OBJ:
         case RGW_OP_DELETE_MULTI_OBJ:
         case RGW_OP_ADMIN_SET_METADATA:
         case RGW_OP_SYNC_DATALOG_NOTIFY:
@@ -6499,6 +6631,7 @@ AWSGeneralAbstractor::get_auth_data_v4(const req_state* const s,
         case RGW_OP_PUT_BUCKET_LOGGING:
         case RGW_OP_POST_BUCKET_LOGGING:
         case RGW_OP_GET_BUCKET_LOGGING: 
+        case RGW_OP_PUT_BUCKET_OWNERSHIP_CONTROLS:
           break;
         default:
           ldpp_dout(s, 10) << "ERROR: AWS4 completion for operation: " << s->op_type << ", NOT IMPLEMENTED" << dendl;

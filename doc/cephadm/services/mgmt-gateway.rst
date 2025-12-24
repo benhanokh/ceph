@@ -7,7 +7,7 @@ Management Gateway
 Deploying mgmt-gateway
 ======================
 
-In Ceph releases beginning with Squid, the ``mgmt-gateway`` service introduces a new design for Ceph applications
+In Ceph releases beginning with Tentacle, the ``mgmt-gateway`` service introduces a new design for Ceph applications
 based on a modular, service-based architecture. This service, managed by cephadm and built on top of nginx
 (an open-source, high-performance web server), acts as the new front-end and single entry point to the
 Ceph cluster. The ``mgmt-gateway`` provides unified access to all Ceph applications, including the Ceph dashboard
@@ -74,7 +74,7 @@ run the ``mgmt-gateway`` in HA mode users can either use the cephadm command lin
 
 Or provide specification files as following:
 
-``mgmt-gateway`` Configuration:
+``mgmt-gateway`` configuration:
 
 .. code-block:: yaml
 
@@ -85,7 +85,7 @@ Or provide specification files as following:
       enable_auth: true
       virtual_ip: 192.168.100.220
 
-In addition, the user must configure an ingress service to provide virtual IP functionality for
+In addition, the admin must configure an ingress service to provide virtual IP functionality for
 the ``mgmt-gateway``. For example:
 
 .. code-block:: yaml
@@ -199,7 +199,7 @@ running daemon(s) you must redeploy the daemon(s) in order to have them actually
 
 For example:
 
-.. code-block:: bash
+.. prompt:: bash #
 
      ceph config set mgr mgr/cephadm/container_image_nginx <new-nginx-image>
-     ceph orch redeploy ``mgmt-gateway``
+     ceph orch redeploy mgmt-gateway

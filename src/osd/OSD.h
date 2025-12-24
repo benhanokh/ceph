@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -1054,7 +1055,6 @@ struct OSDShard {
 		    std::set<std::pair<spg_t,epoch_t>> *merge_pgs);
   void register_and_wake_split_child(PG *pg);
   void unprime_split_children(spg_t parent, unsigned old_pg_num);
-  void update_scheduler_config();
   op_queue_type_t get_op_queue_type() const;
 
   OSDShard(
@@ -1745,7 +1745,9 @@ protected:
       OpSchedulerItem&& qi);
 
     /// try to do some work
-    void _process(uint32_t thread_index, ceph::heartbeat_handle_d *hb) override;
+    void _process(uint32_t thread_index,
+                  uint32_t shard_index,
+                  ceph::heartbeat_handle_d *hb) override;
 
     void stop_for_fast_shutdown();
 
@@ -1789,8 +1791,7 @@ protected:
       }
     }
 
-    bool is_shard_empty(uint32_t thread_index) override {
-      uint32_t shard_index = thread_index % osd->num_shards;
+    bool is_shard_empty(uint32_t thread_index, uint32_t shard_index) override {
       auto &&sdata = osd->shards[shard_index];
       ceph_assert(sdata);
       std::lock_guard l(sdata->shard_lock);
@@ -2045,6 +2046,7 @@ protected:
   // which pgs were scanned for min_lec
   std::vector<pg_t> min_last_epoch_clean_pgs;
   void send_beacon(const ceph::coarse_mono_clock::time_point& now);
+  void maybe_send_beacon();
 
   ceph_tid_t get_tid() {
     return service.get_tid();
@@ -2188,7 +2190,7 @@ private:
   }
 
 private:
-  int mon_cmd_maybe_osd_create(std::string &cmd);
+  int mon_cmd_maybe_osd_create(std::string &&cmd);
   int update_crush_device_class();
   int update_crush_location();
 

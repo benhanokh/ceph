@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -2426,7 +2427,7 @@ OSD::OSD(CephContext *cct_,
 				  "osd_pg_epoch_max_lag_factor")),
   osd_compat(get_osd_compat_set()),
   osd_op_tp(cct, "OSD::osd_op_tp", "tp_osd_tp",
-	    get_num_op_threads()),
+	    get_num_op_threads(), get_num_op_shards()),
   heartbeat_stop(false),
   heartbeat_need_update(true),
   hb_front_client_messenger(hb_client_front),
@@ -2725,7 +2726,7 @@ OSD::PGRefOrError OSD::locate_asok_target(const cmdmap_t& cmdmap,
     pg->unlock();
     return OSD::PGRefOrError{std::nullopt, -EAGAIN};
   } else {
-    ss << "i don't have pgid " << pgid;
+    ss << "don't have pgid " << pgid;
     return OSD::PGRefOrError{std::nullopt, -ENOENT};
   }
 }
@@ -4835,26 +4836,22 @@ int OSD::shutdown()
   return r;
 }
 
-int OSD::mon_cmd_maybe_osd_create(string &cmd)
+int OSD::mon_cmd_maybe_osd_create(string &&cmd)
 {
   bool created = false;
   while (true) {
     dout(10) << __func__ << " cmd: " << cmd << dendl;
-    vector<string> vcmd{cmd};
-    bufferlist inbl;
     C_SaferCond w;
     string outs;
-    monc->start_mon_command(vcmd, inbl, NULL, &outs, &w);
+    monc->start_mon_command({std::move(cmd)}, {}, NULL, &outs, &w);
     int r = w.wait();
     if (r < 0) {
       if (r == -ENOENT && !created) {
 	string newcmd = "{\"prefix\": \"osd create\", \"id\": " + stringify(whoami)
 	  + ", \"uuid\": \"" + stringify(superblock.osd_fsid) + "\"}";
-	vector<string> vnewcmd{newcmd};
-	bufferlist inbl;
 	C_SaferCond w;
 	string outs;
-	monc->start_mon_command(vnewcmd, inbl, NULL, &outs, &w);
+	monc->start_mon_command({std::move(newcmd)}, {}, NULL, &outs, &w);
 	int r = w.wait();
 	if (r < 0) {
 	  derr << __func__ << " fail: osd does not exist and created failed: "
@@ -4904,7 +4901,7 @@ int OSD::update_crush_location()
     string("\"id\": ") + stringify(whoami) + ", " +
     string("\"weight\":") + weight + ", " +
     string("\"args\": [") + stringify(cct->crush_location) + "]}";
-  return mon_cmd_maybe_osd_create(cmd);
+  return mon_cmd_maybe_osd_create(std::move(cmd));
 }
 
 int OSD::update_crush_device_class()
@@ -4930,7 +4927,7 @@ int OSD::update_crush_device_class()
     string("\"class\": \"") + device_class + string("\", ") +
     string("\"ids\": [\"") + stringify(whoami) + string("\"]}");
 
-  r = mon_cmd_maybe_osd_create(cmd);
+  r = mon_cmd_maybe_osd_create(std::move(cmd));
   if (r == -EBUSY) {
     // good, already bound to a device-class
     return 0;
@@ -6454,20 +6451,7 @@ void OSD::tick_without_osd_lock()
     service.get_scrub_services().initiate_scrub(service.is_recovery_active());
     service.promote_throttle_recalibrate();
     resume_creating_pg();
-    bool need_send_beacon = false;
-    const auto now = ceph::coarse_mono_clock::now();
-    {
-      // borrow lec lock to pretect last_sent_beacon from changing
-      std::lock_guard l{min_last_epoch_clean_lock};
-      const auto elapsed = now - last_sent_beacon;
-      if (std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() >
-        cct->_conf->osd_beacon_report_interval) {
-        need_send_beacon = true;
-      }
-    }
-    if (need_send_beacon) {
-      send_beacon(now);
-    }
+    maybe_send_beacon();
   }
 
   mgrc.update_daemon_health(get_health_metrics());
@@ -7383,6 +7367,26 @@ void OSD::send_beacon(const ceph::coarse_mono_clock::time_point& now)
   }
 }
 
+void OSD::maybe_send_beacon()
+{
+  bool need_send_beacon = false;
+  const auto now = ceph::coarse_mono_clock::now();
+  {
+    // borrow lec lock to protect last_sent_beacon from changing
+    std::lock_guard l{min_last_epoch_clean_lock};
+    const auto elapsed = now - last_sent_beacon;
+    if (std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() >
+      cct->_conf->osd_beacon_report_interval) {
+      need_send_beacon = true;
+    }
+  }
+  if (need_send_beacon) {
+    send_beacon(now);
+  } else {
+    dout(20) << __func__ << " beacon would be too frequent; skipping" << dendl;
+  }
+}
+
 void OSD::handle_command(MCommand *m)
 {
   ConnectionRef con = m->get_connection();
@@ -7469,7 +7473,7 @@ void OSD::scrub_purged_snaps()
   int tr = store->queue_transaction(service.meta_ch, std::move(t), nullptr);
   ceph_assert(tr == 0);
   if (is_active()) {
-    send_beacon(ceph::coarse_mono_clock::now());
+    maybe_send_beacon();
   }
   dout(10) << __func__ << " done" << dendl;
 }
@@ -9954,7 +9958,8 @@ void OSD::dequeue_op(
   pg->do_request(op, handle);
 
   // finish
-  dout(10) << "dequeue_op " << *op->get_req() << " finish" << dendl;
+  dout(10) << "dequeue_op " << *op->get_req() << " finish"
+    << " latency " << (ceph_clock_now() - now) << dendl;
   OID_EVENT_TRACE_WITH_MSG(m, "DEQUEUE_OP_END", false);
 }
 
@@ -10379,11 +10384,10 @@ bool OSD::maybe_override_options_for_qos(const std::set<std::string> *changed)
                 "\"who\": \"" + osd + "\", "
                 "\"name\": \"" + key + "\""
               "}";
-            vector<std::string> vcmd{cmd};
 
             dout(1) << __func__ << " Removing Key: " << key
                     << " for " << osd << " from Mon db" << dendl;
-            monc->start_mon_command(vcmd, {}, nullptr, nullptr, nullptr);
+            monc->start_mon_command({std::move(cmd)}, {}, nullptr, nullptr, nullptr);
           }
 
           // Raise a cluster warning indicating that the changes did not
@@ -10469,28 +10473,18 @@ class MonCmdSetConfigOnFinish : public Context {
   CephContext *cct;
   std::string key;
   std::string val;
-  bool update_shard;
 public:
   explicit MonCmdSetConfigOnFinish(
     OSD *o,
     CephContext *cct,
     const std::string &k,
-    const std::string &v,
-    const bool s)
-      : osd(o), cct(cct), key(k), val(v), update_shard(s) {}
+    const std::string &v) : osd(o), cct(cct), key(k), val(v) {}
   void finish(int r) override {
     if (r != 0) {
       // Fallback to setting the config within the in-memory "values" map.
       cct->_conf.set_val_default(key, val);
     }
-
-    // If requested, apply this option on the
-    // active scheduler of each op shard.
-    if (update_shard) {
-      for (auto& shard : osd->shards) {
-        shard->update_scheduler_config();
-      }
-    }
+    cct->_conf.apply_changes(nullptr);
   }
 };
 
@@ -10503,20 +10497,10 @@ void OSD::mon_cmd_set_config(const std::string &key, const std::string &val)
       "\"name\": \"" + key + "\", "
       "\"value\": \"" + val + "\""
     "}";
-  vector<std::string> vcmd{cmd};
 
-  // List of config options to be distributed across each op shard.
-  // Currently limited to a couple of mClock options.
-  static const std::vector<std::string> shard_option =
-    { "osd_mclock_max_capacity_iops_hdd", "osd_mclock_max_capacity_iops_ssd" };
-  const bool update_shard = std::find(shard_option.begin(),
-                                      shard_option.end(),
-                                      key) != shard_option.end();
-
-  auto on_finish = new MonCmdSetConfigOnFinish(this, cct, key,
-                                               val, update_shard);
+  auto on_finish = new MonCmdSetConfigOnFinish(this, cct, key, val);
   dout(10) << __func__ << " Set " << key << " = " << val << dendl;
-  monc->start_mon_command(vcmd, {}, nullptr, nullptr, on_finish);
+  monc->start_mon_command({std::move(cmd)}, {}, nullptr, nullptr, on_finish);
 }
 
 op_queue_type_t OSD::osd_op_queue_type() const
@@ -11024,11 +11008,6 @@ void OSDShard::unprime_split_children(spg_t parent, unsigned old_pg_num)
   }
 }
 
-void OSDShard::update_scheduler_config()
-{
-  scheduler->update_configuration();
-}
-
 op_queue_type_t OSDShard::get_op_queue_type() const
 {
   return scheduler->get_type();
@@ -11051,7 +11030,7 @@ OSDShard::OSDShard(
     shard_lock{make_mutex(shard_lock_name)},
     scheduler(ceph::osd::scheduler::make_scheduler(
       cct, osd->whoami, osd->num_shards, id, osd->store->is_rotational(),
-      osd->store->get_type(), osd_op_queue, osd_op_queue_cut_off, osd->monc)),
+      osd->store->get_type(), osd_op_queue, osd_op_queue_cut_off)),
     context_queue(sdata_wait_lock, sdata_cond),
     ec_extent_cache_lru(cct->_conf.get_val<uint64_t>(
       "ec_extent_cache_size"))
@@ -11090,9 +11069,8 @@ void OSD::ShardedOpWQ::_add_slot_waiter(
 #undef dout_prefix
 #define dout_prefix *_dout << "osd." << osd->whoami << " op_wq(" << shard_index << ") "
 
-void OSD::ShardedOpWQ::_process(uint32_t thread_index, heartbeat_handle_d *hb)
+void OSD::ShardedOpWQ::_process(uint32_t thread_index, uint32_t shard_index, heartbeat_handle_d *hb)
 {
-  uint32_t shard_index = thread_index % osd->num_shards;
   auto& sdata = osd->shards[shard_index];
   ceph_assert(sdata);
 
@@ -11282,7 +11260,7 @@ void OSD::ShardedOpWQ::_process(uint32_t thread_index, heartbeat_handle_d *hb)
 	   << " waiting_peering " << slot->waiting_peering << dendl;
 
   ThreadPool::TPHandle tp_handle(osd->cct, hb, timeout_interval.load(),
-				 suicide_interval.load());
+				 suicide_interval.load(), &osd->osd_op_tp);
 
   // take next item
   auto qi = std::move(slot->to_process.front());

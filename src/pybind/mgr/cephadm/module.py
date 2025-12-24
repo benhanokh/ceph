@@ -42,6 +42,7 @@ from ceph.deployment.service_spec import (
     TunedProfileSpec,
     MgmtGatewaySpec,
     NvmeofServiceSpec,
+    CertificateSource
 )
 from ceph.deployment.drive_group import DeviceSelection
 from ceph.utils import str_to_datetime, datetime_to_str, datetime_now
@@ -165,13 +166,13 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             'ssh_config_file',
             type='str',
             default=None,
-            desc='customized SSH config file to connect to managed hosts',
+            desc='Customized SSH config file to distribute to managed hosts',
         ),
         Option(
             'device_cache_timeout',
             type='secs',
             default=30 * 60,
-            desc='seconds to cache device inventory',
+            desc='Seconds for which to cache device inventory',
         ),
         Option(
             'device_enhanced_scan',
@@ -190,32 +191,32 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             'daemon_cache_timeout',
             type='secs',
             default=10 * 60,
-            desc='seconds to cache service (daemon) inventory',
+            desc='Seconds for which to cache service (daemon) inventory',
         ),
         Option(
             'facts_cache_timeout',
             type='secs',
             default=1 * 60,
-            desc='seconds to cache host facts data',
+            desc='Seconds for which to cache host facts data',
         ),
         Option(
             'host_check_interval',
             type='secs',
             default=10 * 60,
-            desc='how frequently to perform a host check',
+            desc='How frequently to perform a host check',
         ),
         Option(
             'stray_daemon_check_interval',
             type='secs',
             default=30 * 60,
-            desc='how frequently cephadm should check for the presence of stray daemons',
+            desc='How frequently cephadm should check for the presence of stray daemons',
         ),
         Option(
             'mode',
             type='str',
             enum_allowed=['root', 'cephadm-package'],
             default='root',
-            desc='mode for remote execution of cephadm',
+            desc='Mode for remote execution of cephadm',
         ),
         Option(
             'container_image_base',
@@ -227,27 +228,27 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             'warn_on_stray_hosts',
             type='bool',
             default=True,
-            desc='raise a health warning if daemons are detected on a host '
+            desc='Raise a health warning if daemons are detected on a host '
             'that is not managed by cephadm',
         ),
         Option(
             'warn_on_stray_daemons',
             type='bool',
             default=True,
-            desc='raise a health warning if daemons are detected '
+            desc='Raise a health warning if daemons are detected '
             'that are not managed by cephadm',
         ),
         Option(
             'warn_on_failed_host_check',
             type='bool',
             default=True,
-            desc='raise a health warning if the host check fails',
+            desc='Raise a health warning if the host check fails'
         ),
         Option(
             'log_to_cluster',
             type='bool',
             default=True,
-            desc='log to the "cephadm" cluster log channel"',
+            desc='Log to the "cephadm" cluster log channel"'
         ),
         Option(
             'allow_ptrace',
@@ -255,9 +256,8 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             default=False,
             desc='allow SYS_PTRACE capability on ceph containers',
             long_desc='The SYS_PTRACE capability is needed to attach to a '
-            'process with gdb or strace.  Enabling this options '
-            'can allow debugging daemons that encounter problems '
-            'at runtime.',
+            'process with gdb or strace. Enabling this option '
+            'can facilitate debugging daemons that encounter runtime problems.'
         ),
         Option(
             'container_init',
@@ -269,32 +269,32 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             'prometheus_alerts_path',
             type='str',
             default='/etc/prometheus/ceph/ceph_default_alerts.yml',
-            desc='location of alerts to include in prometheus deployments',
+            desc='Location of alerts to include in Prometheus Alertmanager'
         ),
         Option(
             'grafana_dashboards_path',
             type='str',
             default='/etc/grafana/dashboards/ceph-dashboard/',
-            desc='location of dashboards to include in grafana deployments',
+            desc='Location of dashboards to include in Grafana'
         ),
         Option(
             'migration_current',
             type='int',
             default=None,
-            desc='internal - do not modify',
+            desc='Internal - do not modify',
             # used to track spec and other data migrations.
         ),
         Option(
             'config_dashboard',
             type='bool',
             default=True,
-            desc='manage configs like API endpoints in Dashboard.'
+            desc='Manage configs like API endpoints in Dashboard.'
         ),
         Option(
             'manage_etc_ceph_ceph_conf',
             type='bool',
             default=False,
-            desc='Manage and own /etc/ceph/ceph.conf on the hosts.',
+            desc='Manage and own /etc/ceph/ceph.conf on hosts.',
         ),
         Option(
             'manage_etc_ceph_ceph_conf_hosts',
@@ -307,7 +307,7 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             'registry_url',
             type='str',
             default=None,
-            desc='Registry url for login purposes. This is not the default registry'
+            desc='Registry URL for login purposes. This is not the default registry.'
         ),
         Option(
             'registry_username',
@@ -332,13 +332,13 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             'use_repo_digest',
             type='bool',
             default=True,
-            desc='Automatically convert image tags to image digest. Make sure all daemons use the same image',
+            desc='Automatically convert image tags to image digest to ensure that all daemons use the same image'
         ),
         Option(
             'config_checks_enabled',
             type='bool',
             default=False,
-            desc='Enable or disable the cephadm configuration analysis',
+            desc='Enable or disable cephadm configuration analysis'
         ),
         Option(
             'default_registry',
@@ -351,37 +351,41 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             'max_count_per_host',
             type='int',
             default=10,
-            desc='max number of daemons per service per host',
+            desc='Max number of daemons per service per host: guard against mistakes and runaways',
         ),
         Option(
             'autotune_memory_target_ratio',
             type='float',
             default=.7,
-            desc='ratio of total system memory to divide amongst autotuned daemons'
+            desc='Fraction of total system memory to divide among autotuned daemons. '
+                 'Converged systems hosting both Ceph and compute should set '
+                 'a lower value; systems with more than 10 GiB of memory per '
+                 'OSD may benefit from a slightly larger value so that the '
+                 'abundance of RAM can be fully utilized',
         ),
         Option(
             'autotune_interval',
             type='secs',
             default=10 * 60,
-            desc='how frequently to autotune daemon memory'
+            desc='How frequently to autotune daemon memory'
         ),
         Option(
             'use_agent',
             type='bool',
             default=False,
-            desc='Use cephadm agent on each host to gather and send metadata'
+            desc='Use the cephadm agent on each host to gather and send metadata'
         ),
         Option(
             'agent_refresh_rate',
             type='secs',
             default=20,
-            desc='How often agent on each host will try to gather and send metadata'
+            desc='How often the agent on each host will gather and send metadata'
         ),
         Option(
             'agent_starting_port',
             type='int',
             default=4721,
-            desc='First port agent will try to bind to (will also try up to next 1000 subsequent ports if blocked)'
+            desc='The first TCP port the agent will try to bind to. Up to 1000 subsequent ports will be attempted if this port cannot be bound'
         ),
         Option(
             'agent_down_multiplier',
@@ -393,31 +397,37 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             'hw_monitoring',
             type='bool',
             default=False,
-            desc='Deploy hw monitoring daemon on every host.'
+            desc='Whether the hardware monitoring daemon be deployed on every host?'
         ),
         Option(
             'max_osd_draining_count',
             type='int',
             default=10,
-            desc='max number of osds that will be drained simultaneously when osds are removed'
+            desc='Max number of OSDs that will be drained simultaneously when OSDs are removed'
+        ),
+        Option(
+            'max_parallel_osd_upgrades',
+            type='int',
+            default=16,
+            desc='Maximum number of OSD daemons upgraded in parallel.'
         ),
         Option(
             'service_discovery_port',
             type='int',
             default=8765,
-            desc='cephadm service discovery port'
+            desc='Cephadm service discovery port'
         ),
         Option(
             'cgroups_split',
             type='bool',
             default=True,
-            desc='Pass --cgroups=split when cephadm creates containers (currently podman only)'
+            desc='Pass --cgroups=split when cephadm creates containers (currently Podman only)'
         ),
         Option(
             'log_refresh_metadata',
             type='bool',
             default=False,
-            desc='Log all refresh metadata. Includes daemon, device, and host info collected regularly. Only has effect if logging at debug level'
+            desc='Log all refresh metadata. Includes daemon, device, and host info collected regularly. Only has effect if logging at the debug level'
         ),
         Option(
             'certificate_check_debug_mode',
@@ -444,7 +454,7 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             'certificate_duration_days',
             type='int',
             default=(3 * 365),
-            desc='Specifies the duration of self certificates generated and signed by cephadm root CA',
+            desc='Specifies the duration of self-signed certificates generated and signed by the cephadm root CA',
             min=90,
             max=(10 * 365)
         ),
@@ -460,7 +470,7 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             'secure_monitoring_stack',
             type='bool',
             default=False,
-            desc='Enable TLS security for all the monitoring stack daemons'
+            desc='Enable TLS security for all monitoring stack daemons'
         ),
         Option(
             'default_cephadm_command_timeout',
@@ -473,27 +483,27 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             'ssh_keepalive_interval',
             type='int',
             default=7,
-            desc='How often ssh connections are checked for liveness'
+            desc='How often SSH connections are checked for liveness'
         ),
         Option(
             'ssh_keepalive_count_max',
             type='int',
             default=3,
-            desc='How many times ssh connections can fail liveness checks '
+            desc='How many sequential SSH connection liveness check failures '
             'before the host is marked offline'
         ),
         Option(
             'cephadm_log_destination',
             type='str',
             default='',
-            desc="Destination for cephadm command's persistent logging",
+            desc="Destination for cephadm command persistent logging",
             enum_allowed=['file', 'syslog', 'file,syslog'],
         ),
         Option(
             'oob_default_addr',
             type='str',
             default='169.254.1.1',
-            desc="Default address for RedFish API (oob management)."
+            desc="Default IP address for RedFish API (OOB management)."
         ),
     ]
     for image in DefaultImages:
@@ -536,6 +546,7 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             self.container_image_node_exporter = ''
             self.container_image_loki = ''
             self.container_image_promtail = ''
+            self.container_image_alloy = ''
             self.container_image_haproxy = ''
             self.container_image_keepalived = ''
             self.container_image_snmp_gateway = ''
@@ -585,6 +596,7 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             self.secure_monitoring_stack = False
             self.apply_spec_fails: List[Tuple[str, str]] = []
             self.max_osd_draining_count = 10
+            self.max_parallel_osd_upgrades = 16
             self.device_enhanced_scan = False
             self.inventory_list_all = False
             self.cgroups_split = True
@@ -649,8 +661,6 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
 
         self.tuned_profile_utils = TunedProfileUtils(self)
 
-        self._init_cert_mgr()
-
         # ensure the host lists are in sync
         for h in self.inventory.keys():
             if h not in self.cache.daemons:
@@ -663,9 +673,10 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
         self.events = EventStore(self)
         self.offline_hosts: Set[str] = set()
 
-        self.migration = Migrations(self)
-
         service_registry.init_services(self)
+        self._init_cert_mgr()
+
+        self.migration = Migrations(self)
 
         self.mgr_service: MgrService = cast(MgrService, service_registry.get_service('mgr'))
         self.osd_service: OSDService = cast(OSDService, service_registry.get_service('osd'))
@@ -723,25 +734,23 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
 
         self.cert_mgr = CertMgr(self)
 
-        # register global certificates
-        self.cert_mgr.register_cert_key_pair('mgmt-gateway', 'mgmt_gw_cert', 'mgmt_gw_key', TLSObjectScope.GLOBAL)
-        self.cert_mgr.register_cert_key_pair('oauth2-proxy', 'oauth2_proxy_cert', 'oauth2_proxy_key', TLSObjectScope.GLOBAL)
+        for svc in service_registry.get_all_services():
+            if svc.allows_user_certificates:
+                if svc.SCOPE == TLSObjectScope.UNKNOWN:
+                    OrchestratorError(f"Service {svc.TYPE} requieres certificates but it has not defined its svc.SCOPE field.")
+                self.cert_mgr.register_cert_key_pair(svc.TYPE, svc.cert_name, svc.key_name, svc.SCOPE, svc.ca_cert_name)
 
-        # register per-service certificates
-        self.cert_mgr.register_cert_key_pair('ingress', 'ingress_ssl_cert', 'ingress_ssl_key', TLSObjectScope.SERVICE)
-        self.cert_mgr.register_cert_key_pair('iscsi', 'iscsi_ssl_cert', 'iscsi_ssl_key', TLSObjectScope.SERVICE)
-        self.cert_mgr.register_cert_key_pair('nvmeof', 'nvmeof_server_cert', 'nvmeof_server_key', TLSObjectScope.SERVICE)
         self.cert_mgr.register_cert_key_pair('nvmeof', 'nvmeof_client_cert', 'nvmeof_client_key', TLSObjectScope.SERVICE)
-
-        # register ancilary certificates/keys
         self.cert_mgr.register_cert('nvmeof', 'nvmeof_root_ca_cert', TLSObjectScope.SERVICE)
-        self.cert_mgr.register_cert('rgw', 'rgw_frontend_ssl_cert', TLSObjectScope.SERVICE)
-        self.cert_mgr.register_key('nvmeof', 'nvmeof_encryption_key', TLSObjectScope.SERVICE)
-
-        # register per-host certificates
-        self.cert_mgr.register_cert_key_pair('grafana', 'grafana_cert', 'grafana_key', TLSObjectScope.HOST)
+        # register haproxy monitor ssl cert and key
+        self.cert_mgr.register_cert_key_pair('ingress', 'haproxy_monitor_ssl_cert', 'haproxy_monitor_ssl_key', TLSObjectScope.SERVICE)
 
         self.cert_mgr.init_tlsobject_store()
+
+    def _get_mgr_ips(self) -> List[str]:
+        return [self.inventory.get_addr(d.hostname)
+                for d in self.cache.get_daemons_by_service('mgr')
+                if d.hostname is not None]
 
     def _get_security_config(self) -> Tuple[bool, bool, bool]:
         oauth2_proxy_enabled = len(self.cache.get_daemons_by_service('oauth2-proxy')) > 0
@@ -812,6 +821,35 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
                 timeout = 60
         return self.event_loop.get_result(coro, timeout)
 
+    def update_host_timeout_error(self, host: str, remove: bool = False) -> None:
+        if 'CEPHADM_HOST_TIMEOUT_ERROR' in self.health_checks:
+            hosts = self.health_checks['CEPHADM_HOST_TIMEOUT_ERROR'].get('detail', [])
+        else:
+            hosts = []
+        if remove and host not in hosts:
+            # If the host being removed isn't in the host list, there's no way we'd be removing
+            # the last host from the list, so no need to worry about clearing the warning
+            return
+        elif remove:
+            hosts.remove(host)
+        elif not remove and host in hosts:
+            # If the host was in the host list we got, the warning must already exist and
+            # include the host, so nothing to be done
+            return
+        else:  # not remove and host is not in list case
+            hosts.append(host)
+
+        if not hosts:
+            self.remove_health_warning('CEPHADM_HOST_TIMEOUT_ERROR')
+        else:
+            self.set_health_warning(
+                'CEPHADM_HOST_TIMEOUT_ERROR',
+                f'SSH command execution failed with TimeoutError for {len(hosts)} hosts',
+                len(hosts),
+                hosts
+            )
+        return
+
     @contextmanager
     def async_timeout_handler(self, host: Optional[str] = '',
                               cmd: Optional[str] = '',
@@ -823,6 +861,9 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
         try:
             yield
         except (asyncio.TimeoutError, concurrent.futures.TimeoutError):
+            # raise health warning for timeout issue
+            if host:
+                self.update_host_timeout_error(host)
             err_str: str = ''
             if cmd:
                 err_str = f'Command "{cmd}" timed out '
@@ -845,6 +886,9 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
                 err_str += f'on host {host} '
             err_str += f' - {str(e)}'
             raise OrchestratorError(err_str)
+        else:
+            if host:
+                self.update_host_timeout_error(host, remove=True)
 
     def set_container_image(self, entity: str, image: str) -> None:
         self.check_mon_command({
@@ -935,7 +979,7 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
         suffix = daemon_type not in [
             'mon', 'crash', 'ceph-exporter', 'node-proxy',
             'prometheus', 'node-exporter', 'grafana', 'alertmanager',
-            'container', 'agent', 'snmp-gateway', 'loki', 'promtail',
+            'container', 'agent', 'snmp-gateway', 'loki', 'promtail', 'alloy',
             'elasticsearch', 'jaeger-collector', 'jaeger-agent', 'jaeger-query', 'mgmt-gateway', 'oauth2-proxy'
         ]
         if forcename:
@@ -1319,18 +1363,28 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             return -errno.EINVAL, "", ("Invalid arguments. Please provide arguments <url> <username> <password> "
                                        "or -i <login credentials json file>")
         elif (url and username and password):
-            registry_json = {'url': url, 'username': username, 'password': password}
+            registry_json = {'registry_credentials': [{'url': url, 'username': username, 'password': password}]}
         else:
             assert isinstance(inbuf, str)
             registry_json = json.loads(inbuf)
-            if "url" not in registry_json or "username" not in registry_json or "password" not in registry_json:
-                return -errno.EINVAL, "", ("json provided for custom registry login did not include all necessary fields. "
-                                           "Please setup json file as\n"
-                                           "{\n"
-                                           " \"url\": \"REGISTRY_URL\",\n"
-                                           " \"username\": \"REGISTRY_USERNAME\",\n"
-                                           " \"password\": \"REGISTRY_PASSWORD\"\n"
-                                           "}\n")
+            registry_creds = registry_json.get('registry_credentials')
+            if not registry_creds:
+                if isinstance(registry_json, dict) and all(
+                    isinstance(k, str) and isinstance(v, str) for k, v in registry_json.items()
+                ):
+                    registry_creds = [registry_json]  # type: ignore[list-item]
+                    registry_json = {'registry_credentials': registry_creds}
+                else:
+                    return -errno.EINVAL, "", "Invalid login credentials json file"
+            for d in registry_creds:
+                if "url" not in d or "username" not in d or "password" not in d:
+                    return -errno.EINVAL, "", ("json provided for custom registry login did not include all necessary fields. "
+                                               "Please setup json file as\n"
+                                               "{\n"
+                                               " \"url\": \"REGISTRY_URL\",\n"
+                                               " \"username\": \"REGISTRY_USERNAME\",\n"
+                                               " \"password\": \"REGISTRY_PASSWORD\"\n"
+                                               "}\n")
 
         # verify login info works by attempting login on random host
         host = None
@@ -1751,6 +1805,7 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
                 'nvmeof': self.container_image_nvmeof,
                 'prometheus': self.container_image_prometheus,
                 'promtail': self.container_image_promtail,
+                'alloy': self.container_image_alloy,
                 'snmp-gateway': self.container_image_snmp_gateway,
                 'mgmt-gateway': self.container_image_nginx,
                 'oauth2-proxy': self.container_image_oauth2_proxy,
@@ -3000,6 +3055,7 @@ Then run the following:
             placement=PlacementSpec(host_pattern=host),
             data_devices=DeviceSelection(paths=devices),
             unmanaged=False,
+            method=drive_group.method,
             objectstore=drive_group.objectstore
         )
 
@@ -3229,8 +3285,8 @@ Then run the following:
         if module_name == 'dashboard':
             host_fqdns.append('dashboard_servers')
 
-        cert, key = self.cert_mgr.generate_cert(host_fqdns, self.get_mgr_ip())
-        return {'cert': cert, 'key': key}
+        tls_creds = self.cert_mgr.generate_cert(host_fqdns, self.get_mgr_ip())
+        return {'cert': tls_creds.cert, 'key': tls_creds.key}
 
     @handle_orch_error
     def set_prometheus_access_info(self, user: str, password: str) -> str:
@@ -3323,12 +3379,15 @@ Then run the following:
                 'certificate': self.cert_mgr.get_root_ca()}
 
     @handle_orch_error
-    def cert_store_cert_ls(self, show_details: bool = False) -> Dict[str, Any]:
-        return self.cert_mgr.cert_ls(show_details)
+    def cert_store_cert_ls(self,
+                           filter_by: str = '',
+                           show_details: bool = False,
+                           include_cephadm_signed: bool = False) -> Dict[str, Any]:
+        return self.cert_mgr.cert_ls(filter_by, show_details, include_cephadm_signed)
 
     @handle_orch_error
-    def cert_store_entity_ls(self) -> Dict[str, Dict[str, List[str]]]:
-        return self.cert_mgr.get_entities()
+    def cert_store_bindings_ls(self) -> Dict[str, Dict[str, List[str]]]:
+        return self.cert_mgr.get_consumers()
 
     @handle_orch_error
     def cert_store_reload(self) -> str:
@@ -3348,8 +3407,8 @@ Then run the following:
         return report
 
     @handle_orch_error
-    def cert_store_key_ls(self) -> Dict[str, Any]:
-        return self.cert_mgr.key_ls()
+    def cert_store_key_ls(self, include_cephadm_generated_keys: bool = False) -> Dict[str, Any]:
+        return self.cert_mgr.key_ls(include_cephadm_generated_keys)
 
     @handle_orch_error
     def cert_store_get_cert(
@@ -3363,7 +3422,7 @@ Then run the following:
         if not cert:
             if no_exception_when_missing:
                 return ''
-            raise OrchSecretNotFound(entity=cert_name, service_name=service_name, hostname=hostname)
+            raise OrchSecretNotFound(consumer=cert_name, service_name=service_name, hostname=hostname)
         return cert
 
     @handle_orch_error
@@ -3378,36 +3437,50 @@ Then run the following:
         if not key:
             if no_exception_when_missing:
                 return ''
-            raise OrchSecretNotFound(entity=key_name, service_name=service_name, hostname=hostname)
+            raise OrchSecretNotFound(consumer=key_name, service_name=service_name, hostname=hostname)
         return key
+
+    def _raise_non_editable_cert_error(self, cert_name: str, consumer: str, service_name: str, hostname: str) -> None:
+        if service_name:
+            context = f"service '{service_name}'"
+        elif hostname:
+            context = f"host '{hostname}'"
+        elif consumer:
+            context = f"'{consumer}'"
+
+        raise OrchestratorError(
+            f"Certificate '{cert_name}' for {context} is not editable (defined as inline in the spec or generated by cephadm)."
+        )
 
     @handle_orch_error
     def cert_store_set_pair(
         self,
         cert: str,
         key: str,
-        entity: str,
+        consumer: str,
         cert_name: str = "",
         service_name: str = "",
         hostname: str = "",
         force: bool = False
     ) -> str:
 
-        if entity not in self.cert_mgr.list_entities():
-            raise OrchestratorError(f"Invalid entity: {entity}. Please use 'ceph orch certmgr entity ls' to list valid entities.")
+        if consumer not in self.cert_mgr.list_consumers():
+            raise OrchestratorError(f"Invalid service: {consumer}. Please use 'ceph orch certmgr bindings ls' to list valid bindings.")
 
         # Check the certificate validity status
         target = service_name or hostname
-        cert_info = self.cert_mgr.check_certificate_state(entity, target, cert, key)
-        if not force and not cert_info.is_operationally_valid():
+        cert_info = self.cert_mgr.check_certificate_state(consumer, target, cert, key)
+        debug_mode = self.certificate_check_debug_mode and force
+        if not debug_mode and not cert_info.is_operationally_valid():
             raise OrchestratorError(cert_info.get_status_description())
 
-        # Obtain the certificate name (from entity)
-        cert_names = self.cert_mgr.list_entity_known_certificates(entity)
-        if len(cert_names) == 1:
-            cert_name = cert_names[0]
-        elif len(cert_names) > 1 and not cert_name:
-            raise OrchestratorError(f"Entity '{entity}' has many certificates, please use --cert-name argument to specify which one from the list: {cert_names}")
+        if not cert_name:
+            # If not provided, then obtain the certificate name by using consumer
+            cert_names = self.cert_mgr.list_consumer_known_certificates(consumer)
+            if len(cert_names) == 1:
+                cert_name = cert_names[0]
+            elif len(cert_names) > 1 and not cert_name:
+                raise OrchestratorError(f"Service '{consumer}' has many certificates, please use the --cert-name argument to specify which one from the list: {cert_names}")
 
         # Check the certificate scope
         scope_errors = {
@@ -3419,9 +3492,12 @@ Then run the following:
         if (scope == TLSObjectScope.HOST and not hostname) or (scope == TLSObjectScope.SERVICE and not service_name):
             raise OrchestratorError(scope_errors[scope])
 
+        if not debug_mode and not self.cert_mgr.is_cert_editable(cert_name, service_name or '', hostname or ''):
+            self._raise_non_editable_cert_error(cert_name, consumer, service_name, hostname)
+
         key_name = cert_name.replace('_cert', '_key')
-        self.cert_mgr.save_cert(cert_name, cert, service_name, hostname, True)
-        self.cert_mgr.save_key(key_name, key, service_name, hostname, True)
+        self.cert_mgr.save_cert(cert_name, cert, service_name, hostname, user_made=True, editable=True)
+        self.cert_mgr.save_key(key_name, key, service_name, hostname, user_made=True, editable=True)
         return "Certificate/key pair set correctly"
 
     @handle_orch_error
@@ -3431,14 +3507,19 @@ Then run the following:
         cert: str,
         service_name: str = "",
         hostname: str = "",
+        force: bool = False
     ) -> str:
 
-        target = service_name or hostname
-        cert_info = self.cert_mgr.check_certificate_state(cert_name, target, cert)
-        if not cert_info.is_operationally_valid():
-            raise OrchestratorError(cert_info.get_status_description())
+        debug_mode = self.certificate_check_debug_mode and force
+        if not debug_mode:
+            if not self.cert_mgr.is_cert_editable(cert_name, service_name or '', hostname or ''):
+                self._raise_non_editable_cert_error(cert_name, '', service_name, hostname)
+            target = service_name or hostname
+            cert_info = self.cert_mgr.check_certificate_state(cert_name, target, cert)
+            if not cert_info.is_operationally_valid():
+                raise OrchestratorError(cert_info.get_status_description())
 
-        self.cert_mgr.save_cert(cert_name, cert, service_name, hostname, True)
+        self.cert_mgr.save_cert(cert_name, cert, service_name, hostname, user_made=True, editable=True)
         return f'Certificate for {cert_name} set correctly'
 
     @handle_orch_error
@@ -3460,12 +3541,14 @@ Then run the following:
         hostname: Optional[str] = None,
     ) -> str:
 
+        cert_err = OrchestratorError("Cannot delete the certificate. Please use 'ceph orch certmgr cert ls' to list available certificates. \n"
+                                     "Note: for certificates with host/service scope use --service-name or --hostname to specify the target.")
         try:
-            self.cert_mgr.rm_cert(cert_name, service_name, hostname)
+            if not self.cert_mgr.rm_cert(cert_name, service_name, hostname):
+                raise cert_err
             return f'Certificate for {cert_name} removed correctly'
         except TLSObjectException:
-            raise OrchestratorError("Cannot delete the certificate. Please use 'ceph orch certmgr cert ls' to list available certificates. \n"
-                                    "Note: for certificates with host/service scope use --service-name or --hostname to specify the target.")
+            raise cert_err
 
     @handle_orch_error
     def cert_store_rm_key(
@@ -3688,6 +3771,29 @@ Then run the following:
             results.append(self._plan(cast(ServiceSpec, spec)))
         return results
 
+    def _check_cert_source(self, spec: ServiceSpec) -> str:
+        cert_warning = ''
+        if spec.is_using_certificates_source(CertificateSource.REFERENCE):
+            svc = service_registry.get_service(spec.service_type)
+            if svc.SCOPE == TLSObjectScope.SERVICE:
+                if not self.cert_mgr.cert_exists(svc.cert_name, service_name=spec.service_name(), host=None):
+                    raise OrchestratorError(
+                        f"\n\nSSL is configured with '{CertificateSource.REFERENCE.value}', but cannot find an entry for the service '{spec.service_name()}'"
+                        f"\nunder the certificate '{svc.cert_name}' within the certmgr store. To set the certificate, use:\n"
+                        f"\n  > ceph orch certmgr cert set --cert-name {svc.cert_name} --service-name {spec.service_name()} -i <cert-key-pem-file> \n"
+                    )
+            else:
+                cert_warning = (
+                    f"\n\n\nWarning: SSL is configured with '{CertificateSource.REFERENCE.value}', and this service uses per-host certificates.\n\n"
+                    f"To configure keys/certificates, run the following commands for each host daemons are deployed on:\n"
+                    f"  > ceph orch certmgr cert set --cert-name {svc.cert_name} --service-name {spec.service_name()} --hostname <host>  -i <cert-file>\n"
+                    f"  > ceph orch certmgr key set --key-name {svc.cert_name} --service-name {spec.service_name()} --hostname <host> -i <key-file>\n\n"
+                    f"Once all certificates are provisioned, run:\n"
+                    f"  > ceph orch reconfig {spec.service_name()}\n"
+                    f"to reconfigure the service with the certificates."
+                )
+        return cert_warning
+
     def _apply_service_spec(self, spec: ServiceSpec) -> str:
         if spec.placement.is_empty():
             # fill in default placement
@@ -3709,6 +3815,7 @@ Then run the following:
                 'ceph-exporter': PlacementSpec(host_pattern='*'),
                 'loki': PlacementSpec(count=1),
                 'promtail': PlacementSpec(host_pattern='*'),
+                'alloy': PlacementSpec(host_pattern='*'),
                 'crash': PlacementSpec(host_pattern='*'),
                 'container': PlacementSpec(count=1),
                 'snmp-gateway': PlacementSpec(count=1),
@@ -3729,6 +3836,8 @@ Then run the following:
 
         host_count = len(self.inventory.keys())
         max_count = self.max_count_per_host
+
+        cert_warning = self._check_cert_source(spec)
 
         if spec.service_type == 'nvmeof':
             nvmeof_spec = cast(NvmeofServiceSpec, spec)
@@ -3778,7 +3887,7 @@ Then run the following:
             spec.service_name(), spec.placement.pretty_str()))
         self.spec_store.save(spec)
         self._kick_serve_loop()
-        return "Scheduled %s update..." % spec.service_name()
+        return f"Scheduled {spec.service_name()} update...{cert_warning}"
 
     @handle_orch_error
     def apply(
@@ -3850,6 +3959,10 @@ Then run the following:
 
     @handle_orch_error
     def apply_promtail(self, spec: ServiceSpec) -> str:
+        return self._apply(spec)
+
+    @handle_orch_error
+    def apply_alloy(self, spec: ServiceSpec) -> str:
         return self._apply(spec)
 
     @handle_orch_error

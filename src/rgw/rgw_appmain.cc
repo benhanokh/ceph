@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab ft=cpp
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
 /*
  * Ceph - scalable distributed file system
@@ -20,7 +20,6 @@
 #include "common/errno.h"
 #include "common/Timer.h"
 #include "common/TracepointProvider.h"
-#include "common/openssl_opts_handler.h"
 #include "common/numa.h"
 #include "include/compat.h"
 #include "include/str_list.h"
@@ -46,6 +45,7 @@
 #include "rgw_rest_realm.h"
 #include "rgw_rest_ratelimit.h"
 #include "rgw_rest_zero.h"
+#include "rgw_rest_restore.h"
 #include "rgw_swift_auth.h"
 #include "rgw_log.h"
 #include "rgw_lib.h"
@@ -66,7 +66,9 @@
 #include "rgw_asio_frontend.h"
 #include "rgw_dmclock_scheduler_ctx.h"
 #include "rgw_lua.h"
+#ifdef WITH_RADOSGW_RADOS
 #include "rgw_dedup.h"
+#endif
 #ifdef WITH_RADOSGW_DBSTORE
 #include "rgw_sal_dbstore.h"
 #endif
@@ -168,8 +170,6 @@ void rgw::AppMain::init_frontends1(bool nfs)
   if (!g_conf()->rgw_region.empty() && g_conf()->rgw_zonegroup.empty()) {
     g_conf().set_val_or_die("rgw_zonegroup", g_conf()->rgw_region.c_str());
   }
-
-  ceph::crypto::init_openssl_engine_once();
 } /* init_frontends1 */
 
 void rgw::AppMain::init_numa()
@@ -258,7 +258,9 @@ int rgw::AppMain::init_storage()
           run_quota,
           run_sync,
           g_conf().get_val<bool>("rgw_dynamic_resharding"),
-	        true, true, null_yield, env.cfgstore, // run notification thread
+	  true, // run notification thread
+	  true, // run bucket-logging thread
+	  true, null_yield, env.cfgstore,
           g_conf()->rgw_cache_enabled);
   if (!env.driver) {
     return -EIO;
@@ -363,6 +365,7 @@ void rgw::AppMain::cond_init_apis()
       admin_resource->register_resource("info", new RGWRESTMgr_Info);
       admin_resource->register_resource("usage", new RGWRESTMgr_Usage);
       admin_resource->register_resource("account", new RGWRESTMgr_Account);
+      admin_resource->register_resource("restore", new RGWRESTMgr_Restore);
       /* Register driver-specific admin APIs */
       env.driver->register_admin_apis(admin_resource);
       rest.register_resource(g_conf()->rgw_admin_entry, admin_resource);
@@ -597,6 +600,7 @@ void rgw::AppMain::init_lua()
 #endif
 } /* init_lua */
 
+#ifdef WITH_RADOSGW_RADOS
 void rgw::AppMain::init_dedup()
 {
   rgw::sal::Driver* driver = env.driver;
@@ -611,6 +615,7 @@ void rgw::AppMain::init_dedup()
     }
   }
 }
+#endif
 
 void rgw::AppMain::shutdown(std::function<void(void)> finalize_async_signals)
 {
@@ -618,9 +623,9 @@ void rgw::AppMain::shutdown(std::function<void(void)> finalize_async_signals)
   rgw_pauser.reset();
   fe_pauser.reset();
   realm_watcher.reset();
-  pusher.reset();
   reloader.reset();
 #ifdef WITH_RADOSGW_RADOS
+  pusher.reset();
   if (env.driver->get_name() == "rados") {
     if (g_conf().get_val<bool>("rgw_lua_enable"))
       static_cast<rgw::sal::RadosLuaManager*>(env.lua.manager.get())->
@@ -639,9 +644,11 @@ void rgw::AppMain::shutdown(std::function<void(void)> finalize_async_signals)
   ldh.reset(nullptr); // deletes ldap helper if it was created
   rgw_log_usage_finalize();
 
+#ifdef WITH_RADOSGW_RADOS
   if (dedup_background) {
     dedup_background->shutdown();
   }
+#endif
 
   if (lua_background) {
     lua_background->shutdown();

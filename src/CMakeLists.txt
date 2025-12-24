@@ -113,6 +113,10 @@ if(NOT MSVC)
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wno-ignored-qualifiers>)
 endif()
 
+if (CMAKE_CXX_COMPILER_ID STREQUAL Clang)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wsign-compare>)
+endif()
+
 add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-ftemplate-depth-1024>)
 
 # Because Boost can't be bothered to not include its own deprecated headers
@@ -168,6 +172,7 @@ elseif(CMAKE_CXX_COMPILER_ID STREQUAL Clang)
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wno-mismatched-tags>)
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wno-unused-private-field>)
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wno-address-of-packed-member>)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wno-unknown-warning-option>)
   add_compile_options(
     -Wno-unused-function
     -Wno-unused-local-typedef
@@ -194,16 +199,12 @@ if(WITH_CEPH_DEBUG_MUTEX)
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-DCEPH_DEBUG_MUTEX>)
 endif()
 
+if(WITH_CPUTRACE)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-DWITH_CPUTRACE>)
+endif()
+
 include(CheckCCompilerFlag)
 if(CMAKE_CXX_COMPILER_ID STREQUAL GNU)
-  CHECK_C_COMPILER_FLAG("-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2" HAS_FORTIFY_SOURCE)
-  if(NOT CMAKE_BUILD_TYPE STREQUAL Debug)
-    if(HAS_FORTIFY_SOURCE)
-      add_definitions(
-        -U_FORTIFY_SOURCE
-        -D_FORTIFY_SOURCE=2)
-    endif()
-  endif()
     CHECK_C_COMPILER_FLAG(-fstack-protector-strong HAS_STACK_PROTECT)
     if (HAS_STACK_PROTECT)
       add_compile_options(-fstack-protector-strong)
@@ -245,7 +246,7 @@ endif()
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_C_STANDARD 99)
+set(CMAKE_C_STANDARD 11)
 # we use `asm()` to inline assembly, so enable the GNU extension
 set(CMAKE_C_EXTENSIONS ON)
 set(C_STANDARD_REQUIRED ON)
@@ -531,6 +532,7 @@ set(libcommon_files
   osdc/Striper.cc
   osdc/Objecter.cc
   osdc/error_code.cc
+  osdc/SplitOp.cc
   librbd/Features.cc
   librbd/io/IoOperations.cc
   ${mds_files})
@@ -565,9 +567,11 @@ set(ceph_common_objs
   $<TARGET_OBJECTS:compressor_objs>
   $<TARGET_OBJECTS:common-objs>
   $<TARGET_OBJECTS:common_mountcephfs_objs>
-  $<TARGET_OBJECTS:crush_objs>)
+  $<TARGET_OBJECTS:crush_objs>
+  $<TARGET_OBJECTS:json_spirit>
+  $<TARGET_OBJECTS:erasure_code>)
 set(ceph_common_deps
-  json_spirit erasure_code extblkdev arch crc32
+  common_utf8 extblkdev arch crc32
   ${LIB_RESOLV}
   Boost::thread
   Boost::system
@@ -1137,8 +1141,8 @@ endif(WITH_KVS)
 if(WITH_RADOSGW)
   if(WITH_RADOSGW_SELECT_PARQUET OR WITH_RADOSGW_ARROW_FLIGHT)
     if(WITH_SYSTEM_ARROW)
-      find_package(Arrow 4 REQUIRED QUIET)
-      find_package(Parquet 4 REQUIRED QUIET)
+      find_package(Arrow 9 REQUIRED QUIET)
+      find_package(Parquet 9 REQUIRED QUIET)
     else()
       # find arrow's dependencies
       if (WITH_SYSTEM_UTF8PROC)

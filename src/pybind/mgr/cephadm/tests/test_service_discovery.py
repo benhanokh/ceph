@@ -1,5 +1,5 @@
 from unittest.mock import MagicMock
-from cephadm.service_discovery import Root
+from cephadm.services.service_discovery import Root
 from cephadm.services.service_registry import service_registry
 
 
@@ -68,6 +68,8 @@ class FakeNFSServiceSpec:
 class FakeIngressServiceSpec:
     def __init__(self, port):
         self.monitor_port = port
+        self.monitor_ip_addrs = {}
+        self.monitor_networks = {}
 
 
 class FakeServiceSpec:

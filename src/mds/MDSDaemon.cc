@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -20,6 +21,7 @@
 #include "include/Context.h"
 #include "include/types.h"
 #include "include/str_list.h"
+#include "include/util.h"
 
 #include "common/Clock.h"
 #include "common/HeartbeatMap.h"
@@ -164,12 +166,16 @@ void MDSDaemon::asok_command(
     dump_status(f);
     r = 0;
   } else if (command == "lockup") {
-    int64_t millisecs;
-    cmd_getval(cmdmap, "millisecs", millisecs);
-    derr << "(lockup) sleeping with mds_lock for " << millisecs << dendl;
-    std::lock_guard l(mds_lock);
-    std::this_thread::sleep_for(std::chrono::milliseconds(millisecs));
-    r = 0;
+    int64_t millisecs{};
+    if (cmd_getval(cmdmap, "millisecs", millisecs)) {
+      derr << "(lockup) sleeping with mds_lock for " << millisecs << dendl;
+      std::lock_guard l(mds_lock);
+      std::this_thread::sleep_for(std::chrono::milliseconds(millisecs));
+      r = 0;
+    } else {
+      ss << "millisecs setting not found";
+      r = -EINVAL;
+    }
   } else if (command == "exit") {
     outbl.append("Exiting...\n");
     r = 0;
@@ -264,6 +270,24 @@ void MDSDaemon::dump_status(Formatter *f)
   }
 
   f->dump_float("uptime", get_uptime().count());
+
+  {
+    std::map<std::string, std::string> sysinfo;
+    collect_sys_info(&sysinfo, cct);
+    f->open_object_section("sysinfo");
+    for (auto& [k, v] : sysinfo) {
+      f->dump_string(k, v);
+    }
+    f->close_section();
+  }
+
+  if constexpr (std::endian::native == std::endian::little) {
+    f->dump_string("endian", "little");
+  } else if constexpr (std::endian::native == std::endian::big) {
+    f->dump_string("endian", "big");
+  } else {
+    f->dump_string("endian", "mixed");
+  }
 
   f->close_section(); // status
 }

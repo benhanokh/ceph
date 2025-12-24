@@ -42,6 +42,7 @@ import { RgwMultisiteWizardComponent } from '../rgw-multisite-wizard/rgw-multisi
 import { RgwMultisiteSyncPolicyComponent } from '../rgw-multisite-sync-policy/rgw-multisite-sync-policy.component';
 import { ModalCdsService } from '~/app/shared/services/modal-cds.service';
 import { RgwMultisiteService } from '~/app/shared/api/rgw-multisite.service';
+import { CdForm } from '~/app/shared/forms/cd-form';
 
 const BASE_URL = 'rgw/multisite/configuration';
 
@@ -51,7 +52,7 @@ const BASE_URL = 'rgw/multisite/configuration';
   styleUrls: ['./rgw-multisite-details.component.scss'],
   changeDetection: ChangeDetectionStrategy.OnPush
 })
-export class RgwMultisiteDetailsComponent implements OnDestroy, OnInit {
+export class RgwMultisiteDetailsComponent extends CdForm implements OnDestroy, OnInit {
   private sub = new Subscription();
   @ViewChild('treeNodeTemplate') labelTpl: TemplateRef<any>;
   @ViewChild(RgwMultisiteSyncPolicyComponent) syncPolicyComp: RgwMultisiteSyncPolicyComponent;
@@ -68,8 +69,6 @@ export class RgwMultisiteDetailsComponent implements OnDestroy, OnInit {
   selection = new CdTableSelection();
   createTableActions: CdTableAction[];
   migrateTableAction: CdTableAction[];
-  importAction: CdTableAction[];
-  exportAction: CdTableAction[];
   multisiteReplicationActions: CdTableAction[];
   loadingIndicator = true;
 
@@ -142,12 +141,13 @@ export class RgwMultisiteDetailsComponent implements OnDestroy, OnInit {
     private rgwMultisiteService: RgwMultisiteService,
     private changeDetectionRef: ChangeDetectorRef
   ) {
+    super();
     this.permissions = this.authStorageService.getPermissions();
   }
 
   openModal(entity: any | string, edit = false) {
     const entityName = edit ? entity?.data?.type : entity;
-    const action = edit ? 'edit' : 'create';
+    const action = edit ? this.actionLabels.EDIT : this.actionLabels.CREATE;
     const initialState = {
       resource: entityName,
       action: action,
@@ -156,14 +156,18 @@ export class RgwMultisiteDetailsComponent implements OnDestroy, OnInit {
       multisiteInfo: this.multisiteInfo
     };
     if (entityName === 'realm') {
-      this.bsModalRef = this.cdsModalService.show(RgwMultisiteRealmFormComponent, initialState);
+      this.cdsModalService.show(RgwMultisiteRealmFormComponent, initialState);
     } else if (entityName === 'zonegroup') {
       this.bsModalRef = this.modalService.show(RgwMultisiteZonegroupFormComponent, initialState, {
         size: 'lg'
       });
     } else {
-      this.bsModalRef = this.modalService.show(RgwMultisiteZoneFormComponent, initialState, {
-        size: 'lg'
+      this.cdsModalService.show(RgwMultisiteZoneFormComponent, {
+        resource: entityName,
+        action: action,
+        info: entity,
+        defaultsInfo: this.defaultsInfo,
+        multisiteInfo: this.multisiteInfo
       });
     }
   }
@@ -195,9 +199,7 @@ export class RgwMultisiteDetailsComponent implements OnDestroy, OnInit {
       defaultsInfo: this.defaultsInfo,
       multisiteInfo: this.multisiteInfo
     };
-    this.bsModalRef = this.modalService.show(RgwMultisiteExportComponent, initialState, {
-      size: 'lg'
-    });
+    this.cdsModalService.show(RgwMultisiteExportComponent, initialState);
   }
 
   getDisableExport() {
@@ -236,20 +238,37 @@ export class RgwMultisiteDetailsComponent implements OnDestroy, OnInit {
         permission: 'create',
         icon: Icons.add,
         name: this.actionLabels.CREATE + ' Realm',
-        click: () => this.openModal('realm')
+        click: () => this.openModal('realm'),
+        visible: () => !this.showMigrateAndReplicationActions
       },
       {
         permission: 'create',
         icon: Icons.add,
         name: this.actionLabels.CREATE + ' Zone Group',
         click: () => this.openModal('zonegroup'),
-        disable: () => this.getDisable()
+        disable: () => this.getDisable(),
+        visible: () => !this.showMigrateAndReplicationActions
       },
       {
         permission: 'create',
         icon: Icons.add,
         name: this.actionLabels.CREATE + ' Zone',
-        click: () => this.openModal('zone')
+        click: () => this.openModal('zone'),
+        visible: () => !this.showMigrateAndReplicationActions
+      },
+      {
+        permission: 'create',
+        icon: Icons.download,
+        name: this.actionLabels.IMPORT,
+        click: () => this.openImportModal(),
+        disable: () => this.getDisableImport()
+      },
+      {
+        permission: 'create',
+        icon: Icons.upload,
+        name: this.actionLabels.EXPORT,
+        click: () => this.openExportModal(),
+        disable: () => this.getDisableExport()
       }
     ];
     this.migrateTableAction = [
@@ -258,24 +277,6 @@ export class RgwMultisiteDetailsComponent implements OnDestroy, OnInit {
         icon: Icons.wrench,
         name: this.actionLabels.MIGRATE,
         click: () => this.openMigrateModal()
-      }
-    ];
-    this.importAction = [
-      {
-        permission: 'create',
-        icon: Icons.download,
-        name: this.actionLabels.IMPORT,
-        click: () => this.openImportModal(),
-        disable: () => this.getDisableImport()
-      }
-    ];
-    this.exportAction = [
-      {
-        permission: 'create',
-        icon: Icons.upload,
-        name: this.actionLabels.EXPORT,
-        click: () => this.openExportModal(),
-        disable: () => this.getDisableExport()
       }
     ];
     this.multisiteReplicationActions = [

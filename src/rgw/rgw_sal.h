@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab ft=cpp
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
 /*
  * Ceph - scalable distributed file system
@@ -51,6 +51,7 @@ class RGWZonePlacementInfo;
 struct rgw_pubsub_topic;
 struct RGWOIDCProviderInfo;
 struct RGWRoleInfo;
+class RGWGetObj_Filter;
 
 using RGWBucketListNameFilter = std::function<bool (const std::string&)>;
 
@@ -163,6 +164,7 @@ static constexpr uint32_t FLAG_PREVENT_VERSIONING = 0x0002;
 // if cannot do all elements of op, do as much as possible (e.g.,
 // delete object where head object is missing)
 static constexpr uint32_t FLAG_FORCE_OP = 0x0004;
+static constexpr uint32_t FLAG_SKIP_UPDATE_OLH = 0x0008;
 
 enum class RGWRestoreStatus : uint8_t {
   None  = 0,
@@ -263,8 +265,28 @@ struct TopicList {
   std::string next_marker;
 };
 
-/** A list of key-value attributes */
-  using Attrs = std::map<std::string, ceph::buffer::list>;
+/**
+ * @brief A factory for DataProcessor instances
+ *
+ * This factory is used to create DataProcessor instances that can process data
+ * in a streaming fashion. It is used by the RGWGetDataCB interface to allow
+ * data to be processed as it is read from the backing store.
+ * The factory is responsible for passing the read data to the DataProcessor
+ * passed through the set_writer() method.
+ */
+class DataProcessorFactory {
+ public:
+  DataProcessorFactory() {}
+  virtual ~DataProcessorFactory() {}
+
+  virtual int set_writer(DataProcessor* writer,
+                         Attrs& attrs,
+                         const DoutPrefixProvider *dpp,
+                         optional_yield y) = 0;
+  virtual RGWGetObj_Filter* get_filter() = 0;
+  virtual bool need_copy_data() = 0;
+  virtual void finalize_attrs(Attrs& attrs) { /* default implementation does nothing */ }
+};
 
 /**
  * @brief Base singleton representing a Store or Filter
@@ -935,7 +957,10 @@ class Bucket {
                                     uint64_t num_objs, optional_yield y) = 0;
     /** Change the owner of this bucket in the backing store.  Current owner must be set.  Does not
      * change ownership of the objects in the bucket. */
-    virtual int chown(const DoutPrefixProvider* dpp, const rgw_owner& new_owner, optional_yield y) = 0;
+    virtual int chown(const DoutPrefixProvider* dpp,
+                      const rgw_owner& new_owner,
+                      const std::string& new_owner_name,
+                      optional_yield y) = 0;
     /** Store the cached bucket info into the backing store */
     virtual int put_info(const DoutPrefixProvider* dpp, bool exclusive, ceph::real_time mtime, optional_yield y) = 0;
     /** Get the owner of this bucket */
@@ -1049,12 +1074,15 @@ class Bucket {
         RGWObjVersionTracker* objv_tracker) = 0;
     /** Move the pending bucket logging object into the bucket
      if "last_committed" is not null, it will be set to the name of the last committed object
+     if async is true, write the entry to the commit lists to be processed by the BucketLoggingManager
      * */
-    virtual int commit_logging_object(const std::string& obj_name, optional_yield y, const DoutPrefixProvider *dpp, const std::string& prefix, std::string* last_committed) = 0;
+    virtual int commit_logging_object(const std::string& obj_name, optional_yield y,
+	const DoutPrefixProvider *dpp, const std::string& prefix,
+	std::string* last_committed, bool async) = 0;
     //** Remove the pending bucket logging object */
-    virtual int remove_logging_object(const std::string& obj_name, optional_yield y, const DoutPrefixProvider *dpp) = 0;
+    virtual int remove_logging_object(const std::string& obj_name, const std::string& prefix, optional_yield y, const DoutPrefixProvider *dpp) = 0;
     /** Write a record to the pending bucket logging object */
-    virtual int write_logging_object(const std::string& obj_name, const std::string& record, optional_yield y, const DoutPrefixProvider *dpp, bool async_completion) = 0;
+    virtual int write_logging_object(const std::string& obj_name, const std::string& record, const std::string& prefix, optional_yield y, const DoutPrefixProvider *dpp, bool async_completion) = 0;
 
     /* dang - This is temporary, until the API is completed */
     virtual rgw_bucket& get_key() = 0;
@@ -1206,6 +1234,7 @@ class Object {
 	       boost::optional<ceph::real_time> delete_at,
                std::string* version_id, std::string* tag, std::string* etag,
                void (*progress_cb)(off_t, void *), void* progress_data,
+               DataProcessorFactory* dp_factory,
                const DoutPrefixProvider* dpp, optional_yield y) = 0;
 
     /** return logging subsystem */
@@ -1247,7 +1276,7 @@ class Object {
      * deleted.  @note the attribute APIs may be revisited in the future. */
     virtual int set_obj_attrs(const DoutPrefixProvider* dpp, Attrs* setattrs, Attrs* delattrs, optional_yield y, uint32_t flags) = 0;
     /** Get attributes for this object */
-    virtual int get_obj_attrs(optional_yield y, const DoutPrefixProvider* dpp, rgw_obj* target_obj = NULL) = 0;
+    virtual int get_obj_attrs(optional_yield y, const DoutPrefixProvider* dpp) = 0;
     /** Modify attributes for this object. */
     virtual int modify_obj_attrs(const char* attr_name, bufferlist& attr_val, optional_yield y, const DoutPrefixProvider* dpp,
                                  uint32_t flags = rgw::sal::FLAG_LOG_OP) = 0;
@@ -1282,6 +1311,7 @@ class Object {
 			   CephContext* cct,
 		           std::optional<uint64_t> days,
    	 		   bool& in_progress,
+			   uint64_t& size,
 			   const DoutPrefixProvider* dpp,
 			   optional_yield y) = 0;
     /** Check to see if two placement rules match */
@@ -1526,7 +1556,9 @@ public:
 		       std::string& tag, ACLOwner& owner,
 		       uint64_t olh_epoch,
 		       rgw::sal::Object* target_obj,
-                       prefix_map_t& processed_prefixes) = 0;
+           prefix_map_t& processed_prefixes,
+           const char *if_match = nullptr,
+           const char *if_nomatch = nullptr) = 0;
   /** Cleanup orphaned parts caused by racing condition involving part upload retry */
   virtual int cleanup_orphaned_parts(const DoutPrefixProvider *dpp,
                                      CephContext *cct, optional_yield y,
@@ -1942,6 +1974,7 @@ public:
 				      bool run_sync_thread,
 				      bool run_reshard_thread,
 				      bool run_notification_thread,
+				      bool run_bucket_logging_thread,
 				      bool background_tasks,
 				      optional_yield y,
               rgw::sal::ConfigStore* cfgstore,
@@ -1957,6 +1990,7 @@ public:
 						   run_sync_thread,
 						   run_reshard_thread,
                run_notification_thread,
+				                   run_bucket_logging_thread,
 						   use_cache, use_gc,
 						   background_tasks, y, cfgstore, admin);
     return driver;
@@ -1985,7 +2019,8 @@ public:
 						bool quota_threads,
 						bool run_sync_thread,
 						bool run_reshard_thread,
-            bool run_notification_thread,
+                                                bool run_notification_thread,
+                                                bool run_bucket_logging_thread,
 						bool use_metadata_cache,
 						bool use_gc, bool background_tasks,
 						optional_yield y, rgw::sal::ConfigStore* cfgstore, bool admin);

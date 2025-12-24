@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #include "crimson/os/seastore/lba_mapping.h"
 #include "crimson/os/seastore/lba/btree_lba_manager.h"
@@ -80,7 +80,7 @@ bool LBAMapping::is_data_stable() const {
     direct_cursor->key);
 }
 
-LBAMapping::next_iertr::future<LBAMapping> LBAMapping::next()
+base_iertr::future<LBAMapping> LBAMapping::next()
 {
   LOG_PREFIX(LBAMapping::next);
   auto ctx = get_effective_cursor().ctx;
@@ -104,10 +104,10 @@ LBAMapping::next_iertr::future<LBAMapping> LBAMapping::next()
   });
 }
 
-LBAMapping::refresh_iertr::future<LBAMapping> LBAMapping::refresh()
+base_iertr::future<LBAMapping> LBAMapping::refresh()
 {
   if (is_viewable()) {
-    return refresh_iertr::make_ready_future<LBAMapping>(*this);
+    return base_iertr::make_ready_future<LBAMapping>(*this);
   }
   return seastar::do_with(
     direct_cursor,
@@ -117,16 +117,29 @@ LBAMapping::refresh_iertr::future<LBAMapping> LBAMapping::refresh()
       if (direct_cursor) {
 	return direct_cursor->refresh();
       }
-      return refresh_iertr::now();
+      return base_iertr::now();
     }).si_then([&indirect_cursor] {
       if (indirect_cursor) {
 	return indirect_cursor->refresh();
       }
-      return refresh_iertr::now();
+      return base_iertr::now();
     }).si_then([&direct_cursor, &indirect_cursor] {
       return LBAMapping(direct_cursor, indirect_cursor);
     });
   });
+}
+
+base_iertr::future<> LBAMapping::co_refresh()
+{
+  if (is_viewable()) {
+    co_return;
+  }
+  if (direct_cursor) {
+    co_await direct_cursor->refresh();
+  }
+  if (indirect_cursor) {
+    co_await indirect_cursor->refresh();
+  }
 }
 
 bool LBAMapping::is_initial_pending() const {

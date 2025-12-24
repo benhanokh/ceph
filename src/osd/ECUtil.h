@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -211,22 +212,26 @@ class slice_iterator {
 
         // If we have reached the end of the extent, we need to move that on too.
         if (bl_iter == emap_iter.get_val().end()) {
+          // NOTE: Despite appearances, the following is happening BEFORE
+          // the caller gets to use the buffer pointers (since the in/out is
+          // set a few lines above).  This means that the caller must not
+          // check the CRC.
+          if (out_set.contains(shard)) {
+            invalidate_crcs(shard);
+          }
           ++emap_iter;
           if (emap_iter == input[shard].end()) {
             erase = true;
           } else {
-            if (out_set.contains(shard)) {
-              bufferlist bl = emap_iter.get_val();
-              bl.invalidate_crc();
-            }
             iters.at(shard).second = emap_iter.get_val().begin();
             if (zeros) {
               zeros->emplace(shard, emap_iter.get_off(), emap_iter.get_len());
             }
           }
         }
-      } else
+      } else {
         ceph_assert(iter_offset > start);
+      }
 
       if (erase) {
         iter = iters.erase(iter);
@@ -247,6 +252,11 @@ class slice_iterator {
     if (out.empty()) {
       advance();
     }
+  }
+
+  void invalidate_crcs(shard_id_t shard) {
+    bufferlist bl = iters.at(shard).first.get_val();
+    bl.invalidate_crc();
   }
 
 public:
@@ -653,10 +663,6 @@ public:
       ErasureCodeInterface::FLAG_EC_PLUGIN_REQUIRE_SUB_CHUNKS) != 0;
   }
 
-  bool get_is_hinfo_required() const {
-    return !supports_ec_overwrites();
-  }
-
   bool supports_partial_reads() const {
     return (plugin_flags &
       ErasureCodeInterface::FLAG_EC_PLUGIN_PARTIAL_READ_OPTIMIZATION) != 0;
@@ -675,6 +681,11 @@ public:
   bool supports_encode_decode_crcs() const {
     return (plugin_flags &
             ErasureCodeInterface::FLAG_EC_PLUGIN_CRC_ENCODE_DECODE_SUPPORT) != 0;
+  }
+
+  bool supports_direct_reads() const {
+    return (plugin_flags &
+            ErasureCodeInterface::FLAG_EC_PLUGIN_DIRECT_READS) != 0;
   }
 
   uint64_t get_stripe_width() const {
@@ -755,9 +766,10 @@ public:
     return ((len + stripe_width - 1) / stripe_width) * chunk_size;
   }
 
-  uint64_t chunk_aligned_shard_offset_to_ro_offset(uint64_t offset) const {
-    ceph_assert(offset % chunk_size == 0);
-    return (offset / chunk_size) * stripe_width;
+  uint64_t shard_offset_to_ro_offset(shard_id_t shard, uint64_t offset) const {
+    raw_shard_id_t raw_shard = get_raw_shard(shard);
+    auto result = std::lldiv(offset, chunk_size);
+    return result.quot * stripe_width + (int)raw_shard * chunk_size + result.rem;
   }
 
   std::pair<uint64_t, uint64_t> chunk_aligned_ro_range_to_shard_ro_range(
@@ -1062,16 +1074,9 @@ public:
     }
   }
 
-  bool add_zero_padding_for_decode(uint64_t object_size, shard_id_set &exclude_set) {
-    shard_extent_set_t zeros(sinfo->get_k_plus_m());
-    sinfo->ro_size_to_zero_mask(object_size, zeros);
-    extent_set superset = get_extent_superset();
+  void add_zero_padding_for_decode(ECUtil::shard_extent_set_t &zeros) {
     bool changed = false;
     for (auto &&[shard, z] : zeros) {
-      if (exclude_set.contains(shard)) {
-        continue;
-      }
-      z.intersection_of(superset);
       for (auto [off, len] : z) {
         changed = true;
         bufferlist bl;
@@ -1083,8 +1088,6 @@ public:
     if (changed) {
       compute_ro_range();
     }
-
-    return changed;
   }
 
   template <typename IntervalSetT> requires is_interval_set_v<IntervalSetT>

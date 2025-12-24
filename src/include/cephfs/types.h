@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -20,12 +21,14 @@
 #include <ostream>
 #include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
 
 #include "include/compact_set.h"
 #include "include/encoding.h"
 #include "include/fs_types.h"
 #include "include/ceph_fs.h"
+#include "include/object.h" // for snapid_t
 #include "include/types.h" // for version_t
 #include "include/utime.h"
 
@@ -117,7 +120,7 @@ struct frag_info_t : public scatter_info_t {
   void decode(ceph::buffer::list::const_iterator& bl);
   void dump(ceph::Formatter *f) const;
   void decode_json(JSONObj *obj);
-  static void generate_test_instances(std::list<frag_info_t*>& ls);
+  static std::list<frag_info_t>  generate_test_instances();
 
   // this frag
   utime_t mtime;
@@ -177,7 +180,7 @@ struct nest_info_t : public scatter_info_t {
   void decode(ceph::buffer::list::const_iterator& bl);
   void dump(ceph::Formatter *f) const;
   void decode_json(JSONObj *obj);
-  static void generate_test_instances(std::list<nest_info_t*>& ls);
+  static std::list<nest_info_t> generate_test_instances();
 
   // this frag + children
   utime_t rctime;
@@ -212,9 +215,11 @@ struct vinodeno_t {
     decode(snapid, p);
   }
   void dump(ceph::Formatter *f) const;
-  static void generate_test_instances(std::list<vinodeno_t*>& ls) {
-    ls.push_back(new vinodeno_t);
-    ls.push_back(new vinodeno_t(1, 2));
+  static std::list<vinodeno_t> generate_test_instances() {
+    std::list<vinodeno_t> ls;
+    ls.emplace_back();
+    ls.push_back(vinodeno_t(1, 2));
+    return ls;
   }
   inodeno_t ino;
   snapid_t snapid;
@@ -338,7 +343,7 @@ struct quota_info_t
   }
 
   void dump(ceph::Formatter *f) const;
-  static void generate_test_instances(std::list<quota_info_t *>& ls);
+  static std::list<quota_info_t> generate_test_instances();
 
   bool is_valid() const {
     return max_bytes >=0 && max_files >=0;
@@ -377,7 +382,7 @@ struct client_writeable_range_t {
   void encode(ceph::buffer::list &bl) const;
   void decode(ceph::buffer::list::const_iterator& bl);
   void dump(ceph::Formatter *f) const;
-  static void generate_test_instances(std::list<client_writeable_range_t*>& ls);
+  static std::list<client_writeable_range_t> generate_test_instances();
 
   byte_range_t range;
   snapid_t follows = 0;     // aka "data+metadata flushed thru"
@@ -442,7 +447,7 @@ public:
   void encode(ceph::buffer::list &bl) const;
   void decode(ceph::buffer::list::const_iterator& bl);
   void dump(ceph::Formatter *f) const;
-  static void generate_test_instances(std::list<inline_data_t*>& ls);
+  static std::list<inline_data_t> generate_test_instances();
   version_t version = 1;
 
 private:
@@ -566,6 +571,26 @@ struct optmetadata_singleton {
     return u64kind < other.u64kind;
   }
 
+  bool operator == (const optmetadata_singleton& other) const {
+    if (this->get_kind() != other.get_kind()) {
+      return false;
+    }
+
+    return std::visit(
+      [](auto& this_optmetadata, auto& other_optmetadata)
+      {
+	// FIXME: optmetadata's can be an instance of unknown_md_t or
+	// charmap_md_t. former should memcmp() since there's no other way but
+	// latter should not. See https://tracker.ceph.com/issues/73382.
+	return memcmp(&this_optmetadata, &other_optmetadata, sizeof(this_optmetadata)) == 0;
+      },
+      optmetadata, other.optmetadata);
+  }
+
+  bool operator != (const optmetadata_singleton& other) const {
+    return !(*this == other);
+  }
+
 private:
   uint64_t u64kind = 0;
   optmetadata_t optmetadata;
@@ -640,6 +665,30 @@ struct optmetadata_multiton {
     return opts.size();
   }
 
+  bool operator == (const optmetadata_multiton<optmetadata_singleton<optmetadata_server_t<Allocator>,Allocator>, Allocator>& other) const
+  {
+    if (size() != other.size())
+      return false;
+
+    auto it_this = opts.begin();
+    auto it_other = other.opts.begin();
+    while (it_this != opts.end() && it_other != opts.end()) {
+      if (*it_this != *it_other) {
+        return false;
+      }
+
+      ++it_this;
+      ++it_other;
+    }
+
+    return true;
+  }
+
+  bool operator != (const optmetadata_multiton<optmetadata_singleton<optmetadata_server_t<Allocator>,Allocator>, Allocator>& other) const
+  {
+    return !(*this == other);
+  }
+
 private:
   optvec_t opts;
 };
@@ -672,11 +721,13 @@ static inline void decode(optmetadata_multiton<Singleton,Allocator>& o, ::ceph::
 
 template<template<typename> class Allocator = std::allocator>
 struct inode_t {
+
   /**
    * ***************
-   * Do not forget to add any new fields to the compare() function.
+   * XXX Do not forget to add any new fields to the compare() function.
    * ***************
    */
+
   using optmetadata_singleton_server_t = optmetadata_singleton<optmetadata_server_t<Allocator>,Allocator>;
   using client_range_map = std::map<client_t,client_writeable_range_t,std::less<client_t>,Allocator<std::pair<const client_t,client_writeable_range_t>>>;
 
@@ -825,7 +876,7 @@ struct inode_t {
   static void client_ranges_cb(client_range_map& c, JSONObj *obj);
   static void old_pools_cb(compact_set<int64_t, std::less<int64_t>, Allocator<int64_t> >& c, JSONObj *obj);
   void decode_json(JSONObj *obj);
-  static void generate_test_instances(std::list<inode_t*>& ls);
+  static std::list<inode_t> generate_test_instances();
   /**
    * Compare this inode_t with another that represent *the same inode*
    * at different points in time.
@@ -929,6 +980,18 @@ struct inode_t {
 private:
   bool older_is_consistent(const inode_t &other) const;
 };
+
+template<template<typename> class Allocator>
+inline bool operator==(std::vector<uint8_t,Allocator<uint8_t>> l,
+	          std::vector<uint8_t,Allocator<uint8_t>> r) {
+  return l.size() == r.size() && memcmp(l.data(), r.data(), l.size()) == 0;
+}
+
+template<template<typename> class Allocator>
+inline bool operator!=(std::vector<uint8_t,Allocator<uint8_t>> l,
+	          std::vector<uint8_t,Allocator<uint8_t>> r) {
+  return l.size() != r.size() || memcmp(l.data(), r.data(), l.size()) != 0;
+}
 
 // These methods may be moved back to mdstypes.cc when we have pmr
 template<template<typename> class Allocator>
@@ -1129,18 +1192,19 @@ void inode_t<Allocator>::decode(ceph::buffer::list::const_iterator &p)
 }
 
 template<template<typename> class Allocator>
-void inode_t<Allocator>::generate_test_instances(std::list<inode_t*>& ls)
+auto inode_t<Allocator>::generate_test_instances() -> std::list<inode_t>
 {
-  ls.push_back(new inode_t<Allocator>);
-  ls.push_back(new inode_t<Allocator>);
-  ls.back()->ino = 1;
+  std::list<inode_t> ls;
+  ls.emplace_back();
+  ls.emplace_back();
+  ls.back().ino = 1;
   // i am lazy.
+  return ls;
 }
 
 template<template<typename> class Allocator>
 int inode_t<Allocator>::compare(const inode_t<Allocator> &other, bool *divergent) const
 {
-  // TODO: fscrypt / optmetadata: https://tracker.ceph.com/issues/70188
   ceph_assert(ino == other.ino);
   *divergent = false;
   if (version == other.version) {
@@ -1160,18 +1224,22 @@ int inode_t<Allocator>::compare(const inode_t<Allocator> &other, bool *divergent
         truncate_size != other.truncate_size ||
         truncate_from != other.truncate_from ||
         truncate_pending != other.truncate_pending ||
-	change_attr != other.change_attr ||
         mtime != other.mtime ||
         atime != other.atime ||
         time_warp_seq != other.time_warp_seq ||
         inline_data != other.inline_data ||
+	change_attr != other.change_attr ||
         client_ranges != other.client_ranges ||
-        !(dirstat == other.dirstat) ||
-        !(rstat == other.rstat) ||
-        !(accounted_rstat == other.accounted_rstat) ||
+        dirstat != other.dirstat ||
+        rstat != other.rstat ||
+        accounted_rstat != other.accounted_rstat ||
         file_data_version != other.file_data_version ||
         xattr_version != other.xattr_version ||
         backtrace_version != other.backtrace_version ||
+	fscrypt_auth != other.fscrypt_auth ||
+	fscrypt_file != other.fscrypt_file ||
+	fscrypt_last_block != other.fscrypt_last_block ||
+	optmetadata != other.optmetadata ||
 	remote_ino != other.remote_ino ||
 	referent_inodes != other.referent_inodes) {
       *divergent = true;

@@ -71,6 +71,7 @@
       },
       {
          "datasource": "$datasource",
+         "description": "",
          "fieldConfig": {
             "defaults": {
                "color": {
@@ -161,6 +162,7 @@
       },
       {
          "datasource": "$datasource",
+         "description": "",
          "fieldConfig": {
             "defaults": {
                "color": {
@@ -251,6 +253,7 @@
       },
       {
          "datasource": "$datasource",
+         "description": "",
          "fieldConfig": {
             "defaults": {
                "color": {
@@ -360,6 +363,7 @@
       },
       {
          "datasource": "$datasource",
+         "description": "",
          "fieldConfig": {
             "defaults": {
                "color": {
@@ -450,6 +454,7 @@
       },
       {
          "datasource": "$datasource",
+         "description": "",
          "fieldConfig": {
             "defaults": {
                "color": {
@@ -540,6 +545,7 @@
       },
       {
          "datasource": "$datasource",
+         "description": "",
          "fieldConfig": {
             "defaults": {
                "color": {
@@ -630,6 +636,7 @@
       },
       {
          "datasource": "$datasource",
+         "description": "",
          "fieldConfig": {
             "defaults": {
                "color": {
@@ -802,7 +809,7 @@
       ]
    },
    "timezone": "",
-   "title": "OSD device details",
+   "title": "Ceph OSD - Device Overview",
    "uid": "CrAHE0iZz",
    "version": 0
 }

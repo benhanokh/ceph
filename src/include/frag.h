@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*- 
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*- 
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -100,6 +101,18 @@ public:
 
   operator _frag_t() const { return _enc; }
 
+  bool is_frag_valid() const {
+    if (bits() > 24) {
+      /* bits must be in range [0,24] */
+      return false;
+    } else if ((value() & ~mask()) != 0) {
+      /* unused bits must be 0 */
+      return false;
+    } else {
+      return true;
+    }
+  }
+
   // tests
   bool contains(unsigned v) const { return ceph_frag_contains_value(_enc, v); }
   bool contains(frag_t sub) const { return ceph_frag_contains_frag(_enc, sub._enc); }
@@ -149,7 +162,7 @@ public:
 
   void dump(ceph::Formatter *f) const;
 
-  static void generate_test_instances(std::list<frag_t*>& ls);
+  static std::list<frag_t> generate_test_instances() ;
 
   bool operator<(const frag_t& b) const
   {
@@ -399,7 +412,7 @@ public:
 
   void dump(ceph::Formatter *f) const;
 
-  static void generate_test_instances(std::list<fragtree_t*>& ls);
+  static std::list<fragtree_t> generate_test_instances();
 };
 WRITE_CLASS_ENCODER(fragtree_t)
 

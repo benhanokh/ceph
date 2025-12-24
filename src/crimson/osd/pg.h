@@ -1,5 +1,5 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
-// vim: ts=8 sw=2 smarttab expandtab
+// vim: ts=8 sw=2 sts=2 expandtab expandtab
 
 #pragma once
 
@@ -602,6 +602,10 @@ public:
   void handle_activate_map(PeeringCtx &rctx);
   void handle_initialize(PeeringCtx &rctx);
 
+  void update_snap_mapper_bits(uint32_t bits) {
+    snap_mapper.update_bits(bits);
+  }
+
   void start_split_stats(const std::set<spg_t>& childpgs, std::vector<object_stat_sum_t> *out) {
     peering_state.start_split_stats(childpgs, out);
   }
@@ -631,6 +635,7 @@ public:
 
   void split_into(pg_t child_pgid, Ref<PG> child, unsigned split_bits) {
     peering_state.split_into(child_pgid, &child->peering_state, split_bits);
+    child->update_snap_mapper_bits(split_bits);
     child->snap_trimq = snap_trimq;
   }
 
@@ -670,7 +675,7 @@ public:
     bool transaction_applied,
     ObjectStore::Transaction &txn,
     bool async = false);
-  void replica_clear_repop_obc(
+  void clear_repop_obc(
     const std::vector<pg_log_entry_t> &logv);
   void handle_rep_op_reply(const MOSDRepOpReply& m);
   interruptible_future<> do_update_log_missing(
@@ -931,9 +936,17 @@ public:
     int *return_code,
     std::vector<pg_log_op_return_item_t> *op_returns) const;
   int get_recovery_op_priority() const {
-    int64_t pri = 0;
-    get_pgpool().info.opts.get(pool_opts_t::RECOVERY_OP_PRIORITY, &pri);
-    return  pri > 0 ? pri : crimson::common::local_conf()->osd_recovery_op_priority;
+    return peering_state.get_recovery_op_priority();
+  }
+  int64_t get_average_object_size() {
+    const auto& stats = get_info().stats.stats.sum;
+    auto num_objects = stats.num_objects;
+    auto num_bytes =   stats.num_bytes;
+
+    if (num_objects <= 0)
+      return 0;
+
+    return num_bytes / num_objects;
   }
   seastar::future<> mark_unfound_lost(int) {
     // TODO: see PrimaryLogPG::mark_all_unfound_lost()

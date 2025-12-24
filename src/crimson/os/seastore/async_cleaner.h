@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #pragma once
 
@@ -16,6 +16,7 @@
 #include "crimson/os/seastore/segment_manager_group.h"
 #include "crimson/os/seastore/randomblock_manager_group.h"
 #include "crimson/os/seastore/transaction.h"
+#include "crimson/os/seastore/transaction_interruptor.h"
 #include "crimson/os/seastore/segment_seq_allocator.h"
 #include "crimson/os/seastore/backref_mapping.h"
 
@@ -289,10 +290,6 @@ std::ostream &operator<<(std::ostream &, const segments_info_t &);
  */
 class ExtentCallbackInterface {
 public:
-  using base_ertr = crimson::errorator<
-    crimson::ct_error::input_output_error>;
-  using base_iertr = trans_iertr<base_ertr>;
-
   virtual ~ExtentCallbackInterface() = default;
 
   virtual shard_stats_t& get_shard_stats() = 0;
@@ -1181,12 +1178,12 @@ using RBMSpaceTrackerRef = std::unique_ptr<RBMSpaceTracker>;
 class AsyncCleaner {
 public:
   using state_t = BackgroundListener::state_t;
-  using base_ertr = crimson::errorator<
-    crimson::ct_error::input_output_error>;
 
   virtual void set_background_callback(BackgroundListener *) = 0;
 
   virtual void set_extent_callback(ExtentCallbackInterface *) = 0;
+
+  virtual const segments_info_t* get_segments_info() const = 0;
 
   virtual store_statfs_t get_stat() const = 0;
 
@@ -1355,6 +1352,10 @@ public:
     extent_callback = cb;
   }
 
+  const segments_info_t* get_segments_info() const final {
+   return &segments;
+  }
+
   store_statfs_t get_stat() const final {
     store_statfs_t st;
     st.total = segments.get_total_bytes();
@@ -1390,6 +1391,7 @@ public:
   bool should_block_io_on_clean() const final {
     assert(background_callback->is_ready());
     if (get_segments_reclaimable() == 0) {
+      // No CLOSED segments to reclaim
       return false;
     }
     auto aratio = get_projected_available_ratio();
@@ -1714,6 +1716,10 @@ public:
 
   void set_extent_callback(ExtentCallbackInterface *cb) final {
     extent_callback = cb;
+  }
+
+  const segments_info_t* get_segments_info() const final {
+   return nullptr;
   }
 
   store_statfs_t get_stat() const final {

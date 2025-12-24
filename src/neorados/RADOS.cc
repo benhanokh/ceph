@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -1381,7 +1382,7 @@ class Notifier : public async::service_list_base_hook {
   };
 
   asio::io_context::executor_type ex;
-  Objecter::LingerOp* linger_op;
+  boost::intrusive_ptr<Objecter::LingerOp> linger_op;
   // Zero for unbounded. I would not recommend this.
   const uint32_t capacity;
 
@@ -1396,18 +1397,17 @@ class Notifier : public async::service_list_base_hook {
     if (neoref) {
       neoref = nullptr;
     }
-    if (linger_op) {
-      linger_op->put();
-    }
+    linger_op.reset();
     std::unique_lock l(m);
     handlers.clear();
   }
 
 public:
 
-  Notifier(asio::io_context::executor_type ex, Objecter::LingerOp* linger_op,
+  Notifier(asio::io_context::executor_type ex,
+	   boost::intrusive_ptr<Objecter::LingerOp> linger_op,
 	   uint32_t capacity, std::shared_ptr<detail::Client> neoref)
-    : ex(ex), linger_op(linger_op), capacity(capacity),
+    : ex(ex), linger_op(std::move(linger_op)), capacity(capacity),
       svc(asio::use_service<async::service<Notifier>>(
 	    asio::query(ex, boost::asio::execution::context))),
       neoref(std::move(neoref)) {
@@ -1522,12 +1522,12 @@ void RADOS::watch_(Object o, IOContext _ioc,
   auto e = asio::prefer(get_executor(),
 			asio::execution::outstanding_work.tracked);
   impl->objecter->linger_watch(
-    linger_op, op, ioc->snapc, ceph::real_clock::now(), bl,
+    linger_op.get(), op, ioc->snapc, ceph::real_clock::now(), bl,
     asio::bind_executor(
       std::move(e),
       [c = std::move(c), cookie, linger_op](bs::error_code e, cb::list) mutable {
 	if (e) {
-	  linger_op->objecter->linger_cancel(linger_op);
+	  linger_op->objecter->linger_cancel(linger_op.get());
 	  cookie = 0;
 	}
 	asio::dispatch(asio::append(std::move(c), e, cookie));
@@ -1556,13 +1556,13 @@ void RADOS::watch_(Object o, IOContext _ioc, WatchComp c,
   auto e = asio::prefer(get_executor(),
 			asio::execution::outstanding_work.tracked);
   impl->objecter->linger_watch(
-    linger_op, op, ioc->snapc, ceph::real_clock::now(), bl,
+    linger_op.get(), op, ioc->snapc, ceph::real_clock::now(), bl,
     asio::bind_executor(
       std::move(e),
       [c = std::move(c), cookie, linger_op](bs::error_code e, cb::list) mutable {
 	if (e) {
 	  linger_op->user_data.reset();
-	  linger_op->objecter->linger_cancel(linger_op);
+	  linger_op->objecter->linger_cancel(linger_op.get());
 	  cookie = 0;
 	}
 	asio::dispatch(asio::append(std::move(c), e, cookie));
@@ -1570,8 +1570,8 @@ void RADOS::watch_(Object o, IOContext _ioc, WatchComp c,
 }
 
 void RADOS::next_notification_(uint64_t cookie, NextNotificationComp c) {
-  Objecter::LingerOp* linger_op = reinterpret_cast<Objecter::LingerOp*>(cookie);
-  if (!impl->objecter->is_valid_watch(linger_op)) {
+  boost::intrusive_ptr linger_op = impl->objecter->linger_by_cookie(cookie);
+  if (!linger_op) {
     dispatch(asio::append(std::move(c),
 			  bs::error_code(ENOTCONN, bs::generic_category()),
 			  Notification{}));
@@ -1611,9 +1611,9 @@ void RADOS::notify_ack_(Object o, IOContext _ioc,
 
 tl::expected<ceph::timespan, bs::error_code> RADOS::check_watch(uint64_t cookie)
 {
-  auto linger_op = reinterpret_cast<Objecter::LingerOp*>(cookie);
-  if (impl->objecter->is_valid_watch(linger_op)) {
-    return impl->objecter->linger_check(linger_op);
+  boost::intrusive_ptr linger_op = impl->objecter->linger_by_cookie(cookie);
+  if (linger_op) {
+    return impl->objecter->linger_check(linger_op.get());
   } else {
     return tl::unexpected(bs::error_code(ENOTCONN, bs::generic_category()));
   }
@@ -1624,7 +1624,12 @@ void RADOS::unwatch_(uint64_t cookie, IOContext _ioc,
 {
   auto ioc = reinterpret_cast<const IOContextImpl*>(&_ioc.impl);
 
-  Objecter::LingerOp *linger_op = reinterpret_cast<Objecter::LingerOp*>(cookie);
+  boost::intrusive_ptr linger_op = impl->objecter->linger_by_cookie(cookie);
+  if (!linger_op) {
+    dispatch(asio::append(std::move(c),
+			  bs::error_code(ENOTCONN, bs::generic_category())));
+    return;
+  }
 
   ObjectOperation op;
   op.watch(cookie, CEPH_OSD_WATCH_OP_UNWATCH);
@@ -1637,7 +1642,7 @@ void RADOS::unwatch_(uint64_t cookie, IOContext _ioc,
 			   [objecter = impl->objecter,
 			    linger_op, c = std::move(c)]
 			   (bs::error_code ec) mutable {
-			     objecter->linger_cancel(linger_op);
+			     objecter->linger_cancel(linger_op.get());
 			     asio::dispatch(asio::append(std::move(c), ec));
 			   }));
 }
@@ -1653,7 +1658,7 @@ struct NotifyHandler : std::enable_shared_from_this<NotifyHandler> {
   asio::io_context& ioc;
   asio::strand<asio::io_context::executor_type> strand;
   Objecter* objecter;
-  Objecter::LingerOp* op;
+  boost::intrusive_ptr<Objecter::LingerOp> op;
   RADOS::NotifyComp c;
 
   bool acked = false;
@@ -1663,10 +1668,10 @@ struct NotifyHandler : std::enable_shared_from_this<NotifyHandler> {
 
   NotifyHandler(asio::io_context& ioc,
 		Objecter* objecter,
-		Objecter::LingerOp* op,
+		boost::intrusive_ptr<Objecter::LingerOp> op,
 		RADOS::NotifyComp c)
     : ioc(ioc), strand(asio::make_strand(ioc)),
-      objecter(objecter), op(op), c(std::move(c)) {}
+      objecter(objecter), op(std::move(op)), c(std::move(c)) {}
 
   // Use bind or a lambda to pass this in.
   void handle_ack(bs::error_code ec,
@@ -1697,7 +1702,7 @@ struct NotifyHandler : std::enable_shared_from_this<NotifyHandler> {
     if (!res && ec)
       res = ec;
     if ((acked && finished) || res) {
-      objecter->linger_cancel(op);
+      objecter->linger_cancel(op.get());
       ceph_assert(c);
       bc::flat_map<std::pair<uint64_t, uint64_t>, buffer::list> reply_map;
       bc::flat_set<std::pair<uint64_t, uint64_t>> missed_set;
@@ -1739,7 +1744,7 @@ void RADOS::notify_(Object o, IOContext _ioc, bufferlist bl,
     bl, &inbl);
 
   impl->objecter->linger_notify(
-    linger_op, rd, ioc->snap_seq, inbl,
+    linger_op.get(), rd, ioc->snap_seq, inbl,
     asio::bind_executor(
       e,
       [cb](bs::error_code ec, ceph::bufferlist bl) mutable {
@@ -1868,8 +1873,8 @@ void RADOS::enumerate_objects_(IOContext _ioc, Cursor begin, Cursor end,
     });
 }
 
-void RADOS::osd_command_(int osd, std::vector<std::string> cmd,
-			 ceph::bufferlist in, CommandComp c) {
+void RADOS::osd_command_(int osd, std::vector<std::string>&& cmd,
+			 ceph::bufferlist&& in, CommandComp c) {
   impl->objecter->osd_command(
     osd, std::move(cmd), std::move(in), nullptr,
     [c = std::move(c)]
@@ -1879,8 +1884,8 @@ void RADOS::osd_command_(int osd, std::vector<std::string> cmd,
     });
 }
 
-void RADOS::pg_command_(PG pg, std::vector<std::string> cmd,
-			ceph::bufferlist in, CommandComp c) {
+void RADOS::pg_command_(PG pg, std::vector<std::string>&& cmd,
+			ceph::bufferlist&& in, CommandComp c) {
   impl->objecter->pg_command(
     pg_t{pg.seed, pg.pool}, std::move(cmd), std::move(in), nullptr,
     [c = std::move(c)]
@@ -1950,12 +1955,12 @@ void RADOS::wait_for_latest_osd_map_(SimpleOpComp c) {
   impl->objecter->wait_for_latest_osdmap(std::move(c));
 }
 
-void RADOS::mon_command_(std::vector<std::string> command,
-			 cb::list bl, std::string* outs, cb::list* outbl,
+void RADOS::mon_command_(std::vector<std::string>&& command,
+			 cb::list&& bl, std::string* outs, cb::list* outbl,
 			 SimpleOpComp c) {
 
   impl->monclient.start_mon_command(
-    command, bl,
+    std::move(command), std::move(bl),
     [c = std::move(c), outs, outbl](bs::error_code e,
 				    std::string s, cb::list bl) mutable {
       if (outs)

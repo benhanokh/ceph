@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -24,6 +25,7 @@
 
 #include "mon/MonClient.h"
 #include "common/errno.h"
+#include "common/JSONFormatter.h"
 #include "common/version.h"
 #include "mgr/Types.h"
 
@@ -178,7 +180,7 @@ ceph_send_command(BaseMgrModule *self, PyObject *args, PyObject *kwargs)
     self->py_modules->get_monc().start_mon_command(
         name,
         {cmd_json},
-        inbuf,
+        std::move(inbuf),
         &command_c->outbl,
         &command_c->outs,
         new C_OnFinisher(c, &self->py_modules->cmd_finisher));
@@ -198,7 +200,7 @@ ceph_send_command(BaseMgrModule *self, PyObject *args, PyObject *kwargs)
     self->py_modules->get_objecter().osd_command(
         osd_id,
         {cmd_json},
-        inbuf,
+        std::move(inbuf),
         &tid,
 	[command_c, f = &self->py_modules->cmd_finisher]
 	(boost::system::error_code ec, std::string s, ceph::buffer::list bl) {
@@ -227,7 +229,7 @@ ceph_send_command(BaseMgrModule *self, PyObject *args, PyObject *kwargs)
     self->py_modules->get_objecter().pg_command(
         pgid,
         {cmd_json},
-        inbuf,
+        std::move(inbuf),
         &tid,
 	[command_c, f = &self->py_modules->cmd_finisher]
 	(boost::system::error_code ec, std::string s, ceph::buffer::list bl) {
@@ -1150,6 +1152,7 @@ ceph_add_mds_perf_query(BaseMgrModule *self, PyObject *args)
   static const std::map<std::string, MDSPerfMetricSubKeyType> sub_key_types = {
     {"mds_rank", MDSPerfMetricSubKeyType::MDS_RANK},
     {"client_id", MDSPerfMetricSubKeyType::CLIENT_ID},
+    {"subvolume_path", MDSPerfMetricSubKeyType::SUBVOLUME_PATH},
   };
   static const std::map<std::string, MDSPerformanceCounterType> counter_types = {
     {"cap_hit", MDSPerformanceCounterType::CAP_HIT_METRIC},
@@ -1168,6 +1171,12 @@ ceph_add_mds_perf_query(BaseMgrModule *self, PyObject *args)
     {"stdev_write_latency", MDSPerformanceCounterType::STDEV_WRITE_LATENCY_METRIC},
     {"avg_metadata_latency", MDSPerformanceCounterType::AVG_METADATA_LATENCY_METRIC},
     {"stdev_metadata_latency", MDSPerformanceCounterType::STDEV_METADATA_LATENCY_METRIC},
+    {"subv_read_iops", MDSPerformanceCounterType::SUBV_READ_IOPS_METRIC},
+    {"subv_write_iops", MDSPerformanceCounterType::SUBV_WRITE_IOPS_METRIC},
+    {"subv_read_throughput", MDSPerformanceCounterType::SUBV_READ_THROUGHPUT_METRIC},
+    {"subv_write_throughput", MDSPerformanceCounterType::SUBV_WRITE_THROUGHPUT_METRIC},
+    {"subv_avg_read_latency", MDSPerformanceCounterType::SUBV_AVG_READ_LATENCY_METRIC},
+    {"subv_avg_write_latency", MDSPerformanceCounterType::SUBV_AVG_WRITE_LATENCY_METRIC},
   };
 
   PyObject *py_query = nullptr;

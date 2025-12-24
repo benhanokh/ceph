@@ -3,20 +3,20 @@ import yaml
 from collections import defaultdict
 import json
 import math
-import os
 import re
 import threading
 import time
 import enum
 from collections import namedtuple
+from collections import OrderedDict
 from tempfile import NamedTemporaryFile
 
 from mgr_module import CLIReadCommand, MgrModule, MgrStandbyModule, PG_STATES, Option, ServiceInfoT, HandleCommandResult, CLIWriteCommand
-from mgr_util import get_default_addr, profile_method, build_url
+from mgr_util import get_default_addr, profile_method, build_url, test_port_allocation, PortAlreadyInUse
 from orchestrator import OrchestratorClientMixin, raise_if_exception, OrchestratorError
 from rbd import RBD
 
-from typing import DefaultDict, Optional, Dict, Any, Set, cast, Tuple, Union, List, Callable, IO
+from typing import DefaultDict, Optional, Dict, Any, Set, cast, Tuple, Union, List, Callable, IO, TypeVar, Generic
 LabelValues = Tuple[str, ...]
 Number = Union[int, float]
 MetricValue = Dict[LabelValues, Number]
@@ -27,18 +27,43 @@ MetricValue = Dict[LabelValues, Number]
 
 DEFAULT_PORT = 9283
 
-
-# cherrypy likes to sys.exit on error.  don't let it take us down too!
-def os_exit_noop(status: int) -> None:
-    pass
-
-
-os._exit = os_exit_noop   # type: ignore
-
 # to access things in class Module from subclass Root.  Because
 # it's a dict, the writer doesn't need to declare 'global' for access
 
 _global_instance = None  # type: Optional[Module]
+# Configuration for port availability waiting
+PORT_WAIT_MAX_TIME = 10.0  # Maximum time to wait for port to become available
+PORT_WAIT_INTERVAL = 0.5   # Polling interval
+
+
+def _wait_for_port_available(
+    log: Any,
+    server_addr: str,
+    server_port: int,
+    max_wait_time: float = PORT_WAIT_MAX_TIME
+) -> bool:
+    """
+    Wait for a port to become available using test_port_allocation.
+
+    Returns:
+        True if port became available, False if timeout reached.
+    """
+    elapsed = 0.0
+    while elapsed < max_wait_time:
+        try:
+            test_port_allocation(server_addr, server_port)
+            return True  # Port is available
+        except PortAlreadyInUse:
+            log.debug(f'Port {server_port} still in use, waiting...')
+            time.sleep(PORT_WAIT_INTERVAL)
+            elapsed += PORT_WAIT_INTERVAL
+        except Exception as e:
+            # For other errors (e.g., invalid address), just return and let CherryPy handle it
+            log.debug(f'Port check failed with: {e}')
+            return True
+    return False
+
+
 cherrypy.config.update({
     'response.headers.server': 'Ceph-Prometheus'
 })
@@ -89,6 +114,11 @@ OSD_METADATA = ('back_iface', 'ceph_daemon', 'cluster_addr', 'device_class',
                 'front_iface', 'hostname', 'objectstore', 'public_addr',
                 'ceph_version')
 
+
+OSD_NEARFULL_RATIO = ()
+
+OSD_FULL_RATIO = ()
+
 OSD_STATUS = ['weight', 'up', 'in']
 
 OSD_STATS = ['apply_latency_ms', 'commit_latency_ms']
@@ -100,6 +130,8 @@ RGW_METADATA = ('ceph_daemon', 'hostname', 'ceph_version', 'instance_id')
 RBD_MIRROR_METADATA = ('ceph_daemon', 'id', 'instance_id', 'hostname',
                        'ceph_version')
 
+RBD_IMAGE_METADATA = ('pool_id', 'image_name')
+
 DISK_OCCUPATION = ('ceph_daemon', 'device', 'db_device',
                    'wal_device', 'instance', 'devices', 'device_ids')
 
@@ -107,6 +139,8 @@ NUM_OBJECTS = ['degraded', 'misplaced', 'unfound']
 
 SMB_METADATA = ('smb_version', 'volume',
                 'subvolume_group', 'subvolume', 'netbiosname', 'share')
+
+CEPHADM_DAEMON_STATUS = ('service_type', 'daemon_name', 'hostname', 'service_name')
 
 alert_metric = namedtuple('alert_metric', 'name description')
 HEALTH_CHECKS = [
@@ -150,6 +184,25 @@ class HealthCheckEvent:
         return self.__dict__
 
 
+K = TypeVar('K')
+V = TypeVar('V')
+
+
+class LRUCacheDict(OrderedDict[K, V], Generic[K, V]):
+    maxsize: int
+
+    def __init__(self, maxsize: int, *args: Any, **kwargs: Any) -> None:
+        self.maxsize = maxsize
+        super().__init__(*args, **kwargs)
+
+    def __setitem__(self, key: K, value: V) -> None:
+        if key in self:
+            self.move_to_end(key)
+        elif len(self) >= self.maxsize:
+            self.popitem(last=False)  # drop oldest
+        super().__setitem__(key, value)
+
+
 class HealthHistory:
     kv_name = 'health_history'
     titles = "{healthcheck_name:<24}  {first_seen:<20}  {last_seen:<20}  {count:>5}  {active:^6}"
@@ -158,7 +211,8 @@ class HealthHistory:
     def __init__(self, mgr: MgrModule):
         self.mgr = mgr
         self.lock = threading.Lock()
-        self.healthcheck: Dict[str, HealthCheckEvent] = {}
+        self.max_entries = cast(int, self.mgr.get_localized_module_option('healthcheck_history_max_entries', 1000))
+        self.healthcheck: LRUCacheDict[str, HealthCheckEvent] = LRUCacheDict(maxsize=self.max_entries)
         self._load()
 
     def _load(self) -> None:
@@ -188,7 +242,7 @@ class HealthHistory:
         """Reset the healthcheck history."""
         with self.lock:
             self.mgr.set_store(self.kv_name, "{}")
-            self.healthcheck = {}
+            self.healthcheck.clear()
 
     def save(self) -> None:
         """Save the current in-memory healthcheck history to the KV store."""
@@ -203,43 +257,43 @@ class HealthHistory:
         """
 
         current_checks = health_checks.get('checks', {})
-        changes_made = False
-
-        # first turn off any active states we're tracking
-        for seen_check in self.healthcheck:
-            check = self.healthcheck[seen_check]
-            if check.active and seen_check not in current_checks:
-                check.active = False
-                changes_made = True
-
-        # now look for any additions to track
         now = time.time()
-        for name, info in current_checks.items():
-            if name not in self.healthcheck:
-                # this healthcheck is new, so start tracking it
-                changes_made = True
-                self.healthcheck[name] = HealthCheckEvent(
-                    name=name,
-                    severity=info.get('severity'),
-                    first_seen=now,
-                    last_seen=now,
-                    count=1,
-                    active=True
-                )
-            else:
-                # seen it before, so update its metadata
-                check = self.healthcheck[name]
-                if check.active:
-                    # check has been registered as active already, so skip
-                    continue
-                else:
-                    check.last_seen = now
-                    check.count += 1
-                    check.active = True
-                    changes_made = True
+        with self.lock:
+            changes_made = False
+            names = set(self.healthcheck) | set(current_checks)
 
-        if changes_made:
-            self.save()
+            for name in names:
+                present = name in current_checks
+                check = self.healthcheck.get(name)
+                if check is None:
+                    if present:
+                        info = current_checks[name]
+                        self.healthcheck[name] = HealthCheckEvent(
+                            name=name,
+                            severity=info.get('severity'),
+                            first_seen=now,
+                            last_seen=now,
+                            count=1,
+                            active=True
+                        )
+                        changes_made = True
+
+                    continue
+
+                if present:
+                    if not check.active:
+                        check.count += 1
+                        changes_made = True
+
+                    check.last_seen = now
+                    check.active = True
+                else:
+                    if check.active:
+                        check.active = False
+                        changes_made = True
+
+            if changes_made:
+                self.save()
 
     def __str__(self) -> str:
         """Print the healthcheck history.
@@ -601,7 +655,14 @@ class Module(MgrModule, OrchestratorClientMixin):
             desc='Do not include perf-counters in the metrics output',
             long_desc='Gathering perf-counters from a single Prometheus exporter can degrade ceph-mgr performance, especially in large clusters. Instead, Ceph-exporter daemons are now used by default for perf-counter gathering. This should only be disabled when no ceph-exporters are deployed.',
             runtime=True
-        )
+        ),
+        Option(
+            name='healthcheck_history_max_entries',
+            type='int',
+            default=1000,
+            desc='Maximum number of health check history entries to keep',
+            runtime=True
+        ),
     ]
 
     STALE_CACHE_FAIL = 'fail'
@@ -613,6 +674,7 @@ class Module(MgrModule, OrchestratorClientMixin):
         self.cert_file: IO[bytes]
         self.metrics = self._setup_static_metrics()
         self.shutdown_event = threading.Event()
+        self.config_change_event = threading.Event()
         self.collect_lock = threading.Lock()
         self.collect_time = 0.0
         self.scrape_interval: float = 15.0
@@ -703,6 +765,18 @@ class Module(MgrModule, OrchestratorClientMixin):
             'OSD Metadata',
             OSD_METADATA
         )
+        metrics['osd_nearfull_ratio'] = Metric(
+            'gauge',
+            'osd_nearfull_ratio',
+            'OSD cluster-wide nearfull ratio',
+            ()
+        )
+        metrics['osd_full_ratio'] = Metric(  # <-- Add this block
+            'gauge',
+            'osd_full_ratio',
+            'OSD cluster-wide full ratio',
+            ()
+        )
 
         # The reason for having this separate to OSD_METADATA is
         # so that we can stably use the same tag names that
@@ -743,6 +817,13 @@ class Module(MgrModule, OrchestratorClientMixin):
             RBD_MIRROR_METADATA
         )
 
+        metrics['rbd_image_metadata'] = Metric(
+            'untyped',
+            'rbd_image_metadata',
+            'RBD Image Metadata',
+            RBD_IMAGE_METADATA
+        )
+
         metrics['pg_total'] = Metric(
             'gauge',
             'pg_total',
@@ -776,6 +857,12 @@ class Module(MgrModule, OrchestratorClientMixin):
             'smb_metadata',
             'SMB Metadata',
             SMB_METADATA
+        )
+        metrics['cephadm_daemon_status'] = Metric(
+            'gauge',
+            'cephadm_daemon_status',
+            'Status of cephadm daemons (0=stopped, 1=running, 2=errored)',
+            CEPHADM_DAEMON_STATUS
         )
 
         for flag in OSD_FLAGS:
@@ -884,18 +971,10 @@ class Module(MgrModule, OrchestratorClientMixin):
     def config_notify(self) -> None:
         """
         This method is called whenever one of our config options is changed.
+        Signal the serve loop to restart the engine with the new configuration.
         """
-        # https://stackoverflow.com/questions/7254845/change-cherrypy-port-and-restart-web-server
-        # if we omit the line: cherrypy.server.httpserver = None
-        # then the cherrypy server is not restarted correctly
-        self.log.info('Restarting engine...')
-        cherrypy.engine.stop()
-        cherrypy.server.httpserver = None
-        server_addr = cast(str, self.get_localized_module_option('server_addr', get_default_addr()))
-        server_port = cast(int, self.get_localized_module_option('server_port', DEFAULT_PORT))
-        self.configure(server_addr, server_port)
-        cherrypy.engine.start()
-        self.log.info('Engine started.')
+        self.log.info('Config changed, signaling serve loop to restart engine')
+        self.config_change_event.set()
 
     @profile_method()
     def get_health(self) -> None:
@@ -966,6 +1045,30 @@ class Module(MgrModule, OrchestratorClientMixin):
                     pool['recovery_rate'].get(stat, 0),
                     (pool['pool_id'],)
                 )
+
+    @profile_method()
+    def set_cephadm_daemon_status_metrics(self) -> None:
+        try:
+            daemons = raise_if_exception(self.list_daemons())
+            for daemon in daemons:
+                service_type = getattr(daemon, 'daemon_type', '')
+                daemon_name = getattr(daemon, 'daemon_name', '')
+                hostname = str(getattr(daemon, 'hostname', ''))
+                status = getattr(daemon, 'status', '')
+                service_name_attr = getattr(daemon, 'service_name', '')
+                service_name = service_name_attr() if callable(service_name_attr) else str(service_name_attr)
+
+                self.metrics['cephadm_daemon_status'].set(
+                    int(status),
+                    (
+                        service_type,
+                        daemon_name,
+                        hostname,
+                        service_name,
+                    )
+                )
+        except Exception as e:
+            self.log.error(f"Failed to collect cephadm daemon status: {e}")
 
     @profile_method()
     def get_df(self) -> None:
@@ -1138,6 +1241,14 @@ class Module(MgrModule, OrchestratorClientMixin):
     @profile_method()
     def get_metadata_and_osd_status(self) -> None:
         osd_map = self.get('osd_map')
+
+        cluster_nearfull_ratio = osd_map.get('nearfull_ratio', None)
+        cluster_full_ratio = osd_map.get('full_ratio', None)
+        if cluster_nearfull_ratio is not None:
+            self.metrics['osd_nearfull_ratio'].set(cluster_nearfull_ratio, ('cluster',))
+        if cluster_full_ratio is not None:
+            self.metrics['osd_full_ratio'].set(cluster_full_ratio, ('cluster',))
+
         osd_flags = osd_map['flags'].split(',')
         for flag in OSD_FLAGS:
             self.metrics['osd_flag_{}'.format(flag)].set(
@@ -1335,6 +1446,20 @@ class Module(MgrModule, OrchestratorClientMixin):
                 self.metrics['rbd_mirror_metadata'].set(
                     1, rbd_mirror_metadata
                 )
+        try:
+            rbd = RBD()
+            for pool in osd_map['pools']:
+                pool_id = pool['pool']
+                pool_name = pool['pool_name']
+                if 'rbd' in pool.get('application_metadata', {}):
+                    with self.rados.open_ioctx(pool_name) as ioctx:
+                        for image_meta in rbd.list2(ioctx):
+                            image_name = image_meta['name']
+                            self.metrics['rbd_image_metadata'].set(
+                                1, (str(pool_id), image_name)
+                            )
+        except Exception as e:
+            self.log.error(f"Failed to collect RBD image metadata: {e}")
 
     @profile_method()
     def get_num_objects(self) -> None:
@@ -1714,9 +1839,9 @@ class Module(MgrModule, OrchestratorClientMixin):
     def get_smb_metadata(self) -> None:
         try:
             mgr_map = self.get('mgr_map')
-            available_modules = [m['name'] for m in mgr_map['available_modules']]
-            if 'smb' not in available_modules:
-                self.log.debug("SMB module is not available, skipping SMB metadata collection")
+            enabled_modules = mgr_map['modules']
+            if 'smb' not in enabled_modules:
+                self.log.debug("SMB module is not enabled, skipping SMB metadata collection")
                 return
 
             if not self.available()[0]:
@@ -1792,6 +1917,7 @@ class Module(MgrModule, OrchestratorClientMixin):
         self.get_num_objects()
         self.get_all_daemon_health_metrics()
         self.get_smb_metadata()
+        self.set_cephadm_daemon_status_metrics()
 
         if not self.get_module_option('exclude_perf_counters'):
             self.get_perf_counters()
@@ -1836,6 +1962,7 @@ class Module(MgrModule, OrchestratorClientMixin):
     def configure(self, server_addr: str, server_port: int) -> None:
         cmd = {'prefix': 'orch get-security-config'}
         ret, out, _ = self.mon_command(cmd)
+
         if ret == 0 and out is not None:
             try:
                 security_config = json.loads(out)
@@ -1843,8 +1970,11 @@ class Module(MgrModule, OrchestratorClientMixin):
                     self.setup_tls_config(server_addr, server_port)
                     return
             except Exception as e:
-                self.log.exception(f'Failed to setup cephadm based secure monitoring stack: {e}\n',
-                                   'Falling back to default configuration')
+                self.log.exception(
+                    'Failed to setup cephadm based secure monitoring stack: %s\n'
+                    'Falling back to default configuration',
+                    e
+                )
 
         # In any error fallback to plain http mode
         self.setup_default_config(server_addr, server_port)
@@ -1857,6 +1987,13 @@ class Module(MgrModule, OrchestratorClientMixin):
             'server.ssl_module': None,
             'server.ssl_certificate': None,
             'server.ssl_private_key': None,
+            'tools.gzip.on': True,
+            'tools.gzip.mime_types': [
+                'text/plain',
+                'text/html',
+                'application/json',
+            ],
+            'tools.gzip.compress_level': 6,
         })
         # Publish the URI that others may use to access the service we're about to start serving
         self.set_uri(build_url(scheme='http', host=self.get_server_addr(),
@@ -1898,6 +2035,13 @@ class Module(MgrModule, OrchestratorClientMixin):
             'server.ssl_module': 'builtin',
             'server.ssl_certificate': cert_file_path,
             'server.ssl_private_key': key_file_path,
+            'tools.gzip.on': True,
+            'tools.gzip.mime_types': [
+                'text/plain',
+                'text/html',
+                'application/json',
+            ],
+            'tools.gzip.compress_level': 6,
         })
         # Publish the URI that others may use to access the service we're about to start serving
         self.set_uri(build_url(scheme='https', host=self.get_server_addr(),
@@ -1932,10 +2076,9 @@ class Module(MgrModule, OrchestratorClientMixin):
 
             @staticmethod
             def _metrics(instance: 'Module') -> Optional[str]:
-                if not self.cache:
-                    self.log.debug('Cache disabled, collecting and returning without cache')
-                    cherrypy.response.headers['Content-Type'] = 'text/plain'
-                    return self.collect()
+                if not instance.cache:
+                    instance.log.debug('Cache disabled, collecting and returning without cache')
+                    return instance.collect()
 
                 # Return cached data if available
                 if not instance.collect_cache:
@@ -1943,7 +2086,6 @@ class Module(MgrModule, OrchestratorClientMixin):
 
                 def respond() -> Optional[str]:
                     assert isinstance(instance, Module)
-                    cherrypy.response.headers['Content-Type'] = 'text/plain'
                     return instance.collect_cache
 
                 if instance.collect_time < instance.scrape_interval:
@@ -2000,12 +2142,55 @@ class Module(MgrModule, OrchestratorClientMixin):
         self.configure(server_addr, server_port)
 
         cherrypy.tree.mount(Root(), "/")
+
+        # Wait for port to be available before starting (handles standby->active transition)
+        if not _wait_for_port_available(self.log, server_addr, server_port):
+            self.log.warning(f'Port {server_port} still in use after waiting, attempting to start anyway')
         self.log.info('Starting engine...')
-        cherrypy.engine.start()
+        try:
+            cherrypy.engine.start()
+        except Exception as e:
+            self.log.error(f'Failed to start engine: {e}')
+            return
         self.log.info('Engine started.')
 
-        # wait for the shutdown event
-        self.shutdown_event.wait()
+        # Main event loop: handle both shutdown and config change events
+        while True:
+            # Wait for either shutdown or config change event (check every 0.5s)
+            while not self.shutdown_event.is_set() and not self.config_change_event.is_set():
+                self.shutdown_event.wait(timeout=0.5)
+
+            if self.shutdown_event.is_set():
+                # Clean shutdown requested
+                break
+
+            if self.config_change_event.is_set():
+                # Config changed, restart engine with new configuration
+                self.config_change_event.clear()
+                self.log.info('Restarting engine due to config change...')
+
+                # https://stackoverflow.com/questions/7254845/change-cherrypy-port-and-restart-web-server
+                # if we omit the line: cherrypy.server.httpserver = None
+                # then the cherrypy server is not restarted correctly
+                cherrypy.engine.stop()
+                cherrypy.server.httpserver = None
+
+                # Re-read configuration
+                server_addr = cast(str, self.get_localized_module_option('server_addr', get_default_addr()))
+                server_port = cast(int, self.get_localized_module_option('server_port', DEFAULT_PORT))
+                self.configure(server_addr, server_port)
+
+                # Wait for port to be available before starting
+                if not _wait_for_port_available(self.log, server_addr, server_port):
+                    self.log.warning(f'Port {server_port} still in use after waiting, attempting to start anyway')
+
+                try:
+                    cherrypy.engine.start()
+                    self.log.info('Engine restarted.')
+                except Exception as e:
+                    self.log.error(f'Failed to restart engine: {e}')
+
+        # Cleanup on shutdown
         self.shutdown_event.clear()
         # tell metrics collection thread to stop collecting new metrics
         self.metrics_thread.stop()
@@ -2061,10 +2246,10 @@ class StandbyModule(MgrStandbyModule):
         self.shutdown_event = threading.Event()
 
     def serve(self) -> None:
-        server_addr = self.get_localized_module_option(
-            'server_addr', get_default_addr())
-        server_port = self.get_localized_module_option(
-            'server_port', DEFAULT_PORT)
+        server_addr = cast(str, self.get_localized_module_option(
+            'server_addr', get_default_addr()))
+        server_port = cast(int, self.get_localized_module_option(
+            'server_port', DEFAULT_PORT))
         self.log.info("server_addr: %s server_port: %s" %
                       (server_addr, server_port))
         cherrypy.config.update({
@@ -2096,13 +2281,17 @@ class StandbyModule(MgrStandbyModule):
 
             @cherrypy.expose
             def metrics(self) -> str:
-                cherrypy.response.headers['Content-Type'] = 'text/plain'
                 return ''
 
         cherrypy.tree.mount(Root(), '/', {})
+
+        # Wait for port to be available before starting
+        if not _wait_for_port_available(self.log, server_addr, server_port):
+            self.log.warning(f'Port {server_port} still in use after waiting, attempting to start anyway')
         self.log.info('Starting engine...')
         cherrypy.engine.start()
         self.log.info('Engine started.')
+
         # Wait for shutdown event
         self.shutdown_event.wait()
         self.shutdown_event.clear()

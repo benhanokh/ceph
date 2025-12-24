@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #pragma once
 
@@ -22,7 +22,12 @@
 #include "include/uuid.h"
 #include "include/rados.h"
 
+#include "crimson/common/errorator.h"
+
 namespace crimson::os::seastore {
+
+using base_ertr = crimson::errorator<
+  crimson::ct_error::input_output_error>;
 
 class cache_hint_t {
   enum hint_t {
@@ -1819,6 +1824,9 @@ public:
     reserved_data_len = 0;
   }
 };
+constexpr object_data_t get_null_object_data() {
+  return object_data_t{L_ADDR_NULL, 0};
+}
 
 struct __attribute__((packed)) object_data_le_t {
   laddr_le_t reserved_data_base = laddr_le_t(L_ADDR_NULL);
@@ -2102,6 +2110,7 @@ struct alloc_blk_t {
       extent_len_t len,
       extent_types_t type) {
     assert(is_backref_mapped_type(type) ||
+	   is_backref_node(type) ||
 	   is_retired_placeholder_type(type));
     return alloc_blk_t(paddr, L_ADDR_NULL, len, type);
   }

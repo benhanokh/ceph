@@ -240,12 +240,22 @@ class PgAutoscaler(MgrModule):
     def set_scaling_threshold(self, num: float) -> Tuple[int, str, str]:
         """
         set the autoscaler threshold 
-        A.K.A. the factor by which the new PG_NUM must vary from the existing PG_NUM
+        A.K.A. the factor by which the new pg_num must vary
+        from the existing pg_num before action is taken
         """
         if num < 1.0:
             return 22, "", "threshold cannot be set less than 1.0"
         self.set_module_option("threshold", num)
         return 0, "threshold updated", ""
+
+    @CLIReadCommand("osd pool get threshold")
+    def get_scaling_threshold(self) -> Tuple[int, str, str]:
+        """
+        return the autoscaler threshold value
+        A.K.A. the factor by which the new pg_num must vary
+        from the existing pg_num before action is taken
+        """
+        return 0, str(self.get_module_option('threshold')), ''
 
     def complete_all_progress_events(self) -> None:
         for pool_id in list(self._event):
@@ -517,6 +527,17 @@ class PgAutoscaler(MgrModule):
         ))
         return final_ratio, pool_pg_target, final_pg_target
 
+    def get_dynamic_threshold(
+            self,
+            final_pg_num: int,
+            default_threshold: float,
+    ) -> float:
+        if final_pg_num in (512, 1024):
+            return 1.0
+        elif final_pg_num == 2048:
+            return 2.0
+        return default_threshold
+
     def _get_pool_pg_targets(
             self,
             osdmap: OSDMap,
@@ -605,12 +626,27 @@ class PgAutoscaler(MgrModule):
                 continue
 
             adjust = False
-            if (final_pg_target > p['pg_num_target'] * threshold or
-                    final_pg_target < p['pg_num_target'] / threshold) and \
-                    final_ratio >= 0.0 and \
-                    final_ratio <= 1.0 and \
-                    p['pg_autoscale_mode'] == 'on':
-                adjust = True
+
+            # Dynamic threshold only applies to scaling UP, otherwise use the default threshold.
+            if final_pg_target is not None and \
+               final_pg_target > p['pg_num_target']:
+                dynamic_threshold = self.get_dynamic_threshold(final_pg_target, threshold)
+                adjust = final_pg_target > p['pg_num_target'] * dynamic_threshold
+            else:
+                adjust = final_pg_target < p['pg_num_target'] / threshold
+
+            if adjust and \
+               final_ratio >= 0.0 and \
+               final_ratio <= 1.0 and \
+               p['pg_autoscale_mode'] == 'on':
+                    adjust = True
+            else:
+                if final_pg_target != p['pg_num_target']:
+                    self.log.warning("pool %s won't scale because recommended PG_NUM target"
+                                     " value varies from current PG_NUM value by"
+                                     " more than '%f' scaling threshold",
+                                     pool_name,
+                                     dynamic_threshold if final_pg_target > p['pg_num_target'] else threshold)
 
             assert pool_pg_target is not None
             ret.append({

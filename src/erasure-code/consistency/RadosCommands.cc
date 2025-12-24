@@ -29,8 +29,8 @@ int RadosCommands::get_primary_osd(const std::string& pool_name,
   std::ostringstream oss;
   formatter.get()->flush(oss);
 
-  ceph::bufferlist inbl, outbl;
-  int rc = rados.mon_command(oss.str(), inbl, &outbl, nullptr);
+  ceph::bufferlist outbl;
+  int rc = rados.mon_command(oss.str(), {}, &outbl, nullptr);
   ceph_assert(rc == 0);
 
   JSONParser p;
@@ -54,14 +54,14 @@ int RadosCommands::get_primary_osd(const std::string& pool_name,
  */
 bool RadosCommands::get_pool_allow_ec_optimizations(const std::string& pool_name)
 {
-  ceph::messaging::osd::OSDPoolGetRequest osd_pool_get_request{pool_name, "allow_ec_optimizations"};
+  ceph::messaging::osd::OSDPoolGetRequest osd_pool_get_request{pool_name, "all"};
   encode_json("OSDPoolGetRequest", osd_pool_get_request, formatter.get());
 
   std::ostringstream oss;
   formatter.get()->flush(oss);
 
-  ceph::bufferlist inbl, outbl;
-  int rc = rados.mon_command(oss.str(), inbl, &outbl, nullptr);
+  ceph::bufferlist outbl;
+  int rc = rados.mon_command(oss.str(), {}, &outbl, nullptr);
   ceph_assert(rc == 0);
 
   JSONParser p;
@@ -71,7 +71,7 @@ bool RadosCommands::get_pool_allow_ec_optimizations(const std::string& pool_name
   ceph::messaging::osd::OSDPoolGetReply osd_pool_get_reply;
   osd_pool_get_reply.decode_json(&p);
 
-  return osd_pool_get_reply.allow_ec_optimizations;
+  return osd_pool_get_reply.allow_ec_optimizations.value_or(false);
 }
 
 /**
@@ -83,14 +83,14 @@ bool RadosCommands::get_pool_allow_ec_optimizations(const std::string& pool_name
  */
 std::string RadosCommands::get_pool_ec_profile_name(const std::string& pool_name)
 {
-  ceph::messaging::osd::OSDPoolGetRequest osd_pool_get_request{pool_name};
+  ceph::messaging::osd::OSDPoolGetRequest osd_pool_get_request{pool_name, "all"};
   encode_json("OSDPoolGetRequest", osd_pool_get_request, formatter.get());
 
   std::ostringstream oss;
   formatter.get()->flush(oss);
 
-  ceph::bufferlist inbl, outbl;
-  int rc = rados.mon_command(oss.str(), inbl, &outbl, nullptr);
+  ceph::bufferlist outbl;
+  int rc = rados.mon_command(oss.str(), {}, &outbl, nullptr);
   ceph_assert(rc == 0);
 
   JSONParser p;
@@ -100,7 +100,12 @@ std::string RadosCommands::get_pool_ec_profile_name(const std::string& pool_name
   ceph::messaging::osd::OSDPoolGetReply osd_pool_get_reply;
   osd_pool_get_reply.decode_json(&p);
 
-  return osd_pool_get_reply.erasure_code_profile;
+  if (!osd_pool_get_reply.erasure_code_profile) {
+    throw std::runtime_error("No profile for given pool. "
+                             "Is it an Erasure Coded pool?");
+  }
+
+  return *osd_pool_get_reply.erasure_code_profile;
 }
 
 /**
@@ -118,8 +123,8 @@ ceph::ErasureCodeProfile RadosCommands::get_ec_profile_for_pool(const std::strin
   std::ostringstream oss;
   formatter.get()->flush(oss);
 
-  ceph::bufferlist inbl, outbl;
-  int rc = rados.mon_command(oss.str(), inbl, &outbl, nullptr);
+  ceph::bufferlist outbl;
+  int rc = rados.mon_command(oss.str(), {}, &outbl, nullptr);
   ceph_assert(rc == 0);
 
   // Parse the string output into an ErasureCodeProfile
@@ -165,8 +170,8 @@ void RadosCommands::inject_parity_read_on_primary_osd(const std::string& pool_na
   std::ostringstream oss;
   formatter.get()->flush(oss);
 
-  ceph::bufferlist inbl, outbl;
-  int rc = rados.osd_command(primary_osd, oss.str(), inbl, &outbl, nullptr);
+  ceph::bufferlist outbl;
+  int rc = rados.osd_command(primary_osd, oss.str(), {}, &outbl, nullptr);
   ceph_assert(rc == 0);
 }
 
@@ -187,7 +192,7 @@ void RadosCommands::inject_clear_parity_read_on_primary_osd(const std::string& p
   std::ostringstream oss;
   formatter.get()->flush(oss);
 
-  ceph::bufferlist inbl, outbl;
-  int rc = rados.osd_command(primary_osd, oss.str(), inbl, &outbl, nullptr);
+  ceph::bufferlist outbl;
+  int rc = rados.osd_command(primary_osd, oss.str(), {}, &outbl, nullptr);
   ceph_assert(rc == 0);
 }

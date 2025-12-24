@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #pragma once
 
@@ -45,6 +45,17 @@ public:
   LBAMapping &operator=(const LBAMapping &) = default;
   LBAMapping &operator=(LBAMapping &&) = default;
   ~LBAMapping() = default;
+
+  // whether the removal of this mapping would cause
+  // other mappings to be removed.
+  //
+  // Note that this should only be called on complete
+  // indirect mappings
+  bool would_cascade_remove() const {
+    assert(is_indirect());
+    assert(is_complete_indirect());
+    return direct_cursor->get_refcount() == 1;
+  }
 
   // whether the mapping corresponds to a pending extent
   bool is_pending() const {
@@ -100,6 +111,10 @@ public:
   bool is_zero_reserved() const {
     return !is_indirect() && get_val().is_zero();
   }
+  // true if the mapping corresponds to real data
+  bool is_real() const {
+    return !is_indirect() && !get_val().is_zero();
+  }
 
   extent_len_t get_length() const {
     assert(!is_null());
@@ -133,6 +148,10 @@ public:
     return direct_cursor->get_laddr();
   }
 
+  laddr_t get_end() const {
+    return (get_key() + get_length()).checked_to_laddr();
+  }
+
    // An lba pin may be indirect, see comments in lba/btree_lba_manager.h
   laddr_t get_intermediate_key() const {
     assert(is_indirect());
@@ -163,15 +182,17 @@ public:
 
   LogicalChildNodeRef peek_logical_extent(Transaction &t) const;
 
-  using refresh_iertr = LBACursor::base_iertr;
+  // [[deprecated]]
   //TODO: should be changed to return future<> once all calls
   //	  to refresh are through co_await. We return LBAMapping
   //	  for now to avoid mandating the callers to make sure
   //	  the life of the lba mapping survives the refresh.
-  refresh_iertr::future<LBAMapping> refresh();
+  base_iertr::future<LBAMapping> refresh();
 
-  using next_iertr = LBACursor::base_iertr;
-  next_iertr::future<LBAMapping> next();
+  // once the deprecated refresh is removed we can rename this to refresh
+  base_iertr::future<> co_refresh();
+
+  base_iertr::future<LBAMapping> next();
 
 private:
   friend lba::BtreeLBAManager;

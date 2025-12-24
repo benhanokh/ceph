@@ -39,7 +39,9 @@ import {
   PanelModule,
   LayoutModule,
   TilesModule,
-  PopoverModule
+  PopoverModule,
+  InlineLoadingModule,
+  TagModule
 } from 'carbon-components-angular';
 import EditIcon from '@carbon/icons/es/edit/20';
 import CodeIcon from '@carbon/icons/es/code/16';
@@ -68,7 +70,6 @@ import { ModalComponent } from './modal/modal.component';
 import { NotificationsSidebarComponent } from './notifications-sidebar/notifications-sidebar.component';
 import { OrchestratorDocPanelComponent } from './orchestrator-doc-panel/orchestrator-doc-panel.component';
 import { PwdExpirationNotificationComponent } from './pwd-expiration-notification/pwd-expiration-notification.component';
-import { RefreshSelectorComponent } from './refresh-selector/refresh-selector.component';
 import { SelectBadgesComponent } from './select-badges/select-badges.component';
 import { SelectComponent } from './select/select.component';
 import { SparklineComponent } from './sparkline/sparkline.component';
@@ -90,6 +91,7 @@ import { ChartsModule } from '@carbon/charts-angular';
 import { InlineMessageComponent } from './inline-message/inline-message.component';
 import { IconComponent } from './icon/icon.component';
 import { DetailsCardComponent } from './details-card/details-card.component';
+import { ToastComponent } from './notification-toast/notification-toast.component';
 
 // Icons
 import InfoIcon from '@carbon/icons/es/information/16';
@@ -140,7 +142,9 @@ import CloseIcon from '@carbon/icons/es/close/16';
     ChartsModule,
     LayoutModule,
     TilesModule,
-    PopoverModule
+    PopoverModule,
+    InlineLoadingModule,
+    TagModule
   ],
   declarations: [
     SparklineComponent,
@@ -157,7 +161,6 @@ import CloseIcon from '@carbon/icons/es/close/16';
     GrafanaComponent,
     SelectComponent,
     BackButtonComponent,
-    RefreshSelectorComponent,
     ConfigOptionComponent,
     AlertPanelComponent,
     FormModalComponent,
@@ -186,7 +189,8 @@ import CloseIcon from '@carbon/icons/es/close/16';
     SidePanelComponent,
     IconComponent,
     InlineMessageComponent,
-    DetailsCardComponent
+    DetailsCardComponent,
+    ToastComponent
   ],
   providers: [provideCharts(withDefaultRegisterables())],
   exports: [
@@ -202,7 +206,6 @@ import CloseIcon from '@carbon/icons/es/close/16';
     LanguageSelectorComponent,
     GrafanaComponent,
     SelectComponent,
-    RefreshSelectorComponent,
     ConfigOptionComponent,
     AlertPanelComponent,
     PwdExpirationNotificationComponent,
@@ -229,7 +232,8 @@ import CloseIcon from '@carbon/icons/es/close/16';
     SidePanelComponent,
     IconComponent,
     InlineMessageComponent,
-    DetailsCardComponent
+    DetailsCardComponent,
+    ToastComponent
   ]
 })
 export class ComponentsModule {

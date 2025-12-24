@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #pragma once
 
@@ -18,6 +18,7 @@
 #include "crimson/os/seastore/seastore_types.h"
 #include "crimson/os/seastore/segment_manager.h"
 #include "crimson/os/seastore/transaction.h"
+#include "crimson/os/seastore/transaction_interruptor.h"
 #include "crimson/os/seastore/linked_tree_node.h"
 #include "crimson/os/seastore/extent_pinboard.h"
 
@@ -102,12 +103,9 @@ class SegmentProvider;
  * - TRACE: DEBUG details
  * - seastore_t logs
  */
-class Cache : public ExtentTransViewRetriever {
+class Cache : public ExtentTransViewRetriever,
+	      public RetiredExtentPlaceholderInvalidater {
 public:
-  using base_ertr = crimson::errorator<
-    crimson::ct_error::input_output_error>;
-  using base_iertr = trans_iertr<base_ertr>;
-
   Cache(ExtentPlacementManager &epm);
   ~Cache();
 
@@ -127,7 +125,6 @@ public:
       get_dummy_ordering_handle(),
       is_weak,
       src,
-      last_commit,
       [this](Transaction& t) {
         return on_transaction_destruct(t);
       },
@@ -147,7 +144,7 @@ public:
       SUBDEBUGT(seastore_t, "reset", t);
       ++(get_by_src(stats.trans_created_by_src, t.get_src()));
     }
-    t.reset_preserve_handle(last_commit);
+    t.reset_preserve_handle();
   }
 
   /// Declare ref retired in t
@@ -163,8 +160,8 @@ public:
   retire_extent_ret retire_extent_addr(
     Transaction &t, paddr_t addr, extent_len_t length);
 
-  void retire_absent_extent_addr(
-    Transaction &t, paddr_t addr, extent_len_t length);
+  CachedExtentRef retire_absent_extent_addr(
+    Transaction &t, laddr_t laddr, paddr_t addr, extent_len_t length);
 
   /**
    * get_root
@@ -369,6 +366,18 @@ public:
     }
   }
 
+  void invalidate_retired_placeholder(
+    Transaction &t,
+    CachedExtent &retired_placeholder,
+    CachedExtent &extent) {
+    // replace placeholder in transactions
+    while (!retired_placeholder.read_transactions.empty()) {
+      auto t = retired_placeholder.read_transactions.begin()->t;
+      t->replace_placeholder(retired_placeholder, extent);
+    }
+    retired_placeholder.set_invalid(t);
+  }
+
   /*
    * get_absent_extent
    *
@@ -382,41 +391,49 @@ public:
     extent_len_t length,
     extent_len_t partial_off,
     extent_len_t partial_len,
-    Func &&extent_init_func) {
-    CachedExtentRef ret;
+    Func &&extent_init_func,
+    uint32_t pin_crc = CRC_NULL) {
     LOG_PREFIX(Cache::get_absent_extent);
 
 #ifndef NDEBUG
-    auto r = t.get_extent(offset, &ret);
-    if (r != Transaction::get_extent_ret::ABSENT) {
-      SUBERRORT(seastore_cache, "unexpected non-absent extent {}", t, *ret);
-      ceph_abort();
+    {
+      CachedExtentRef ret;
+      auto r = t.get_extent(offset, &ret);
+      if (r != Transaction::get_extent_ret::ABSENT) {
+	SUBERRORT(seastore_cache, "unexpected non-absent extent {}", t, *ret);
+	ceph_abort();
+      }
     }
 #endif
 
     SUBTRACET(seastore_cache, "{} {}~0x{:x} is absent on t, query cache ...",
 	      t, T::TYPE, offset, length);
+    ceph_assert(!booting);
     const auto t_src = t.get_src();
-    auto f = [&t, this, partial_off, partial_len, t_src](CachedExtent &ext) {
-      // XXX: is_stable_dirty() may not be linked in lba tree
-      assert(ext.is_stable());
-      assert(T::TYPE == ext.get_type());
-      cache_access_stats_t& access_stats = get_by_ext(
-        get_by_src(stats.access_by_src_ext, t_src),
-        T::TYPE);
-      ++access_stats.load_absent;
-      ++stats.access.load_absent;
 
-      t.add_to_read_set(CachedExtentRef(&ext));
-      touch_extent_by_range(
-	ext, &t_src, t.get_cache_hint(),
-	partial_off, partial_len);
-    };
+    // partial read
+    TCachedExtentRef<T> ret = CachedExtent::make_cached_extent_ref<T>(length);
+    ret->init(CachedExtent::extent_state_t::CLEAN,
+	      offset,
+	      PLACEMENT_HINT_NULL,
+	      NULL_GENERATION,
+	      TRANS_ID_NULL);
+    SUBDEBUG(seastore_cache,
+	"{} {}~0x{:x} is absent, add extent and reading range 0x{:x}~0x{:x} ... -- {}",
+	T::TYPE, offset, length, partial_off, partial_len, *ret);
+    add_extent(ret);
+    extent_init_func(*ret);
+    cache_access_stats_t& access_stats = get_by_ext(
+      get_by_src(stats.access_by_src_ext, t_src),
+      T::TYPE);
+    ++access_stats.load_absent;
+    ++stats.access.load_absent;
+    t.add_to_read_set(CachedExtentRef(ret));
+    touch_extent_by_range(
+      *ret, &t_src, t.get_cache_hint(),
+      partial_off, partial_len);
     return trans_intr::make_interruptible(
-      do_get_caching_extent<T>(
-        offset, length, partial_off, partial_len,
-        std::forward<Func>(extent_init_func), std::move(f), &t_src)
-    );
+      read_extent<T>(std::move(ret), partial_off, partial_len, &t_src, pin_crc));
   }
 
   /*
@@ -449,12 +466,57 @@ public:
       std::forward<Func>(extent_init_func));
   }
 
+  template <typename T, typename Func>
+  get_extent_iertr::future<TCachedExtentRef<T>> maybe_get_absent_extent(
+    Transaction &t,
+    paddr_t offset,
+    extent_len_t length,
+    Func &&extent_init_func) {
+    LOG_PREFIX(Cache::maybe_get_absent_extent);
+    if (unlikely(booting)) {
+#ifndef NDEBUG
+      CachedExtentRef ret;
+      auto r = t.get_extent(offset, &ret);
+      if (r != Transaction::get_extent_ret::ABSENT) {
+	SUBERRORT(seastore_cache, "unexpected non-absent extent {}", t, *ret);
+	ceph_abort();
+      }
+#endif
+
+      SUBTRACET(seastore_cache, "{} {}~0x{:x} is absent on t, query cache ...",
+		t, T::TYPE, offset, length);
+      const auto t_src = t.get_src();
+      auto f = [&t, this, t_src](CachedExtent &ext) {
+	// XXX: is_stable_dirty() may not be linked in lba tree
+	assert(ext.is_stable());
+	assert(T::TYPE == ext.get_type());
+	cache_access_stats_t& access_stats = get_by_ext(
+	  get_by_src(stats.access_by_src_ext, t_src),
+	  T::TYPE);
+	++access_stats.load_absent;
+	++stats.access.load_absent;
+
+	t.add_to_read_set(CachedExtentRef(&ext));
+	touch_extent_fully(ext, &t_src, t.get_cache_hint());
+      };
+      return trans_intr::make_interruptible(
+	do_get_caching_extent<T>(
+	  offset, length, 0, length,
+	  std::forward<Func>(extent_init_func), std::move(f), &t_src)
+      );
+    }
+    return get_absent_extent<T>(t, offset, length, 0, length,
+      std::forward<Func>(extent_init_func));
+  }
+
   CachedExtentRef peek_extent_viewable_by_trans(
     Transaction &t,
     CachedExtentRef extent) final
   {
     assert(extent);
-    return extent->get_transactional_view(t);
+    auto ext = extent->maybe_get_transactional_view(t);
+    ceph_assert(ext);
+    return ext;
   }
 
   get_extent_iertr::future<> maybe_wait_accessible(
@@ -548,7 +610,8 @@ public:
     bool needs_step_2 = false;
     bool needs_touch = false;
     if (extent->is_stable()) {
-      p_extent = extent->get_transactional_view(t);
+      p_extent = extent->maybe_get_transactional_view(t);
+      ceph_assert(p_extent);
       if (p_extent != extent.get()) {
         assert(!extent->is_pending_io());
         assert(p_extent->is_pending_in_trans(t.get_trans_id()));
@@ -947,40 +1010,8 @@ private:
     paddr_t offset,
     laddr_t laddr,
     extent_len_t length,
-    extent_init_func_t &&extent_init_func
-  ) {
-    LOG_PREFIX(Cache::_get_absent_extent_by_type);
-
-#ifndef NDEBUG
-    CachedExtentRef ret;
-    auto r = t.get_extent(offset, &ret);
-    if (r != Transaction::get_extent_ret::ABSENT) {
-      SUBERRORT(seastore_cache, "unexpected non-absent extent {}", t, *ret);
-      ceph_abort();
-    }
-#endif
-
-    SUBTRACET(seastore_cache, "{} {}~0x{:x} {} is absent on t, query cache ...",
-	      t, type, offset, length, laddr);
-    const auto t_src = t.get_src();
-    auto f = [&t, this, t_src](CachedExtent &ext) {
-      // XXX: is_stable_dirty() may not be linked in lba tree
-      assert(ext.is_stable());
-      cache_access_stats_t& access_stats = get_by_ext(
-        get_by_src(stats.access_by_src_ext, t_src),
-        ext.get_type());
-      ++access_stats.load_absent;
-      ++stats.access.load_absent;
-
-      t.add_to_read_set(CachedExtentRef(&ext));
-      touch_extent_fully(ext, &t_src, t.get_cache_hint());
-    };
-    return trans_intr::make_interruptible(
-      do_get_caching_extent_by_type(
-	type, offset, laddr, length,
-	std::move(extent_init_func), std::move(f), &t_src)
-    );
-  }
+    extent_init_func_t &&extent_init_func,
+    uint32_t pin_crc);
 
   backref_entryrefs_by_seq_t backref_entryrefs_by_seq;
   backref_entry_mset_t backref_entry_mset;
@@ -1036,12 +1067,13 @@ public:
    */
   template <typename Func>
   get_extent_by_type_ret get_absent_extent_by_type(
-    Transaction &t,         ///< [in] transaction
-    extent_types_t type,    ///< [in] type tag
-    paddr_t offset,         ///< [in] starting addr
-    laddr_t laddr,          ///< [in] logical address if logical
-    extent_len_t length,    ///< [in] length
-    Func &&extent_init_func ///< [in] extent init func
+    Transaction &t,             ///< [in] transaction
+    extent_types_t type,        ///< [in] type tag
+    paddr_t offset,             ///< [in] starting addr
+    laddr_t laddr,              ///< [in] logical address if logical
+    extent_len_t length,        ///< [in] length
+    Func &&extent_init_func,    ///< [in] extent init func
+    uint32_t pin_crc = CRC_NULL ///< [in] pin checksum (See: pin_to_extent)
   ) {
     return _get_absent_extent_by_type(
       t,
@@ -1049,7 +1081,8 @@ public:
       offset,
       laddr,
       length,
-      extent_init_func_t(std::forward<Func>(extent_init_func)));
+      extent_init_func_t(std::forward<Func>(extent_init_func)),
+      pin_crc);
   }
 
   get_extent_by_type_ret get_absent_extent_by_type(
@@ -1198,7 +1231,10 @@ public:
       // shallow copy the buffer from original extent
       auto remap_offset = remap_laddr.get_byte_distance<
 	extent_len_t>(original_laddr);
-      auto nbp = ceph::bufferptr(*original_bptr, remap_offset, remap_length);
+
+      auto nbp = ceph::bufferptr(buffer::create_page_aligned(remap_length));
+      original_bptr->copy_out(remap_offset, remap_length, nbp.c_str());
+
       // ExtentPlacementManager::alloc_new_extent will make a new
       // (relative/temp) paddr, so make extent directly
       ext = CachedExtent::make_cached_extent_ref<T>(std::move(nbp));
@@ -1429,15 +1465,10 @@ public:
 	return extent;
       }
     } else {
-      auto result = t.get_extent(extent->get_paddr(), &extent);
-      if (result == Transaction::get_extent_ret::RETIRED) {
-	return CachedExtentRef();
-      } else {
-	if (result == Transaction::get_extent_ret::ABSENT) {
-	  t.add_to_read_set(extent);
-	}
-	return extent;
+      if (extent->is_stable()) {
+	std::ignore = t.maybe_add_to_read_set(extent);
       }
+      return extent->maybe_get_transactional_view(t);
     }
   }
 
@@ -1571,6 +1602,10 @@ public:
     return stats.omap_tree_depth;
   }
 
+  void boot_done() {
+    booting = false;
+    extents_index.clear();
+  }
 private:
   void touch_extent_fully(
       CachedExtent &ext,
@@ -1654,11 +1689,6 @@ private:
   friend class crimson::os::seastore::BackrefManager;
 
   ExtentPinboardRef pinboard;
-
-  struct query_counters_t {
-    uint64_t access = 0;
-    uint64_t hit = 0;
-  };
 
   btree_cursor_stats_t cursor_stats;
   struct invalid_trans_efforts_t {
@@ -1860,18 +1890,21 @@ private:
   /// Introspect transaction when it is being destructed
   void on_transaction_destruct(Transaction& t);
 
+  static void check_full_extent_integrity(
+    uint32_t ref_crc, uint32_t pin_crc);
+
   /// Read the extent in range offset~length,
   /// must be called exclusively for an extent,
   /// also see do_read_extent_maybe_partial().
   ///
   /// May return an invalid extent due to transaction conflict.
-  template <typename T>
-  read_extent_ret<T> read_extent(
-    TCachedExtentRef<T>&& extent,
+  get_extent_ertr::future<CachedExtentRef> _read_extent(
+    CachedExtentRef &&extent,
     extent_len_t offset,
     extent_len_t length,
-    const Transaction::src_t* p_src
-  ) {
+    const Transaction::src_t *p_src,
+    uint32_t pin_crc)
+  {
     LOG_PREFIX(Cache::read_extent);
     assert(extent->state == CachedExtent::extent_state_t::EXIST_CLEAN ||
            extent->state == CachedExtent::extent_state_t::CLEAN);
@@ -1898,7 +1931,7 @@ private:
           read_range.ptr);
       });
     }).safe_then(
-      [this, FNAME, extent=std::move(extent), offset, length]() mutable {
+      [this, FNAME, extent=std::move(extent), offset, length, pin_crc]() mutable {
         ceph_assert(extent->state == CachedExtent::extent_state_t::EXIST_CLEAN
           || extent->state == CachedExtent::extent_state_t::CLEAN
           || !extent->is_valid());
@@ -1915,6 +1948,17 @@ private:
             extent->on_clean_read();
             SUBDEBUG(seastore_cache, "read extent 0x{:x}~0x{:x} done -- {}",
               offset, length, *extent);
+
+            if (pin_crc != CRC_NULL) {
+              SUBDEBUG(seastore_cache, "read extent 0x{:x}~0x{:x} veryfing integrity -- {}",
+                offset, length, *extent);
+              // We must check the integrity here prior to complete_io.
+              // Previously, concurrent transaction could have checked
+              // crc of non matching extent data.
+              // See: https://tracker.ceph.com/issues/73790
+              assert(extent->is_fully_loaded());
+              check_full_extent_integrity(extent->last_committed_crc, pin_crc);
+            }
           } else {
             extent->last_committed_crc = CRC_NULL;
             SUBDEBUG(seastore_cache, "read extent 0x{:x}~0x{:x} done (partial) -- {}",
@@ -1925,7 +1969,7 @@ private:
             offset, length, *extent);
         }
         extent->complete_io();
-        return get_extent_ertr::make_ready_future<TCachedExtentRef<T>>(
+        return get_extent_ertr::make_ready_future<CachedExtentRef>(
           std::move(extent));
       },
       get_extent_ertr::pass_further{},
@@ -1933,6 +1977,20 @@ private:
         "Cache::read_extent: invalid error"
       }
     );
+  }
+
+  template <typename T>
+  read_extent_ret<T> read_extent(
+    TCachedExtentRef<T>&& extent,
+    extent_len_t offset,
+    extent_len_t length,
+    const Transaction::src_t* p_src,
+    uint32_t pin_crc = CRC_NULL
+  ) {
+    return _read_extent(std::move(extent), offset, length, p_src, pin_crc
+    ).safe_then([](auto extent) {
+      return extent->template cast<T>();
+    });
   }
 
   // Extents in cache may contain placeholders
@@ -1945,6 +2003,8 @@ private:
       return CachedExtentRef();
     }
   }
+
+  bool booting = true;
 };
 using CacheRef = std::unique_ptr<Cache>;
 
