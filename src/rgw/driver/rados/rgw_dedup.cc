@@ -151,12 +151,13 @@ namespace rgw::dedup {
     this->remote_restart_req = false;
     this->bucket_index_throttle.disable();
     this->metadata_access_throttle.disable();
+    this->filter = dedup_filter_t{};
   }
 
   //---------------------------------------------------------------------------
   void encode(const control_t& ctl, ceph::bufferlist& bl)
   {
-    ENCODE_START(1, 1, bl);
+    ENCODE_START(2, 1, bl);
     encode(static_cast<int32_t>(ctl.dedup_type), bl);
     encode(ctl.started, bl);
     encode(ctl.dedup_exec, bl);
@@ -171,13 +172,14 @@ namespace rgw::dedup {
     encode(ctl.remote_restart_req, bl);
     encode(ctl.bucket_index_throttle, bl);
     encode(ctl.metadata_access_throttle, bl);
+    encode(ctl.filter, bl);
     ENCODE_FINISH(bl);
   }
 
   //---------------------------------------------------------------------------
   void decode(control_t& ctl, ceph::bufferlist::const_iterator& bl)
   {
-    DECODE_START(1, bl);
+    DECODE_START(2, bl);
     int32_t dedup_type;
     decode(dedup_type, bl);
     ctl.dedup_type = static_cast<dedup_req_type_t> (dedup_type);
@@ -194,6 +196,9 @@ namespace rgw::dedup {
     decode(ctl.remote_restart_req, bl);
     decode(ctl.bucket_index_throttle, bl);
     decode(ctl.metadata_access_throttle, bl);
+    if (struct_v >= 2) {
+      decode(ctl.filter, bl);
+    }
     DECODE_FINISH(bl);
   }
 
@@ -2296,6 +2301,15 @@ namespace rgw::dedup {
     // Should we use a skip-list of storage_classes we should skip (like glacier) ?
     const std::string& storage_class =
       rgw_placement_rule::get_canonical_storage_class(entry.meta.storage_class);
+    if (!d_ctl.filter.is_empty() &&
+        !d_ctl.filter.should_process(p_bucket->get_name(), storage_class)) {
+      p_worker_stats->ingress_skip_filtered++;
+      ldpp_dout(dpp, 20) << __func__ << "::filtered out: "
+                         << p_bucket->get_name() << "/" << entry.key.name
+                         << " storage_class=" << storage_class << dendl;
+      return 0;
+    }
+
     if (storage_class == RGW_STORAGE_CLASS_STANDARD) {
       p_worker_stats->default_storage_class_objs++;
       p_worker_stats->default_storage_class_objs_bytes += ondisk_byte_size;
@@ -3075,6 +3089,45 @@ namespace rgw::dedup {
   }
 
   //---------------------------------------------------------------------------
+  static int process_restart_filter(const DoutPrefixProvider* dpp,
+                                    bufferlist::const_iterator& bl_iter,
+                                    dedup_filter_t& filter)
+  {
+    try {
+      decode(filter, bl_iter);
+    } catch (buffer::error&) {
+      filter = dedup_filter_t{};
+      return 0;
+    }
+
+    if (!filter.allow_buckets.empty() && !filter.deny_buckets.empty()) {
+      ldpp_dout(dpp, 1) << __func__
+                        << "::RESTART rejected: allow_buckets and deny_buckets "
+                        << "are mutually exclusive" << dendl;
+      return -EINVAL;
+    }
+    if (!filter.allow_storage_classes.empty() &&
+        !filter.deny_storage_classes.empty()) {
+      ldpp_dout(dpp, 1) << __func__
+                        << "::RESTART rejected: allow_storage_classes and "
+                        << "deny_storage_classes are mutually exclusive" << dendl;
+      return -EINVAL;
+    }
+
+    if (!filter.is_empty()) {
+      ldpp_dout(dpp, 5) << __func__
+                        << "::RESTART with filter: allow_buckets="
+                        << filter.allow_buckets.size()
+                        << " deny_buckets=" << filter.deny_buckets.size()
+                        << " allow_storage_classes="
+                        << filter.allow_storage_classes.size()
+                        << " deny_storage_classes="
+                        << filter.deny_storage_classes.size() << dendl;
+    }
+    return 0;
+  }
+
+  //---------------------------------------------------------------------------
   void Background::handle_notify(uint64_t notify_id, uint64_t cookie, bufferlist &bl)
   {
     int ret = 0;
@@ -3126,6 +3179,12 @@ namespace rgw::dedup {
       break;
     case URGENT_MSG_RESTART:
       if (!d_ctl.dedup_exec) {
+        dedup_filter_t filter;
+        ret = process_restart_filter(dpp, bl_iter, filter);
+        if (ret < 0) {
+          break;
+        }
+        d_ctl.filter = std::move(filter);
         d_ctl.remote_restart_req = true;
         d_cond.notify_all();
       }

@@ -57,6 +57,7 @@ namespace rgw::dedup {
     bool remote_restart_req = false;
     Throttle bucket_index_throttle;
     Throttle metadata_access_throttle;
+    dedup_filter_t filter;
   };
   std::ostream& operator<<(std::ostream &out, const control_t &ctl);
   void encode(const control_t& ctl, ceph::bufferlist& bl);

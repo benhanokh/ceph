@@ -14,6 +14,9 @@
 
 #include "rgw_dedup_utils.h"
 #include "common/ceph_crypto.h"
+#include "common/errno.h"
+#include <fstream>
+#include <cctype>
 namespace rgw::dedup {
 
   //---------------------------------------------------------------------------
@@ -340,6 +343,102 @@ namespace rgw::dedup {
     return data_buff;
   }
 
+  //---------------------------------------------------------------------------
+  static std::string trim_copy(const std::string& s)
+  {
+    size_t begin = 0;
+    while (begin < s.size() &&
+           std::isspace(static_cast<unsigned char>(s[begin]))) {
+      ++begin;
+    }
+    size_t end = s.size();
+    while (end > begin &&
+           std::isspace(static_cast<unsigned char>(s[end - 1]))) {
+      --end;
+    }
+    return s.substr(begin, end - begin);
+  }
+
+  //---------------------------------------------------------------------------
+  int read_str_list_file(const std::string& path,
+                         std::unordered_set<std::string>& entries,
+                         std::ostream& err)
+  {
+    std::ifstream in(path);
+    if (!in.is_open()) {
+      err << "ERROR: failed opening file '" << path << "'\n";
+      return -ENOENT;
+    }
+
+    std::string line;
+    while (std::getline(in, line)) {
+      line = trim_copy(line);
+      if (line.empty() || line[0] == '#') {
+        continue;
+      }
+      entries.insert(std::move(line));
+    }
+    return 0;
+  }
+
+  //---------------------------------------------------------------------------
+  int build_dedup_filter(const std::string& allow_bucket_list,
+                         const std::string& deny_bucket_list,
+                         const std::string& allow_storage_class_list,
+                         const std::string& deny_storage_class_list,
+                         dedup_filter_t& filter,
+                         std::ostream& err)
+  {
+    if (!allow_bucket_list.empty() && !deny_bucket_list.empty()) {
+      err << "ERROR: --allow-bucket-list and --deny-bucket-list "
+          << "are mutually exclusive\n";
+      return -EINVAL;
+    }
+    if (!allow_storage_class_list.empty() && !deny_storage_class_list.empty()) {
+      err << "ERROR: --allow-storage-class-list and --deny-storage-class-list "
+          << "are mutually exclusive\n";
+      return -EINVAL;
+    }
+
+    auto load = [&](const std::string& path,
+                    std::unordered_set<std::string>& target,
+                    const char* opt_name) -> int {
+      if (path.empty()) {
+        return 0;
+      }
+      int r = read_str_list_file(path, target, err);
+      if (r < 0) {
+        err << "ERROR: failed to read " << opt_name
+            << " file '" << path << "': " << cpp_strerror(-r) << "\n";
+        return r;
+      }
+      if (target.empty()) {
+        err << "WARNING: " << opt_name << " file '" << path
+            << "' is empty; no filtering will be applied for this dimension\n";
+      }
+      return 0;
+    };
+
+    int r = 0;
+    if ((r = load(allow_bucket_list, filter.allow_buckets,
+                  "--allow-bucket-list")) < 0) {
+      return r;
+    }
+    if ((r = load(deny_bucket_list, filter.deny_buckets,
+                  "--deny-bucket-list")) < 0) {
+      return r;
+    }
+    if ((r = load(allow_storage_class_list, filter.allow_storage_classes,
+                  "--allow-storage-class-list")) < 0) {
+      return r;
+    }
+    if ((r = load(deny_storage_class_list, filter.deny_storage_classes,
+                  "--deny-storage-class-list")) < 0) {
+      return r;
+    }
+    return 0;
+  }
+
   static const char* s_urgent_msg_names[] = {
     "URGENT_MSG_NONE",
     "URGENT_MSG_ABORT",
@@ -380,6 +479,7 @@ namespace rgw::dedup {
     this->non_default_storage_class_objs += other.non_default_storage_class_objs;
     this->non_default_storage_class_objs_bytes += other.non_default_storage_class_objs_bytes;
     this->ingress_corrupted_etag += other.ingress_corrupted_etag;
+    this->ingress_skip_filtered += other.ingress_skip_filtered;
     this->ingress_skip_too_small_bytes += other.ingress_skip_too_small_bytes;
     this->ingress_skip_too_small += other.ingress_skip_too_small;
     this->ingress_skip_too_small_64KB_bytes += other.ingress_skip_too_small_64KB_bytes;
@@ -435,6 +535,10 @@ namespace rgw::dedup {
 
     {
       Formatter::ObjectSection skipped(*f, "skipped");
+      if (this->ingress_skip_filtered) {
+        f->dump_unsigned("Ingress skip: filtered objs",
+                         this->ingress_skip_filtered);
+      }
       if (this->ingress_skip_too_small) {
         f->dump_unsigned("Ingress skip: too small objs",
                          this->ingress_skip_too_small);
@@ -475,7 +579,7 @@ namespace rgw::dedup {
   //---------------------------------------------------------------------------
   void encode(const worker_stats_t& w, ceph::bufferlist& bl)
   {
-    ENCODE_START(1, 1, bl);
+    ENCODE_START(2, 1, bl);
     encode(w.ingress_obj, bl);
     encode(w.ingress_obj_bytes, bl);
     encode(w.egress_records, bl);
@@ -495,6 +599,7 @@ namespace rgw::dedup {
     encode(w.non_default_storage_class_objs_bytes, bl);
 
     encode(w.ingress_corrupted_etag, bl);
+    encode(w.ingress_skip_filtered, bl);
 
     encode(w.ingress_skip_too_small_bytes, bl);
     encode(w.ingress_skip_too_small, bl);
@@ -509,7 +614,7 @@ namespace rgw::dedup {
   //---------------------------------------------------------------------------
   void decode(worker_stats_t& w, ceph::bufferlist::const_iterator& bl)
   {
-    DECODE_START(1, bl);
+    DECODE_START(2, bl);
     decode(w.ingress_obj, bl);
     decode(w.ingress_obj_bytes, bl);
     decode(w.egress_records, bl);
@@ -526,6 +631,9 @@ namespace rgw::dedup {
     decode(w.non_default_storage_class_objs, bl);
     decode(w.non_default_storage_class_objs_bytes, bl);
     decode(w.ingress_corrupted_etag, bl);
+    if (struct_v >= 2) {
+      decode(w.ingress_skip_filtered, bl);
+    }
     decode(w.ingress_skip_too_small_bytes, bl);
     decode(w.ingress_skip_too_small, bl);
     decode(w.ingress_skip_too_small_64KB_bytes, bl);

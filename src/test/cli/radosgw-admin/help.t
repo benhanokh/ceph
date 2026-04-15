@@ -362,7 +362,13 @@
      --max-bucket-index-ops        specify max bucket-index requests per second allowed for an RGW during dedup, 0 means unlimited
      --max-metadata-ops            specify max metadata requests per second allowed for an RGW during dedup, 0 means unlimited
      --stat                        display dedup throttle setting
-  
+
+  Dedup filter options:
+     --allow-bucket-list=<file>          process only buckets listed in file (one per line)
+     --deny-bucket-list=<file>           process all buckets except those listed in file
+     --allow-storage-class-list=<file>   process only storage classes listed in file
+     --deny-storage-class-list=<file>    process all storage classes except those listed in file
+
   Quota options:
      --max-objects                 specify max objects (negative value to disable)
      --max-size                    specify max size (in B/K/M/G/T, negative value to disable)

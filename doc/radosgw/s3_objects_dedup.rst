@@ -33,6 +33,46 @@ Admin Commands
 - ``radosgw-admin dedup throttle --stat``:
    Displays dedup throttle setting.
 
+Dedup Filter Options
+====================
+
+Bucket Filtering
+----------------
+
+- ``--allow-bucket-list <file>``: allow-mode, only listed buckets are
+  processed.
+- ``--deny-bucket-list <file>``: deny-mode, listed buckets are skipped.
+
+These two options are mutually exclusive.
+
+Storage-Class Filtering
+-----------------------
+
+- ``--allow-storage-class-list <file>``: allow-mode, only listed storage
+  classes are processed.
+- ``--deny-storage-class-list <file>``: deny-mode, listed storage classes are
+  skipped.
+
+These two options are mutually exclusive.
+
+Bucket and storage-class filters are independent dimensions and may be
+combined.
+
+Filter files contain one entry per line. Blank lines and lines beginning with
+``#`` are ignored.
+
+Example::
+
+   # buckets to include in dedup
+   bucket-a
+   bucket-b
+
+.. prompt:: bash #
+
+   radosgw-admin dedup estimate \
+     --allow-bucket-list /tmp/allow_buckets.txt \
+     --deny-storage-class-list /tmp/deny_sc.txt
+
 
 Skipped Objects
 ===============

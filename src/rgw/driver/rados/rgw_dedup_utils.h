@@ -23,6 +23,7 @@
 #include "include/utime.h"
 #include "include/encoding.h"
 #include "common/dout.h"
+#include <unordered_set>
 
 #define FULL_DEDUP_SUPPORT
 
@@ -194,6 +195,7 @@ namespace rgw::dedup {
     uint64_t non_default_storage_class_objs_bytes = 0;
 
     uint64_t ingress_corrupted_etag = 0;
+    uint64_t ingress_skip_filtered = 0;
 
     uint64_t ingress_skip_too_small_bytes = 0;
     uint64_t ingress_skip_too_small = 0;
@@ -312,6 +314,65 @@ namespace rgw::dedup {
     return disk_blocks_to_byte_size(size_4k_units);
   }
 
+  struct dedup_filter_t {
+    std::unordered_set<std::string> allow_buckets;
+    std::unordered_set<std::string> deny_buckets;
+    std::unordered_set<std::string> allow_storage_classes;
+    std::unordered_set<std::string> deny_storage_classes;
+
+    bool is_empty() const
+    {
+      return allow_buckets.empty() &&
+             deny_buckets.empty() &&
+             allow_storage_classes.empty() &&
+             deny_storage_classes.empty();
+    }
+
+    bool should_process(const std::string& bucket_name,
+                        const std::string& storage_class) const
+    {
+      if (!allow_buckets.empty() &&
+          allow_buckets.find(bucket_name) == allow_buckets.end()) {
+        return false;
+      }
+      if (!deny_buckets.empty() &&
+          deny_buckets.find(bucket_name) != deny_buckets.end()) {
+        return false;
+      }
+      if (!allow_storage_classes.empty() &&
+          allow_storage_classes.find(storage_class) == allow_storage_classes.end()) {
+        return false;
+      }
+      if (!deny_storage_classes.empty() &&
+          deny_storage_classes.find(storage_class) != deny_storage_classes.end()) {
+        return false;
+      }
+      return true;
+    }
+
+    void encode(ceph::bufferlist& bl) const
+    {
+      ENCODE_START(1, 1, bl);
+      ceph::encode(allow_buckets, bl);
+      ceph::encode(deny_buckets, bl);
+      ceph::encode(allow_storage_classes, bl);
+      ceph::encode(deny_storage_classes, bl);
+      ENCODE_FINISH(bl);
+    }
+
+    void decode(ceph::bufferlist::const_iterator& bl)
+    {
+      DECODE_START(1, bl);
+      ceph::decode(allow_buckets, bl);
+      ceph::decode(deny_buckets, bl);
+      ceph::decode(allow_storage_classes, bl);
+      ceph::decode(deny_storage_classes, bl);
+      DECODE_FINISH(bl);
+    }
+  };
+  inline void encode(const dedup_filter_t& f, ceph::bufferlist& bl) { f.encode(bl); }
+  inline void decode(dedup_filter_t& f, ceph::bufferlist::const_iterator& bl) { f.decode(bl); }
+
   enum urgent_msg_t {
     URGENT_MSG_NONE = 0,
     URGENT_MSG_ABORT,
@@ -348,6 +409,15 @@ namespace rgw::dedup {
 
   bool hex2int(const char *p, const char *p_end, uint64_t *p_val);
   bool parse_etag_string(const std::string& etag, parsed_etag_t *parsed_etag);
+  int read_str_list_file(const std::string& path,
+                         std::unordered_set<std::string>& entries,
+                         std::ostream& err);
+  int build_dedup_filter(const std::string& allow_bucket_list,
+                         const std::string& deny_bucket_list,
+                         const std::string& allow_storage_class_list,
+                         const std::string& deny_storage_class_list,
+                         dedup_filter_t& filter,
+                         std::ostream& err);
   void etag_to_bufferlist(uint64_t md5_high, uint64_t md5_low, uint16_t num_parts,
                           ceph::bufferlist *bl);
   const char* get_next_data_ptr(bufferlist::const_iterator &bl_itr,
