@@ -344,7 +344,7 @@ namespace rgw::dedup {
   }
 
   //---------------------------------------------------------------------------
-  static std::string trim_copy(const std::string& s)
+  static std::string trim_whitespace(const std::string& s)
   {
     size_t begin = 0;
     while (begin < s.size() &&
@@ -372,8 +372,8 @@ namespace rgw::dedup {
 
     std::string line;
     while (std::getline(in, line)) {
-      line = trim_copy(line);
-      if (line.empty() || line[0] == '#') {
+      line = trim_whitespace(line);
+      if (line.empty() || (!line.empty() && line[0] == '#')) {
         continue;
       }
       entries.insert(std::move(line));

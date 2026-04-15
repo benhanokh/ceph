@@ -3095,7 +3095,7 @@ namespace rgw::dedup {
   {
     try {
       decode(filter, bl_iter);
-    } catch (buffer::error&) {
+    } catch (const buffer::error&) {
       filter = dedup_filter_t{};
       return 0;
     }
