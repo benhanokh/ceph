@@ -248,7 +248,7 @@ void usage()
   cout << "  zonegroup get                    show zone group info\n";
   cout << "  zonegroup modify                 modify an existing zonegroup\n";
   cout << "  zonegroup set                    set zone group info (requires infile)\n";
-  cout << "  zonegroup rm                     remove a zone from a zonegroup\n";
+  cout << "  zonegroup remove                 remove a zone from a zonegroup\n";
   cout << "  zonegroup rename                 rename a zone group\n";
   cout << "  zonegroup list                   list all zone groups set on this cluster\n";
   cout << "  zonegroup placement list         list zonegroup's placement targets\n";
@@ -459,7 +459,8 @@ void usage()
   cout << "   --bucket-index-max-shards         override a zone/zonegroup's default bucket index shard count\n";
   cout << "   --fix                             besides checking bucket index, will also fix it\n";
   cout << "   --check-objects                   bucket check: rebuilds bucket index according to actual objects state\n";
-  cout << "   --format=<format>                 specify output format for certain operations: xml, json\n";
+  cout << "   --format=<format>                 specify output format for certain operations: xml, json (default: json)\n";
+  cout << "   --pretty-format                   enable pretty formatting for json/xml output\n";
   cout << "   --purge-data                      when specified, user removal will also purge all the\n";
   cout << "                                     user data\n";
   cout << "   --purge-keys                      when specified, subuser removal will also purge all the\n";
@@ -5149,7 +5150,7 @@ int main(int argc, const char **argv)
           encode_json("user quota", period_config.quota.user_quota, formatter.get());
         } else {
           cerr << "ERROR: invalid quota scope specification. Please specify "
-              "either --quota-scope=bucket, or --quota-scope=user" << std::endl;
+              "either --quota-scope=bucket or --quota-scope=user" << std::endl;
           return EINVAL;
         }
         formatter->close_section();
@@ -6372,7 +6373,7 @@ int main(int argc, const char **argv)
 	}
 
 	if (!zone_name.empty() && !zone.get_name().empty() && zone.get_name() != zone_name) {
-	  cerr << "Error: zone name " << zone_name << " is different than the zone name " << zone.get_name() << " in the provided json " << std::endl;
+	  cerr << "ERROR: zone name " << zone_name << " is different than the zone name " << zone.get_name() << " in the provided json " << std::endl;
 	  return EINVAL;
 	}
 
@@ -7640,8 +7641,8 @@ int main(int argc, const char **argv)
           return -ret;
         }
 	ldpp_dout(dpp(), 20) << "INFO: " << __func__ <<
-	  ": list() returned without error; results.objs.sizie()=" <<
-	  results.objs.size() << "results.is_truncated=" << results.is_truncated << ", marker=" <<
+	  ": list() returned without error; results.objs.size()=" <<
+	  results.objs.size() << ", results.is_truncated=" << results.is_truncated << ", marker=" <<
 	  params.marker << dendl;
 
         count += results.objs.size();
@@ -8357,8 +8358,8 @@ next:
 
     int ret = init_bucket(tenant, bucket_name, bucket_id, &bucket);
     if (ret < 0) {
-      ldpp_dout(dpp(), 0) << "ERROR: could not init bucket: " << cpp_strerror(-ret) <<
-	dendl;
+      ldpp_dout(dpp(), 0) << "ERROR: could not init bucket: " <<
+	cpp_strerror(-ret) << dendl;
       return -ret;
     }
 
@@ -8370,42 +8371,49 @@ next:
       max_entries = 1000;
     }
 
-    ldpp_dout(dpp(), 20) << "INFO: " << __func__ << ": max_entries=" << max_entries <<
-      ", index=" << index << ", max_shards=" << max_shards << dendl;
+    ldpp_dout(dpp(), 20) << "INFO: " << __func__ << ": max_entries=" <<
+      max_entries << ", index=" << index << ", max_shards=" << max_shards <<
+      dendl;
 
     formatter->open_array_section("entries");
 
+    auto rados = static_cast<rgw::sal::RadosStore*>(driver)->getRados();
     int i = (specified_shard_id ? shard_id : 0);
     for (; i < max_shards; i++) {
-      ldpp_dout(dpp(), 20) << "INFO: " << __func__ << ": starting shard=" << i << dendl;
+      ldpp_dout(dpp(), 20) << "INFO: " << __func__ << ": starting shard=" <<
+	i << dendl;
       marker.clear();
 
-      RGWRados::BucketShard bs(static_cast<rgw::sal::RadosStore*>(driver)->getRados());
+      RGWRados::BucketShard bs(rados);
       int ret = bs.init(dpp(), bucket->get_info(), index, i, null_yield);
       if (ret < 0) {
-	ldpp_dout(dpp(), 0) << "ERROR: bs.init(bucket=" << bucket << ", shard=" << i <<
-	  "): " << cpp_strerror(-ret) << dendl;
+	ldpp_dout(dpp(), 0) << "ERROR: bs.init(bucket=" << bucket <<
+	  ", shard=" << i << "): " << cpp_strerror(-ret) << dendl;
         return -ret;
       }
 
       do {
         entries.clear();
-	// if object is specified, we use that as a filter to only retrieve some entries
-        ret = static_cast<rgw::sal::RadosStore*>(driver)->getRados()->bi_list(bs, object, marker, max_entries, &entries, &is_truncated, false, null_yield);
+	// if object is specified, we use that as a filter to only
+	// retrieve some entries
+        ret = rados->bi_list(bs, object, marker, max_entries, &entries,
+			     &is_truncated, false, null_yield);
         if (ret < 0) {
-          ldpp_dout(dpp(), 0) << "ERROR: bi_list(): " << cpp_strerror(-ret) << dendl;
+          ldpp_dout(dpp(), 0) << "ERROR: bi_list(): " <<
+	    cpp_strerror(-ret) << dendl;
           return -ret;
         }
-	ldpp_dout(dpp(), 20) << "INFO: " << __func__ <<
-	  ": bi_list() returned without error; entries.size()=" <<
-	  entries.size() << ", is_truncated=" << is_truncated <<
-	  ", marker=" << marker << dendl;
 
 	for (const auto& entry : entries) {
           encode_json("entry", entry, formatter.get());
           marker = entry.idx;
         }
         formatter->flush(cout);
+
+	ldpp_dout(dpp(), 20) << "INFO: " << __func__ <<
+	  ": bi_list() returned without error; entries.size()=" <<
+	  entries.size() << ", is_truncated=" << is_truncated <<
+	  ", next_marker=" << marker << dendl;
       } while (is_truncated);
 
       formatter->flush(cout);

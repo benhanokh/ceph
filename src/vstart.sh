@@ -281,6 +281,7 @@ options:
 	--osds-per-host: populate crush_location as each host holds the specified number of osds if set
 	--require-osd-and-client-version: if supplied, do set-require-min-compat-client and require-osd-release to specified value
 	--use-crush-tunables: if supplied, set tunables to specified value
+	--reactor-backend: configre seastar reactor backend options like io_uring or linux-aio
 \n
 EOF
 
@@ -616,6 +617,10 @@ case $1 in
         crimson_smp=$2
         shift
         ;;
+    --reactor-backend)
+        crimson_reactor_backend=$2
+        shift
+        ;;
     --crimson-alien-num-threads)
         crimson_alien_num_threads=$2
         shift
@@ -808,6 +813,7 @@ prepare_conf() {
         pid file = $CEPH_OUT_DIR/\$name.pid
         heartbeat file = $CEPH_OUT_DIR/\$name.heartbeat
 "
+    local extblkdev_conf=""
 
     local mgr_modules="iostat nfs"
     if $with_mgr_dashboard; then
@@ -858,6 +864,7 @@ prepare_conf() {
         enable experimental unrecoverable data corrupting features = *
         osd_crush_chooseleaf_type = 0
         debug asok assert abort = true
+        $(format_conf "${extblkdev_conf}")
         $(format_conf "${msgr_conf}")
         $(format_conf "${extra_conf}")
         $AUTOSCALER_OPTS
@@ -918,6 +925,10 @@ EOF
                [ ${#bluestore_wal_devs[@]} -gt 0 ]; then
                 # when use physical disk, not create file for db/wal
                 BLUESTORE_OPTS=""
+            else
+                # vstart's default file-backed OSDs are not suitable for
+                # extblkdev plugins that probe hardware capabilities.
+                extblkdev_conf="osd_extblkdev_plugins ="
             fi
         fi
         if [ "$io_uring_enabled" -eq 1 ]; then
@@ -1021,8 +1032,6 @@ $DAEMONOPTS
 
         bluestore fsck on mount = true
         bluestore block create = true
-        bluestore allocator = bitmap
-        bluestore alloc favor spatial locality = false
         
 $BLUESTORE_OPTS
 
@@ -1257,6 +1266,10 @@ start_osd() {
         if $crimson_poll_mode; then
             echo "$CEPH_BIN/ceph -c $conf_fn config set osd.$osd crimson_poll_mode true"
             $CEPH_BIN/ceph -c $conf_fn config set "osd.$osd" crimson_poll_mode true
+        fi
+        if [ -n "$crimson_reactor_backend" ]; then
+            echo "$CEPH_BIN/ceph -c $conf_fn config set osd.$osd crimson_reactor_backend $crimson_reactor_backend"
+            $CEPH_BIN/ceph -c $conf_fn config set osd.$osd crimson_reactor_backend $crimson_reactor_backend
         fi
     fi
 	if [ "$new" -eq 1 -o $inc_osd_num -gt 0 ]; then
@@ -1662,7 +1675,7 @@ if [ -z "$CEPH_PORT" ]; then
     while [ true ]
     do
         CEPH_PORT="$(echo $(( RANDOM % 1000 + 40000 )))"
-        ss -a -n | egrep "\<LISTEN\>.+:${CEPH_PORT}\s+" 1>/dev/null 2>&1 || break
+        ss -a -n | grep -E "\<LISTEN\>.+:${CEPH_PORT}\s+" 1>/dev/null 2>&1 || break
     done
 fi
 

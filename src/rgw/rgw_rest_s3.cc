@@ -6341,10 +6341,17 @@ AWSSignerV4::prepare(const DoutPrefixProvider *dpp,
     content_hash = rgw::auth::s3::calc_v4_payload_hash(opt_content->to_str());
     extra_headers["x-amz-content-sha256"] = content_hash;
   } else {
+    // check if the header was already set (e.g. from a forwarded request)
+    const char* existing_hash = info.env->get("HTTP_X_AMZ_CONTENT_SHA256");
+    if (existing_hash) {
+      // use existing header value
+      extra_headers["x-amz-content-sha256"] = existing_hash;
+    } else {
     /* Some S3-compatible services require x-amz-content-sha256 header to always
      * be present and included in the signature, even for unsigned payload.
      * AWS S3 specification states that this header is required for all requests. */
     extra_headers["x-amz-content-sha256"] = AWS4_UNSIGNED_PAYLOAD_HASH;
+    }
   }
 
   /* craft canonical headers */
@@ -7250,7 +7257,7 @@ rgw::auth::s3::STSEngine::authenticate(
         real_clock::time_point now = real_clock::now();
         if (now >= *exp) {
           ldpp_dout(dpp, 0) << "ERROR: Token expired" << dendl;
-          return result_t::reject(-EPERM);
+          return result_t::reject(-ERR_EXPIRED_TOKEN);
         }
       } else {
         ldpp_dout(dpp, 0) << "ERROR: Invalid expiration: " << expiration << dendl;

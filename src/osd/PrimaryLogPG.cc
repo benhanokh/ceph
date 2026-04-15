@@ -821,7 +821,7 @@ void PrimaryLogPG::maybe_force_recovery()
     return;
 
   // find the oldest missing object
-  version_t min_version = recovery_state.get_pg_log().get_log().head.version;
+  eversion_t min_version = recovery_state.get_pg_log().get_log().head;
   hobject_t soid;
   if (!recovery_state.get_pg_log().get_missing().get_rmissing().empty()) {
     min_version = recovery_state.get_pg_log().get_missing().get_rmissing().begin()->first;
@@ -1200,6 +1200,16 @@ void PrimaryLogPG::do_command(
       ret = -EPERM;
     }
     outbl.append(ss.str());
+  }
+
+  else if (prefix == "scrub-abort") {
+    if (is_primary()) {
+      m_scrubber->on_operator_abort_scrub(f.get());
+    } else {
+      ss << "Not primary";
+      ret = -EPERM;
+      outbl.append(ss.str());
+    }
   }
 
   // the test/debug commands that schedule a scrub by modifying timestamps
@@ -1744,28 +1754,14 @@ void PrimaryLogPG::release_object_locks(
 
   if (!to_req.empty()) {
     // requeue at front of scrub blocking queue if we are blocked by scrub
-    for (auto &&p: to_req) {
+    for (auto&& p : to_req) {
       if (m_scrubber->write_blocked_by_scrub(p.first->obs.oi.soid.get_head())) {
         for (auto& op : p.second) {
           op->mark_delayed("waiting for scrub");
         }
-
-	waiting_for_scrub.splice(
-	  waiting_for_scrub.begin(),
-	  p.second,
-	  p.second.begin(),
-	  p.second.end());
-      } else if (is_laggy()) {
-        for (auto& op : p.second) {
-          op->mark_delayed("waiting for readable");
-        }
-	waiting_for_readable.splice(
-	  waiting_for_readable.begin(),
-	  p.second,
-	  p.second.begin(),
-	  p.second.end());
+        waiting_for_scrub.splice(waiting_for_scrub.begin(), p.second);
       } else {
-	requeue_ops(p.second);
+        requeue_ops(p.second);
       }
     }
   }
@@ -4847,8 +4843,8 @@ int PrimaryLogPG::trim_object(
     t->remove(coid);
     t->update_snaps(
       coid,
-      old_snaps,
-      new_snaps);
+      std::move(old_snaps),
+      std::move(new_snaps));
 
     coi = object_info_t(coid);
 
@@ -4882,8 +4878,8 @@ int PrimaryLogPG::trim_object(
 
     t->update_snaps(
       coid,
-      old_snaps,
-      new_snaps);
+      std::move(old_snaps),
+      std::move(new_snaps));
   }
 
   // save head snapset
@@ -5991,6 +5987,8 @@ int PrimaryLogPG::do_sparse_read(OpContext *ctx, OSDOp& osd_op) {
       dout(10) << " sparse read ended up empty for " << soid << dendl;
       map<uint64_t, uint64_t> extents;
       encode(extents, osd_op.outdata);
+      bufferlist data_bl;
+      encode(data_bl, osd_op.outdata);
     }
   } else {
     // read into a buffer
@@ -13522,12 +13520,12 @@ uint64_t PrimaryLogPG::recover_primary(uint64_t max, ThreadPool::TPHandle &handl
   int skipped = 0;
 
   PGBackend::RecoveryHandle *h = pgbackend->open_recovery_op();
-  map<version_t, hobject_t>::const_iterator p =
-    missing.get_rmissing().lower_bound(recovery_state.get_pg_log().get_log().last_requested);
+  map<eversion_t, hobject_t>::const_iterator p =
+    missing.get_rmissing().lower_bound(eversion_t(0, recovery_state.get_pg_log().get_log().last_requested));
   while (p != missing.get_rmissing().end()) {
     handle.reset_tp_timeout();
     hobject_t soid;
-    version_t v = p->first;
+    eversion_t v = p->first;
 
     auto it_objects = recovery_state.get_pg_log().get_log().objects.find(p->second);
     if (it_objects != recovery_state.get_pg_log().get_log().objects.end()) {
@@ -13661,7 +13659,7 @@ uint64_t PrimaryLogPG::recover_primary(uint64_t max, ThreadPool::TPHandle &handl
 
     // only advance last_requested if we haven't skipped anything
     if (!skipped)
-      recovery_state.set_last_requested(v);
+      recovery_state.set_last_requested(v.version);
   }
 
   pgbackend->run_recovery_op(h, recovery_state.get_recovery_op_priority());
@@ -13832,7 +13830,7 @@ uint64_t PrimaryLogPG::recover_replicas(uint64_t max, ThreadPool::TPHandle &hand
 
     // oldest first!
     const pg_missing_t &m(pm->second);
-    for (map<version_t, hobject_t>::const_iterator p = m.get_rmissing().begin();
+    for (map<eversion_t, hobject_t>::const_iterator p = m.get_rmissing().begin();
 	 p != m.get_rmissing().end() && started < max;
 	   ++p) {
       handle.reset_tp_timeout();
@@ -15916,9 +15914,10 @@ boost::statechart::result PrimaryLogPG::AwaitAsyncWork::react(const DoSnapWork&)
 
     pg->snap_trimq.erase(snap_to_trim);
 
-    if (pg->snap_trimq_repeat.count(snap_to_trim)) {
+    if (auto it = pg->snap_trimq_repeat.find(snap_to_trim);
+        it != pg->snap_trimq_repeat.end()) {
       ldout(pg->cct, 10) << " removing from snap_trimq_repeat" << dendl;
-      pg->snap_trimq_repeat.erase(snap_to_trim);
+      pg->snap_trimq_repeat.erase(it);
     } else {
       ldout(pg->cct, 10) << "adding snap " << snap_to_trim
 			 << " to purged_snaps"

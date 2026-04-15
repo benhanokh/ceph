@@ -3,7 +3,17 @@ import json
 import socket
 from enum import Enum
 from functools import wraps
-from typing import Optional, Callable, TypeVar, List, NewType, TYPE_CHECKING, Any, NamedTuple
+from typing import (
+    Any,
+    Callable,
+    List,
+    NamedTuple,
+    NewType,
+    Optional,
+    TYPE_CHECKING,
+    TypeVar,
+    Union,
+)
 from orchestrator import OrchestratorError
 import hashlib
 
@@ -58,6 +68,25 @@ class SpecialHostLabels(str, Enum):
 
     def to_json(self) -> str:
         return self.value
+
+    def __str__(self) -> str:
+        return self.value
+
+
+class Action(str, Enum):
+    NO_ACTION = ''
+    RECONFIG = 'reconfig'
+    REDEPLOY = 'redeploy'
+    RESTART = 'restart'
+    ROTATE_KEY = 'rotate-key'
+    START = 'start'
+    STOP = 'stop'
+
+    @classmethod
+    def create(cls, action: Union[str, 'Action', None]) -> 'Action':
+        if not action:
+            return cls.NO_ACTION
+        return cls(action)
 
     def __str__(self) -> str:
         return self.value
@@ -162,3 +191,15 @@ def md5_hash(input_value: str) -> str:
     input_str = str(input_value).encode('utf-8')
     hash_object = hashlib.md5(input_str)
     return hash_object.hexdigest()
+
+
+def get_node_proxy_status_value(data: Any, key: str, lower: bool = False) -> str:
+    if not isinstance(data, dict):
+        return ''
+    status = data.get('status', {})
+    if not isinstance(status, dict):
+        return ''
+    value = status.get(key, '')
+    if not isinstance(value, str):
+        return ''
+    return value.lower() if lower else value

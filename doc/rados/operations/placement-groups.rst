@@ -116,7 +116,7 @@ The output will resemble the following::
   among multiple pools.
 
 - **RATIO** is the ratio of (1) the storage consumed by the pool to (2) the
-  total raw storage capacity. In order words, RATIO is defined as 
+  total raw storage capacity. In other words, RATIO is defined as 
   (SIZE * RATE) / RAW CAPACITY and may be thought of as a fullness percentage.
 
 - **TARGET RATIO** (if present) is the ratio of the expected storage of this
@@ -477,7 +477,7 @@ from the old ones.
 Factors Relevant To Specifying pg_num
 =====================================
 
-Performance and and even data distribution across
+Performance and even data distribution across
 OSDs weigh in favor of a higher number of PGs. Conserving CPU resources and
 minimizing memory usage weigh in favor of a lower number of PGs.
 The latter was more of a concern before Filestore OSDs were deprecated, so
@@ -631,7 +631,7 @@ For this reason, limiting the number of PGs saves significant resources.
 Choosing the Number of PGs
 ==========================
 
-.. note: It is rarely necessary to do the math in this section by hand.
+.. note:: It is rarely necessary to do the math in this section by hand.
    Instead, use the ``ceph osd pool autoscale-status`` command in combination
    with the ``target_size_bytes`` or ``target_size_ratio`` pool properties. For
    more information, see :ref:`pg-autoscaler`.
@@ -687,7 +687,7 @@ Setting the Number of PGs
 :ref:`Placement Group Link <pgcalc>`
 
 Setting the initial number of PGs in a pool is done implicitly or explicitly
-at the time a pool is created. See `Create a Pool`_ for details. 
+at the time a pool is created. See :ref:`createpool` for details.
 
 However, after a pool is created, if the ``pg_autoscaler`` is not being
 used to manage ``pg_num`` values, you can change the number of PGs by running a
@@ -975,5 +975,4 @@ about it entirely (if it is too new to have a previous version). To mark the
         pg-concepts
 
 
-.. _Create a Pool: ../pools#createpool
 .. _Mapping PGs to OSDs: ../../../architecture#mapping-pgs-to-osds

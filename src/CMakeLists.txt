@@ -242,6 +242,12 @@ if(HAVE_INTEL)
   endif()
 endif()
 
+# Set WITH_EC_ISA_PLUGIN early so it's available when processing common/options
+# This must be set before add_subdirectory(common) is called
+if(HAVE_NASM_X64_AVX2 OR HAVE_ARMV8_SIMD OR HAS_ALTIVEC)
+  set(WITH_EC_ISA_PLUGIN TRUE CACHE BOOL "")
+endif()
+
 # require c++23
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -463,7 +469,7 @@ if(WITH_CRIMSON)
     endif()
   endmacro ()
   set(Seastar_API_LEVEL "6" CACHE STRING "" FORCE)
-  set(Seastar_IO_URING OFF CACHE BOOL "" FORCE)
+  set(Seastar_IO_URING ${HAVE_LIBURING} CACHE BOOL "" FORCE)
   set(Seastar_DEPRECATED_OSTREAM_FORMATTERS OFF CACHE BOOL "" FORCE)
   if(Seastar_DPDK)
     find_package(dpdk QUIET)
@@ -472,7 +478,21 @@ if(WITH_CRIMSON)
       build_dpdk(${CMAKE_BINARY_DIR}/src/dpdk)
     endif()
   endif()
+  set(old_BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS})
+  if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+    # - Debug: shared seastar for faster development iteration
+    #   shared seastar is allowed for faster linking and smaller executables during
+    #   development.
+    #   Note: shared seastar won't be packaged, so this is for developers only
+    # - RelWithDebInfo/Release/MinSizeRel: static seastar for production packages
+    #   This ensures packages don't depend on libseastar.so, and avoids the performance penalty
+    #   of calling functions in shared library.
+    set(BUILD_SHARED_LIBS FALSE)
+  endif()
   add_subdirectory(seastar)
+  set(BUILD_SHARED_LIBS ${old_BUILD_SHARED_LIBS})
+  unset(old_BUILD_SHARED_LIBS)
+
   # create the directory so cmake won't complain when looking at the imported
   # target: Seastar exports this directory created at build-time
   file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/seastar/gen/include")
@@ -489,6 +509,7 @@ if(WITH_CRIMSON)
     "-Wno-pessimizing-move"
     "-Wno-address-of-packed-member")
   add_subdirectory(crimson)
+  add_dependencies(crimson-osd erasure_code)
 endif()
 
 include(CheckTypeSize)
@@ -516,7 +537,9 @@ set(libcommon_files
   mon/MonMap.cc
   mon/MonSub.cc
   mon/error_code.cc
+  mgr/DaemonHealthMetric.cc
   mgr/MgrClient.cc
+  mon/MgrMap.cc
   mon/PGMap.cc
   mgr/ServiceMap.cc
   osd/ECMsgTypes.cc
@@ -574,7 +597,6 @@ set(ceph_common_deps
   common_utf8 extblkdev arch crc32
   ${LIB_RESOLV}
   Boost::thread
-  Boost::system
   Boost::random
   Boost::program_options
   Boost::date_time
@@ -1084,6 +1106,7 @@ if(WITH_NVMEOF_GATEWAY_MONITOR_CLIENT)
     ${nvmeof_monitor_grpc_hdrs}
     ceph_nvmeof_monitor_client.cc
     nvmeof/NVMeofGwClient.cc
+    nvmeof/NVMeofGwUtils.cc
     nvmeof/NVMeofGwMonitorGroupClient.cc
     nvmeof/NVMeofGwMonitorClient.cc)
   add_executable(ceph-nvmeof-monitor-client ${ceph_nvmeof_monitor_client_srcs})

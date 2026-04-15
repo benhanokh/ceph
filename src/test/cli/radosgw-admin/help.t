@@ -108,7 +108,7 @@
     zonegroup get                    show zone group info
     zonegroup modify                 modify an existing zonegroup
     zonegroup set                    set zone group info (requires infile)
-    zonegroup rm                     remove a zone from a zonegroup
+    zonegroup remove                 remove a zone from a zonegroup
     zonegroup rename                 rename a zone group
     zonegroup list                   list all zone groups set on this cluster
     zonegroup placement list         list zonegroup's placement targets
@@ -319,7 +319,8 @@
      --bucket-index-max-shards         override a zone/zonegroup's default bucket index shard count
      --fix                             besides checking bucket index, will also fix it
      --check-objects                   bucket check: rebuilds bucket index according to actual objects state
-     --format=<format>                 specify output format for certain operations: xml, json
+     --format=<format>                 specify output format for certain operations: xml, json (default: json)
+     --pretty-format                   enable pretty formatting for json/xml output
      --purge-data                      when specified, user removal will also purge all the
                                        user data
      --purge-keys                      when specified, subuser removal will also purge all the
