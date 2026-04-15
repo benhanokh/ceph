@@ -157,7 +157,7 @@ namespace rgw::dedup {
   //---------------------------------------------------------------------------
   void encode(const control_t& ctl, ceph::bufferlist& bl)
   {
-    ENCODE_START(2, 1, bl);
+    ENCODE_START(1, 1, bl);
     encode(static_cast<int32_t>(ctl.dedup_type), bl);
     encode(ctl.started, bl);
     encode(ctl.dedup_exec, bl);
@@ -179,7 +179,7 @@ namespace rgw::dedup {
   //---------------------------------------------------------------------------
   void decode(control_t& ctl, ceph::bufferlist::const_iterator& bl)
   {
-    DECODE_START(2, bl);
+    DECODE_START(1, bl);
     int32_t dedup_type;
     decode(dedup_type, bl);
     ctl.dedup_type = static_cast<dedup_req_type_t> (dedup_type);
@@ -196,9 +196,7 @@ namespace rgw::dedup {
     decode(ctl.remote_restart_req, bl);
     decode(ctl.bucket_index_throttle, bl);
     decode(ctl.metadata_access_throttle, bl);
-    if (struct_v >= 2) {
-      decode(ctl.filter, bl);
-    }
+    decode(ctl.filter, bl);
     DECODE_FINISH(bl);
   }
 
@@ -2301,10 +2299,9 @@ namespace rgw::dedup {
     // Should we use a skip-list of storage_classes we should skip (like glacier) ?
     const std::string& storage_class =
       rgw_placement_rule::get_canonical_storage_class(entry.meta.storage_class);
-    if (!d_ctl.filter.is_empty() &&
-        !d_ctl.filter.should_process(p_bucket->get_name(), storage_class)) {
-      p_worker_stats->ingress_skip_filtered++;
-      ldpp_dout(dpp, 20) << __func__ << "::filtered out: "
+    if (!d_ctl.filter.should_process_storage_class(storage_class)) {
+      p_worker_stats->ingress_skip_filtered_storage_class++;
+      ldpp_dout(dpp, 20) << __func__ << "::filtered out (storage class): "
                          << p_bucket->get_name() << "/" << entry.key.name
                          << " storage_class=" << storage_class << dendl;
       return 0;
@@ -2767,6 +2764,13 @@ namespace rgw::dedup {
                               << cpp_strerror(-ret) << dendl;
             continue;
           }
+          // bucket filter: cheap hash-set lookup, avoids all I/O for filtered buckets
+          if (!d_ctl.filter.should_process_bucket(bucket.name)) {
+            p_worker_stats->ingress_skip_filtered_bucket++;
+            ldpp_dout(dpp, 20) << __func__ << "::filtered out (bucket): "
+                               << bucket.name << dendl;
+            continue;
+          }
           ldpp_dout(dpp, 20) <<__func__ << "::bucket=" << bucket << dendl;
           ret = ingress_bucket_objects_single_shard(disk_arr, bucket, worker_id,
                                                     num_work_shards, p_worker_stats);
@@ -3089,18 +3093,20 @@ namespace rgw::dedup {
   }
 
   //---------------------------------------------------------------------------
-  static int process_restart_filter(const DoutPrefixProvider* dpp,
-                                    bufferlist::const_iterator& bl_iter,
-                                    dedup_filter_t& filter)
+  static int decode_restart_filter(const DoutPrefixProvider* dpp,
+                                   bufferlist::const_iterator& bl_iter,
+                                   dedup_filter_t& filter)
   {
+    if (bl_iter.end()) {
+      filter = dedup_filter_t{};
+      return 0;
+    }
     try {
       decode(filter, bl_iter);
     } catch (const buffer::error&) {
-      ldpp_dout(dpp, 10) << __func__
-                         << "::RESTART without decodable filter payload, "
-                         << "using empty filter" << dendl;
-      filter = dedup_filter_t{};
-      return 0;
+      ldpp_dout(dpp, 1) << __func__
+                        << "::RESTART rejected: invalid filter payload" << dendl;
+      return -EINVAL;
     }
 
     if (!filter.allow_buckets.empty() && !filter.deny_buckets.empty()) {
@@ -3183,7 +3189,7 @@ namespace rgw::dedup {
     case URGENT_MSG_RESTART:
       if (!d_ctl.dedup_exec) {
         dedup_filter_t filter;
-        ret = process_restart_filter(dpp, bl_iter, filter);
+        ret = decode_restart_filter(dpp, bl_iter, filter);
         if (ret < 0) {
           break;
         }

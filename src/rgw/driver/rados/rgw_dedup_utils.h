@@ -195,7 +195,8 @@ namespace rgw::dedup {
     uint64_t non_default_storage_class_objs_bytes = 0;
 
     uint64_t ingress_corrupted_etag = 0;
-    uint64_t ingress_skip_filtered = 0;
+    uint64_t ingress_skip_filtered_bucket = 0;
+    uint64_t ingress_skip_filtered_storage_class = 0;
 
     uint64_t ingress_skip_too_small_bytes = 0;
     uint64_t ingress_skip_too_small = 0;
@@ -328,8 +329,7 @@ namespace rgw::dedup {
              deny_storage_classes.empty();
     }
 
-    bool should_process(const std::string& bucket_name,
-                        const std::string& storage_class) const
+    bool should_process_bucket(const std::string& bucket_name) const
     {
       if (!allow_buckets.empty() &&
           allow_buckets.find(bucket_name) == allow_buckets.end()) {
@@ -339,6 +339,11 @@ namespace rgw::dedup {
           deny_buckets.find(bucket_name) != deny_buckets.end()) {
         return false;
       }
+      return true;
+    }
+
+    bool should_process_storage_class(const std::string& storage_class) const
+    {
       if (!allow_storage_classes.empty() &&
           allow_storage_classes.find(storage_class) == allow_storage_classes.end()) {
         return false;
@@ -409,9 +414,6 @@ namespace rgw::dedup {
 
   bool hex2int(const char *p, const char *p_end, uint64_t *p_val);
   bool parse_etag_string(const std::string& etag, parsed_etag_t *parsed_etag);
-  int read_str_list_file(const std::string& path,
-                         std::unordered_set<std::string>& entries,
-                         std::ostream& err);
   int build_dedup_filter(const std::string& allow_bucket_list,
                          const std::string& deny_bucket_list,
                          const std::string& allow_storage_class_list,
