@@ -376,7 +376,7 @@ namespace rgw::dedup {
       if (line.empty() || line[0] == '#') {
         continue;
       }
-      entries.insert(std::move(line));
+      entries.insert(line);
     }
     return 0;
   }

@@ -3184,7 +3184,7 @@ namespace rgw::dedup {
         if (ret < 0) {
           break;
         }
-        d_ctl.filter = std::move(filter);
+        d_ctl.filter = filter;
         d_ctl.remote_restart_req = true;
         d_cond.notify_all();
       }
