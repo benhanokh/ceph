@@ -3096,6 +3096,9 @@ namespace rgw::dedup {
     try {
       decode(filter, bl_iter);
     } catch (const buffer::error&) {
+      ldpp_dout(dpp, 10) << __func__
+                         << "::RESTART without decodable filter payload, "
+                         << "using empty filter" << dendl;
       filter = dedup_filter_t{};
       return 0;
     }

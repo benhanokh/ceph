@@ -400,9 +400,9 @@ namespace rgw::dedup {
       return -EINVAL;
     }
 
-    auto load = [&](const std::string& path,
-                    std::unordered_set<std::string>& target,
-                    const char* opt_name) -> int {
+    auto load_filter_file = [&](const std::string& path,
+                                std::unordered_set<std::string>& target,
+                                const char* opt_name) -> int {
       if (path.empty()) {
         return 0;
       }
@@ -420,20 +420,20 @@ namespace rgw::dedup {
     };
 
     int r = 0;
-    if ((r = load(allow_bucket_list, filter.allow_buckets,
-                  "--allow-bucket-list")) < 0) {
+    if ((r = load_filter_file(allow_bucket_list, filter.allow_buckets,
+                              "--allow-bucket-list")) < 0) {
       return r;
     }
-    if ((r = load(deny_bucket_list, filter.deny_buckets,
-                  "--deny-bucket-list")) < 0) {
+    if ((r = load_filter_file(deny_bucket_list, filter.deny_buckets,
+                              "--deny-bucket-list")) < 0) {
       return r;
     }
-    if ((r = load(allow_storage_class_list, filter.allow_storage_classes,
-                  "--allow-storage-class-list")) < 0) {
+    if ((r = load_filter_file(allow_storage_class_list, filter.allow_storage_classes,
+                              "--allow-storage-class-list")) < 0) {
       return r;
     }
-    if ((r = load(deny_storage_class_list, filter.deny_storage_classes,
-                  "--deny-storage-class-list")) < 0) {
+    if ((r = load_filter_file(deny_storage_class_list, filter.deny_storage_classes,
+                              "--deny-storage-class-list")) < 0) {
       return r;
     }
     return 0;
