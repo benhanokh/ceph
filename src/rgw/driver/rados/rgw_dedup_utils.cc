@@ -373,7 +373,7 @@ namespace rgw::dedup {
     std::string line;
     while (std::getline(in, line)) {
       line = trim_whitespace(line);
-      if (line.empty() || (!line.empty() && line[0] == '#')) {
+      if (line.empty() || line[0] == '#') {
         continue;
       }
       entries.insert(std::move(line));
