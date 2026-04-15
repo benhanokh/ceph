@@ -414,7 +414,7 @@ namespace rgw::dedup {
       }
       if (target.empty()) {
         err << "WARNING: " << opt_name << " file '" << path
-            << "' is empty; no filtering will be applied for this dimension\n";
+            << "' is empty; all items will be allowed for this dimension\n";
       }
       return 0;
     };
