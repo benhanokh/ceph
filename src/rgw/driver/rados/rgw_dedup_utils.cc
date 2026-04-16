@@ -454,10 +454,10 @@ namespace rgw::dedup {
           tenant      = name.substr(0, pos);
           bucket_name = name.substr(pos + 1);
         }
-        int r = driver->load_bucket(dpp, rgw_bucket(tenant, bucket_name), &bucket, y);
-        if (r < 0) {
+        int load_ret = driver->load_bucket(dpp, rgw_bucket(tenant, bucket_name), &bucket, y);
+        if (load_ret < 0) {
           err << "ERROR: " << opt_name << ": bucket '" << name
-              << "' not found: " << cpp_strerror(-r) << "\n";
+              << "' not found: " << cpp_strerror(-load_ret) << "\n";
           return -EINVAL;
         }
       }
