@@ -15,6 +15,7 @@
 #include "rgw_dedup_utils.h"
 #include "common/ceph_crypto.h"
 #include "common/errno.h"
+#include "rgw/rgw_rest.h"
 #include <fstream>
 #include <cctype>
 namespace rgw::dedup {
@@ -360,23 +361,57 @@ namespace rgw::dedup {
   }
 
   //---------------------------------------------------------------------------
-  int read_str_list_file(const std::string& path,
-                         std::unordered_set<std::string>& entries,
-                         std::ostream& err)
+  static int read_str_list_file(const std::string&               path,
+                                std::unordered_set<std::string>& out,
+                                bool                             is_bucket,
+                                std::ostream&                    err)
   {
-    std::ifstream in(path);
-    if (!in.is_open()) {
-      err << "ERROR: failed opening file '" << path << "'\n";
-      return -ENOENT;
+    std::ifstream f(path);
+    if (!f) {
+      err << "ERROR: cannot open file '" << path << "': "
+          << cpp_strerror(errno) << "\n";
+      return -EINVAL;
     }
 
     std::string line;
-    while (std::getline(in, line)) {
-      line = trim_whitespace(line);
-      if (line.empty() || line[0] == '#') {
-        continue;
+    int line_no = 0;
+    while (std::getline(f, line)) {
+      ++line_no;
+
+      // strip trailing whitespace
+      auto end = line.find_last_not_of(" \t\r\n");
+      if (end == std::string::npos) continue;  // blank line
+      std::string name = line.substr(0, end + 1);
+
+      // skip comment lines
+      if (name[0] == '#') continue;
+
+      // reject embedded whitespace within the name
+      if (name.find_first_of(" \t") != std::string::npos) {
+        err << "ERROR: " << path << ":" << line_no
+            << ": name must not contain whitespace: '" << line << "'\n";
+        return -EINVAL;
       }
-      entries.insert(line);
+
+      if (is_bucket) {
+        if (RGWHandler_REST::validate_bucket_name(name) != 0) {
+          err << "ERROR: " << path << ":" << line_no
+              << ": invalid bucket name: '" << name << "'\n";
+          return -EINVAL;
+        }
+      } else {
+        if (name.empty()) continue;
+        for (char c : name) {
+          if (!isupper(c) && !isdigit(c) && c != '_') {
+            err << "ERROR: " << path << ":" << line_no
+                << ": invalid storage-class name (must be uppercase letters, "
+                << "digits, or underscores): '" << name << "'\n";
+            return -EINVAL;
+          }
+        }
+      }
+
+      out.insert(name);
     }
     return 0;
   }
@@ -400,42 +435,24 @@ namespace rgw::dedup {
       return -EINVAL;
     }
 
-    auto load_filter_file = [&](const std::string& path,
-                                std::unordered_set<std::string>& target,
-                                const char* opt_name) -> int {
-      if (path.empty()) {
-        return 0;
-      }
-      int r = read_str_list_file(path, target, err);
-      if (r < 0) {
-        err << "ERROR: failed to read " << opt_name
-            << " file '" << path << "': " << cpp_strerror(-r) << "\n";
-        return r;
-      }
-      if (target.empty()) {
-        err << "WARNING: " << opt_name << " file '" << path
-            << "' is empty; all items will be allowed for this dimension\n";
+    auto load = [&](const std::string& path,
+                    std::unordered_set<std::string>& out,
+                    bool is_bucket) -> int {
+      if (path.empty()) return 0;
+      int ret = read_str_list_file(path, out, is_bucket, err);
+      if (ret != 0) return -EINVAL;
+      if (out.empty()) {
+        err << "WARNING: filter file '" << path << "' produced an empty list\n";
       }
       return 0;
     };
 
     int r = 0;
-    if ((r = load_filter_file(allow_bucket_list, filter.allow_buckets,
-                              "--allow-bucket-list")) < 0) {
-      return r;
-    }
-    if ((r = load_filter_file(deny_bucket_list, filter.deny_buckets,
-                              "--deny-bucket-list")) < 0) {
-      return r;
-    }
-    if ((r = load_filter_file(allow_storage_class_list, filter.allow_storage_classes,
-                              "--allow-storage-class-list")) < 0) {
-      return r;
-    }
-    if ((r = load_filter_file(deny_storage_class_list, filter.deny_storage_classes,
-                              "--deny-storage-class-list")) < 0) {
-      return r;
-    }
+    if ((r = load(allow_bucket_list,        filter.allow_buckets,         true))  < 0) return r;
+    if ((r = load(deny_bucket_list,         filter.deny_buckets,          true))  < 0) return r;
+    if ((r = load(allow_storage_class_list, filter.allow_storage_classes, false)) < 0) return r;
+    if ((r = load(deny_storage_class_list,  filter.deny_storage_classes,  false)) < 0) return r;
+
     return 0;
   }
 
@@ -479,7 +496,8 @@ namespace rgw::dedup {
     this->non_default_storage_class_objs += other.non_default_storage_class_objs;
     this->non_default_storage_class_objs_bytes += other.non_default_storage_class_objs_bytes;
     this->ingress_corrupted_etag += other.ingress_corrupted_etag;
-    this->ingress_skip_filtered += other.ingress_skip_filtered;
+    this->ingress_skip_filtered_bucket        += other.ingress_skip_filtered_bucket;
+    this->ingress_skip_filtered_storage_class += other.ingress_skip_filtered_storage_class;
     this->ingress_skip_too_small_bytes += other.ingress_skip_too_small_bytes;
     this->ingress_skip_too_small += other.ingress_skip_too_small;
     this->ingress_skip_too_small_64KB_bytes += other.ingress_skip_too_small_64KB_bytes;
@@ -535,9 +553,13 @@ namespace rgw::dedup {
 
     {
       Formatter::ObjectSection skipped(*f, "skipped");
-      if (this->ingress_skip_filtered) {
-        f->dump_unsigned("Ingress skip: filtered objs",
-                         this->ingress_skip_filtered);
+      if (this->ingress_skip_filtered_bucket) {
+        f->dump_unsigned("Ingress skip: filtered bucket",
+                         this->ingress_skip_filtered_bucket);
+      }
+      if (this->ingress_skip_filtered_storage_class) {
+        f->dump_unsigned("Ingress skip: filtered storage class",
+                         this->ingress_skip_filtered_storage_class);
       }
       if (this->ingress_skip_too_small) {
         f->dump_unsigned("Ingress skip: too small objs",
@@ -579,7 +601,7 @@ namespace rgw::dedup {
   //---------------------------------------------------------------------------
   void encode(const worker_stats_t& w, ceph::bufferlist& bl)
   {
-    ENCODE_START(2, 1, bl);
+    ENCODE_START(1, 1, bl);
     encode(w.ingress_obj, bl);
     encode(w.ingress_obj_bytes, bl);
     encode(w.egress_records, bl);
@@ -599,7 +621,6 @@ namespace rgw::dedup {
     encode(w.non_default_storage_class_objs_bytes, bl);
 
     encode(w.ingress_corrupted_etag, bl);
-    encode(w.ingress_skip_filtered, bl);
 
     encode(w.ingress_skip_too_small_bytes, bl);
     encode(w.ingress_skip_too_small, bl);
@@ -608,13 +629,16 @@ namespace rgw::dedup {
     encode(w.ingress_skip_too_small_64KB, bl);
 
     encode(w.duration, bl);
+
+    encode(w.ingress_skip_filtered_bucket,        bl);
+    encode(w.ingress_skip_filtered_storage_class, bl);
     ENCODE_FINISH(bl);
   }
 
   //---------------------------------------------------------------------------
   void decode(worker_stats_t& w, ceph::bufferlist::const_iterator& bl)
   {
-    DECODE_START(2, bl);
+    DECODE_START(1, bl);
     decode(w.ingress_obj, bl);
     decode(w.ingress_obj_bytes, bl);
     decode(w.egress_records, bl);
@@ -631,15 +655,15 @@ namespace rgw::dedup {
     decode(w.non_default_storage_class_objs, bl);
     decode(w.non_default_storage_class_objs_bytes, bl);
     decode(w.ingress_corrupted_etag, bl);
-    if (struct_v >= 2) {
-      decode(w.ingress_skip_filtered, bl);
-    }
     decode(w.ingress_skip_too_small_bytes, bl);
     decode(w.ingress_skip_too_small, bl);
     decode(w.ingress_skip_too_small_64KB_bytes, bl);
     decode(w.ingress_skip_too_small_64KB, bl);
 
     decode(w.duration, bl);
+
+    decode(w.ingress_skip_filtered_bucket,        bl);
+    decode(w.ingress_skip_filtered_storage_class, bl);
     DECODE_FINISH(bl);
   }
 
