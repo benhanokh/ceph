@@ -15,6 +15,7 @@
 #pragma once
 #include <string>
 #include "include/rados/buffer.h"
+#include "rgw_sal.h"
 #include "include/encoding.h"
 #include "common/Formatter.h"
 #include "common/ceph_json.h"
@@ -412,7 +413,10 @@ namespace rgw::dedup {
   int read_str_list_file(const std::string& path,
                          std::unordered_set<std::string>& entries,
                          std::ostream& err);
-  int build_dedup_filter(const std::string& allow_bucket_list,
+  int build_dedup_filter(rgw::sal::Driver* driver,
+                         const DoutPrefixProvider* dpp,
+                         optional_yield y,
+                         const std::string& allow_bucket_list,
                          const std::string& deny_bucket_list,
                          const std::string& allow_storage_class_list,
                          const std::string& deny_storage_class_list,

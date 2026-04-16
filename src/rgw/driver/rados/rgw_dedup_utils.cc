@@ -15,6 +15,7 @@
 #include "rgw_dedup_utils.h"
 #include "common/ceph_crypto.h"
 #include "common/errno.h"
+#include "rgw_sal.h"
 #include <fstream>
 #include <cctype>
 namespace rgw::dedup {
@@ -382,7 +383,10 @@ namespace rgw::dedup {
   }
 
   //---------------------------------------------------------------------------
-  int build_dedup_filter(const std::string& allow_bucket_list,
+  int build_dedup_filter(rgw::sal::Driver* driver,
+                         const DoutPrefixProvider* dpp,
+                         optional_yield y,
+                         const std::string& allow_bucket_list,
                          const std::string& deny_bucket_list,
                          const std::string& allow_storage_class_list,
                          const std::string& deny_storage_class_list,
@@ -435,6 +439,39 @@ namespace rgw::dedup {
     if ((r = load_filter_file(deny_storage_class_list, filter.deny_storage_classes,
                               "--deny-storage-class-list")) < 0) {
       return r;
+    }
+
+    // Validate that every bucket named in the filter actually exists.
+    auto validate_buckets = [&](const std::unordered_set<std::string>& names,
+                                const char* opt_name) -> int {
+      for (const auto& name : names) {
+        std::unique_ptr<rgw::sal::Bucket> bucket;
+        // split optional tenant/name (mirrors radosgw-admin init_bucket)
+        std::string tenant;
+        std::string bucket_name = name;
+        auto pos = name.find('/');
+        if (pos != std::string::npos) {
+          tenant      = name.substr(0, pos);
+          bucket_name = name.substr(pos + 1);
+        }
+        int r = driver->load_bucket(dpp, rgw_bucket(tenant, bucket_name), &bucket, y);
+        if (r < 0) {
+          err << "ERROR: " << opt_name << ": bucket '" << name
+              << "' not found: " << cpp_strerror(-r) << "\n";
+          return -EINVAL;
+        }
+      }
+      return 0;
+    };
+
+    int rv = 0;
+    if (!filter.allow_buckets.empty()) {
+      rv = validate_buckets(filter.allow_buckets, "--allow-bucket-list");
+      if (rv < 0) return rv;
+    }
+    if (!filter.deny_buckets.empty()) {
+      rv = validate_buckets(filter.deny_buckets, "--deny-bucket-list");
+      if (rv < 0) return rv;
     }
     return 0;
   }

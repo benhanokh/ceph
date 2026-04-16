@@ -9424,7 +9424,10 @@ next:
 #endif
       }
 
-      int ret = build_dedup_filter(allow_bucket_list,
+      int ret = build_dedup_filter(store,
+                                   dpp(),
+                                   null_yield,
+                                   allow_bucket_list,
                                    deny_bucket_list,
                                    allow_storage_class_list,
                                    deny_storage_class_list,
