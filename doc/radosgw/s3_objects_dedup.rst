@@ -5,6 +5,9 @@ Full RGW Object Dedup
 Full RGW object deduplication adds ``radosgw-admin`` commands to remove
 duplicated RGW tail objects and to collect and report dedup statistics.
 
+These operations are also available through the `Admin Ops API <../radosgw/adminops/#dedup>`_
+under ``/{admin}/dedup``.
+
 
 Admin Commands
 ==============
@@ -32,6 +35,30 @@ Admin Commands
    RGW server during dedup, ``0`` means unlimited.
 - ``radosgw-admin dedup throttle --stat``:
    Displays dedup throttle setting.
+
+The ``dedup estimate`` and ``dedup exec`` commands also accept filter options:
+
+- ``--allow-bucket-list <file>``:
+   Path to a file listing bucket names to include (allowlist mode).
+   Only buckets listed in the file will be processed.
+   Mutually exclusive with ``--deny-bucket-list``.
+
+- ``--deny-bucket-list <file>``:
+   Path to a file listing bucket names to exclude (denylist mode).
+   All buckets except those listed in the file will be processed.
+   Mutually exclusive with ``--allow-bucket-list``.
+
+- ``--allow-storage-class-list <file>``:
+   Path to a file listing storage class names to include (allowlist mode).
+   Mutually exclusive with ``--deny-storage-class-list``.
+
+- ``--deny-storage-class-list <file>``:
+   Path to a file listing storage class names to exclude (denylist mode).
+   Mutually exclusive with ``--allow-storage-class-list``.
+
+**File format:** One name per line. Lines starting with or containing ``#``
+are treated as comments. Whitespace is ignored. The file must contain at least
+one valid name; an empty or all-comment file is rejected.
 
 
 Skipped Objects
@@ -108,19 +135,21 @@ matches. If they are, we proceed with the deduplication:
 - Copy the manifest from the source to the target.
 - Remove all tail objects on the target.
 
-
 Split Head Mode
 ===============
 
-Dedup code can split the head object into 2 objects
+The dedup code can split a head object into 2 objects:
 
-- one with attributes and no data and
+- one with attributes and no data, and
 - a new tail object with only data.
 
-The new tail object will be deduped, unlike the head objects, which cannot
+The new tail object will be deduped, unlike head objects, which cannot
 be deduplicated.
-This feature is only enabled for RGW objects without existing tail objects
-(in other words, objects sized 4 MB or less).
+
+:confval:`rgw_dedup_split_obj_head` (default: true). Setting
+this option to ``false`` disables split-head entirely.
+
+.. confval:: rgw_dedup_split_obj_head
 
 
 Memory Usage
@@ -129,19 +158,27 @@ Memory Usage
  +------------------+----------+
  | RGW Object Count |  Memory  |
  +==================+==========+
- | 1M               | 8 MB     |
+ |      1M          |    8 MB  |
  +------------------+----------+
- | 4M               | 16 MB    |
+ |      4M          |   16 MB  |
  +------------------+----------+
- | 16M              | 32 MB    |
+ |     16M          |   32 MB  |
  +------------------+----------+
- | 64M              | 64 MB    |
+ |     64M          |   64 MB  |
  +------------------+----------+
- | 256M             | 128 MB   |
+ |    256M          |  128 MB  |
  +------------------+----------+
- | 1024M (1G)       | 256 MB   |
+ |   1024M   (1G)   |  256 MB  |
  +------------------+----------+
- | 4096M (4G)       | 512 MB   |
+ |   4096M   (4G)   |  512 MB  |
  +------------------+----------+
- | 16384M (16G)     | 1024 MB  |
+ |  16384M  (16G)   | 1024 MB  |
  +------------------+----------+
+ |  65536M  (64G)   | 2048 MB  |
+ +------------------+----------+
+ | 262144M (256G)   | 4096 MB  |
+ +------------------+----------+
+
+ .. note::
+     Pools with more than ~213 billion user objects (256B with headroom) exceed the
+     dedup system's maximum capacity and will be rejected at startup.

@@ -187,8 +187,8 @@ ReplicatedRecoveryBackend::maybe_pull_missing_obj(
            });
        });
   }).handle_error_interruptible(
-    crimson::ct_error::assert_all(fmt::format(
-      "{} {} error with {} need {} ", pg, FNAME, soid, need).c_str())
+    crimson::ct_error::assert_all("{} {} error with {} need {}",
+                                      std::cref(pg), FNAME, soid, need)
   );
 }
 
@@ -730,11 +730,6 @@ ReplicatedRecoveryBackend::read_object_for_push_op(
   }));
 }
 
-static std::optional<std::string> nullopt_if_empty(const std::string& s)
-{
-  return s.empty() ? std::nullopt : std::make_optional(s);
-}
-
 static bool is_too_many_entries_per_chunk(const PushOp* push_op)
 {
   const uint64_t entries_per_chunk =
@@ -789,8 +784,9 @@ ReplicatedRecoveryBackend::read_omap_for_push_op(
         new_progress.omap_complete = false;
       }
     }).handle_error(
-      crimson::os::FuturizedStore::Shard::read_errorator::assert_all(fmt::format(
-        "{} ReplicatedRecoveryBackend::read_omap_for_push_op error with {}", pg, oid).c_str())
+      crimson::os::FuturizedStore::Shard::read_errorator::assert_all(
+        "{} ReplicatedRecoveryBackend::read_omap_for_push_op error with {}",
+        std::cref(pg), oid)
     )
   );
 }
@@ -1232,7 +1228,14 @@ ReplicatedRecoveryBackend::prep_push_target(
   // create a new object
   if (!complete || !recovery_info.object_exist) {
     t->remove(coll->get_cid(), target_oid);
-    t->touch(coll->get_cid(), target_oid);
+    if (complete) {
+      t->touch(coll->get_cid(), target_oid);
+    } else {
+      t->touch_temp(
+        coll->get_cid(),
+        target_oid,
+        ghobject_t(recovery_info.soid));
+    }
     object_info_t oi;
     oi.decode(attrs.at(OI_ATTR));
     t->set_alloc_hint(coll->get_cid(), target_oid,

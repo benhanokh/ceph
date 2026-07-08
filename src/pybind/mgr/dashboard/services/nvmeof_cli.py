@@ -14,6 +14,7 @@ from mgr_module import CLICheckNonemptyFileInput, HandleCommandResult
 from prettytable import PrettyTable
 
 from ..cli import DBCLICommand
+from ..exceptions import DashboardException
 from ..model.nvmeof import CliFieldTransformer, CliFlags, CliHeader
 from ..rest_client import RequestException
 from .nvmeof_conf import ManagedByOrchestratorException, \
@@ -138,6 +139,36 @@ def convert_from_bytes(num_in_bytes):
     return f"{size_str}{units[unit_index]}"
 
 
+def resolve_nvmeof_server_address(
+    *,
+    server_address: Optional[str] = None,
+    traddr: Optional[str] = None,
+    require: bool = False,
+) -> Optional[str]:
+    sa = (server_address or "").strip() or None
+    ta = (traddr or "").strip() or None
+
+    if sa and ta:
+        raise DashboardException(
+            msg="Pass either 'server_address' or deprecated 'traddr', not both.",
+            code="server_address_and_traddr_mutually_exclusive",
+            http_status_code=400,
+            component="nvmeof",
+        )
+
+    resolved = sa or ta
+
+    if require and not resolved:
+        raise DashboardException(
+            msg="Missing required gateway address: 'server_address' (or deprecated 'traddr').",
+            code="missing_server_address",
+            http_status_code=400,
+            component="nvmeof",
+        )
+
+    return resolved
+
+
 class OutputFormatter(ABC):
     @abstractmethod
     def format_output(self, data, model):
@@ -173,6 +204,8 @@ class AnnotatedDataTextOutputFormatter(OutputFormatter):
 
     def _get_list_text_output(self, data):
         columns = list(dict.fromkeys([key for obj in data for key in obj.keys()]))
+        if not columns:
+            return ''
         table = self._create_table(columns)
         for d in data:
             table.add_row(self._get_row(columns, d))
@@ -180,6 +213,8 @@ class AnnotatedDataTextOutputFormatter(OutputFormatter):
 
     def _get_object_text_output(self, data):
         columns = [k for k in data.keys() if k not in ["status", "error_message"]]
+        if not columns:
+            return ''
         table = self._create_table(columns)
         table.add_row(self._get_row(columns, data))
         return table.get_string()
@@ -457,6 +492,9 @@ class NvmeofCLICommand(DBCLICommand):
                                    self.prefix, exc_info=True)
 
                 out = message if message else self._output_formatter.format_output(ret, self._model)
+                wrn_msg = ret.get('error_message', '')
+                if wrn_msg:
+                    out += f"\nWarning: {wrn_msg}"
 
             elif out_format == 'json':
                 out = json.dumps(ret, indent=4)

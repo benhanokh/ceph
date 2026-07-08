@@ -107,7 +107,8 @@
           </cd-help-text>
         </cds-checkbox>
       </div>
-      <div class="form-item">
+      <div *ngIf="multisiteZoneForm.get('master_zone')?.value === false"
+           class="form-item">
         <cds-checkbox
           id="archive_zone"
           formControlName="archive_zone"

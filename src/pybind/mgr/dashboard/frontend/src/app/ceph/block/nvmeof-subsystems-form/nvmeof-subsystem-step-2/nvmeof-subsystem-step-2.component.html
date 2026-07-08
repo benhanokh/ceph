@@ -6,7 +6,7 @@
        [narrow]="true"
        [fullWidth]="true">
     <div cdsCol
-         [columnNumbers]="{lg: 10}"
+         [columnNumbers]="{sm: 4, md: 8, lg: 16}"
          class="cd-nvmeof-subsystem-step-two">
       <div cdsRow
            class="form-item cds-mb-0">
@@ -23,6 +23,7 @@
           orientation="vertical">
           <cds-radio
             [value]="HOST_TYPE.ALL"
+            [disabled]="!allowAllHosts"
             class="cds-mb-2"
             i18n>Allow all hosts</cds-radio>
           <span class="cds--form__helper-text cds-mb-3"
@@ -60,7 +61,7 @@
            class="form-item">
         <h1
           class="cds--type-heading-compact-01"
-          i18n>Add hosts</h1>
+          i18n>Add host manually</h1>
         <label class="cds--label"
                for="hostname">
           <span i18n>Host name</span>
@@ -89,6 +90,33 @@
             <span i18n>Add</span>
             <cd-icon type="add"></cd-icon>
           </button>
+        </div>
+      </div>
+      <div cdsRow
+           class="form-item">
+        <h1
+          class="cds--type-heading-compact-01"
+          i18n>Upload CSV file</h1>
+        <p
+          class="cds--type-body-01 cds-mb-3 cd-nvmeof-subsystem-step-two-added-hosts-text"
+          i18n>Upload a CSV file containing a list of host names.</p>
+        <div class="cd-nvmeof-subsystem-step-two-csv-container">
+          <cds-file-uploader
+            [drop]="true"
+            [dropText]="csvDropText"
+            [accept]="['csv']"
+            [multiple]="false"
+            size="md"
+            class="cd-nvmeof-subsystem-step-two-csv-input"
+            (filesChange)="onCsvUpload($event)"
+            (removeFile)="onCsvUploadRemove()"></cds-file-uploader>
+          @if(csvUploadError) {
+          <cd-alert-panel
+            type="danger"
+            [showTitle]="false"
+            size="slim"
+            class="cds-mt-3 cd-nvmeof-subsystem-step-two-csv-error-panel">{{ csvUploadError }}</cd-alert-panel>
+          }
         </div>
       </div>
       }
@@ -125,7 +153,7 @@
     i18n>Added hosts ({{addedHostsLength}})</h1>
   <p
     i18n
-    class="cds--type-body-01 cd-nvmeof-subsystem-step-two-added-hosts-text">No hosts added yet.</p>
+    class="cds--type-body-01 cd-nvmeof-subsystem-step-two-added-hosts-text">No hosts added yet. Add hosts manually or upload a CSV file.</p>
   } @else {
   <cds-contained-list
     label="Added hosts ({{addedHostsLength}})"
