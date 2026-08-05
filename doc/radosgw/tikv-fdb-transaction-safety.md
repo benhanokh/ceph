@@ -435,3 +435,38 @@ case), the epoch counter's zero-cost uncontended path is likely preferable. For
 workloads with sustained concurrent writes to a single object, the pessimistic
 lock avoids the retry amplification. Benchmarking on realistic workloads is
 required before committing to either approach for TiKV.
+
+---
+
+## 9. Further thoughts
+
+### Database agnosticism and isolation level requirements
+
+This document has analysed TiKV (snapshot isolation) and FDB (serializable)
+in detail. Any additional KV backend would need to be evaluated against the
+same failure modes — the correct protection mechanism depends entirely on what
+isolation guarantees the database provides, and a database with weaker or
+different guarantees may require yet another approach.
+
+If the goal is complete database agnosticism — supporting arbitrary backends
+without per-backend analysis — the declarative API (Option 1) is the stronger
+choice. The correctness argument is fully contained inside each backend
+implementation; the RGW layer is insulated from the isolation model entirely.
+
+If agnosticism is not required and the backend set is known and fixed, the
+`withObjectTxn` approach (Option 2) is viable, but the transaction safety
+requirements must be documented precisely as a contract that any backend
+implementation must satisfy. Without that contract, adding a new backend risks
+silently introducing the races described in this document.
+
+### Multipart uploads
+
+The transaction safety analysis here covers version-chain mutations and
+child-key mutations (tags, annotations, extended values). Multipart upload
+operations — `InitiateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload`,
+`AbortMultipartUpload` — involve their own patterns of reads and writes across
+`:M:` keys and have not been analysed in detail. It is likely that similar
+transaction safety questions arise, particularly for operations that scan the
+`:M:` keyspace (e.g. `AbortMultipartUpload` enumerating parts to clean up) or
+that race across the initiate/complete/abort boundary. This warrants a
+dedicated analysis.
