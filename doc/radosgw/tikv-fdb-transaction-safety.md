@@ -1,9 +1,16 @@
 # Transaction Safety for Object Mutations on TiKV and FDB
 
-This document explains why naive read-then-write transaction patterns fail for
-object mutations in TiKV, how the failure mode differs between version-chain
-and child-key operations, why FDB is unaffected, and what the correct fix
-looks like.
+The version-chain operations (PUT, DELETE, promote-on-delete-current) and
+child-entry operations (tags, annotations) described in
+[Versioned-Bucket-Operations.md](Versioned-Bucket-Operations.md) and
+[KV-Based-Design-For-RGW.md](KV-Based-Design-For-RGW.md) both involve reading
+keys to determine what to write next. On TiKV (snapshot isolation), those reads
+are invisible to conflict detection — a concurrent writer can invalidate them
+without being caught. On FDB (serializable), reads automatically register
+conflict ranges and the problem does not arise. This document analyses the two
+failure modes, explains why they require different fixes, and proposes two
+structural solutions: a declarative backend API, or a `withObjectTxn` entry
+point that enforces a mandatory claim on `:O:` before any mutation.
 
 ---
 
