@@ -32,6 +32,7 @@ public:
   virtual bool is_tier_type_s3() { return next->is_tier_type_s3(); }
   virtual const std::string& get_storage_class() override { return next->get_storage_class(); }
   virtual bool retain_head_object() override { return next->retain_head_object(); }
+  virtual bool retain_current_version() override { return next->retain_current_version(); }
   virtual bool allow_read_through() { return next->allow_read_through(); }
   virtual uint64_t get_read_through_restore_days() { return next->get_read_through_restore_days(); }
 
@@ -712,6 +713,8 @@ public:
   virtual rgw_bucket& get_key() override { return next->get_key(); }
   virtual RGWBucketInfo& get_info() override { return next->get_info(); }
 
+  virtual void set_cache_request() override {};
+
   virtual void print(std::ostream& out) const override { return next->print(out); }
 
   virtual bool operator==(const Bucket& b) const override { return next->operator==(b); }
@@ -910,15 +913,18 @@ public:
   virtual int omap_set_val_by_key(const DoutPrefixProvider *dpp,
 				  const std::string& key, bufferlist& val,
 				  bool must_exist, optional_yield y) override;
-  virtual int chown(User& new_user, const DoutPrefixProvider* dpp,
-		    optional_yield y) override;
+  virtual int chown(const DoutPrefixProvider* dpp,
+                    const rgw_owner& new_owner,
+                    const std::string& new_owner_name,
+                    optional_yield y) override;
 
   virtual std::unique_ptr<Object> clone() override {
     return std::make_unique<FilterObject>(*this);
   }
 
-  virtual jspan_context& get_trace() { return next->get_trace(); }
-  virtual void set_trace (jspan_context&& _trace_ctx) { next->set_trace(std::move(_trace_ctx)); }
+  virtual jspan_context& get_trace() override { return next->get_trace(); }
+  virtual void set_trace (jspan_context&& _trace_ctx) override { next->set_trace(std::move(_trace_ctx)); }
+  virtual void set_cache_request() override {};
 
   virtual void print(std::ostream& out) const override { return next->print(out); }
 
@@ -938,7 +944,7 @@ public:
   virtual uint64_t get_size() override { return next->get_size(); }
   virtual const std::string& get_etag() override { return next->get_etag(); }
   virtual ceph::real_time& get_mtime() override { return next->get_mtime(); }
-  virtual const std::optional<rgw::cksum::Cksum>& get_cksum() {
+  virtual const std::optional<rgw::cksum::Cksum>& get_cksum() override {
     return next->get_cksum();
   }
 };

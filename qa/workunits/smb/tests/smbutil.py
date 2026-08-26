@@ -1,5 +1,6 @@
 import base64
 import contextlib
+import os
 import pathlib
 import time
 
@@ -89,6 +90,14 @@ class SMBTestConf:
         # it for now until we really need to check
         return self.clients()[0]
 
+    @property
+    def testdir(self):
+        return self._data.get('testdir') or os.path.expanduser('~/cephtest')
+
+    @property
+    def params(self):
+        return self._data.get('params') or {}
+
 
 @contextlib.contextmanager
 def connection(conf, share):
@@ -168,14 +177,25 @@ class PathWrapper:
 
 
 def get_shares(smb_cfg):
-    """Get all SMB shares."""
+    """Get all SMB shares.
+
+    ``ceph smb show`` defaults to --results=collapsed: with exactly one
+    matching share it returns the share object itself; otherwise it returns
+    {"resources": [...]}. Normalize both shapes to a list.
+    """
     jres = cephutil.cephadm_shell_cmd(
         smb_cfg,
         ["ceph", "smb", "show", "ceph.smb.share"],
         load_json=True,
     )
     assert jres.obj
-    resources = jres.obj['resources']
+    obj = jres.obj
+    if 'resources' in obj:
+        resources = obj['resources']
+    elif obj.get('resource_type') == 'ceph.smb.share':
+        resources = [obj]
+    else:
+        raise AssertionError(f'unexpected smb show output: {obj!r}')
     assert len(resources) > 0
     assert all(r['resource_type'] == 'ceph.smb.share' for r in resources)
     return resources
@@ -190,7 +210,7 @@ def get_share_by_id(smb_cfg, cluster_id, share_id):
     return None
 
 
-def apply_share_config(smb_cfg, share):
+def apply_share_config(smb_cfg, share, immediate=False):
     """Apply share configuration via the apply command."""
     jres = cephutil.cephadm_shell_cmd(
         smb_cfg,
@@ -209,5 +229,6 @@ def apply_share_config(smb_cfg, share):
     assert resources_ret['resource_type'] == 'ceph.smb.share'
     # sleep to ensure the settings got applied in smbd
     # TODO: make this more dynamic somehow
-    time.sleep(60)
+    if not immediate:
+        time.sleep(60)
     return resources_ret

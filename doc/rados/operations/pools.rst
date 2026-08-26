@@ -461,7 +461,7 @@ You may set values for the following keys:
 
 .. describe:: supports_omap
 
-    :Description: Determines whether omap operations can be performed on a pool. On by default for replicated pools, off by default for erasure coded pools. The flag can be enabled for erasure coded pools that allow ec optimizations.
+    :Description: Determines whether omap operations can be performed on a pool. On for replicated and erasure-coded pools with EC optimizations enabled (excluding Crimson pools), off for all other erasure-coded pools.
     :Type: Boolean
 
 .. describe:: hashpspool
@@ -836,7 +836,7 @@ Here are the breakdowns of the arguments:
 
 .. describe:: {min_size}
             
-   The minimum number of replicas that must be active for IO operations to be
+   The minimum number of replicas that must be active for I/O operations to be
    serviced.
 
    :Type: Integer

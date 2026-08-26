@@ -27,6 +27,8 @@
 #include <boost/random/binomial_distribution.hpp>
 #include <fmt/format.h>
 #include <gtest/gtest.h>
+#include <limits.h>
+#include <unistd.h>
 
 #include "global/global_context.h"
 #include "os/ObjectStore.h"
@@ -365,6 +367,117 @@ public:
     umount();
   }
 };
+
+class UnsharingBlobsOnRemove : public CheckedUmount {
+public:
+  struct MyCond : public C_SaferCond {
+    void reset() {
+      done = false;
+    }
+  };
+
+  std::string get_data_dir() {
+    return data_dir;
+  }
+ 
+  void write_object(
+    ghobject_t hoid,
+    size_t pos,
+    size_t size)
+  {
+    ObjectStore::Transaction t;
+    bufferlist bl;
+    bl.append(std::string(size, 'x'));
+    t.write(cid, hoid, pos, bl.length(), bl);
+    int r = queue_transaction(store, ch, std::move(t));
+    EXPECT_EQ(r, 0);
+  }
+
+  size_t count_shared_blob_trackers()
+  {
+    BlueStore* bstore = dynamic_cast<BlueStore*> (store.get());
+    auto* kv = bstore->get_kv();
+    // to be inline with BlueStore.cc
+    const string PREFIX_SHARED_BLOB = "X";
+    size_t cnt = 0;
+    auto it = kv->get_iterator(PREFIX_SHARED_BLOB);
+    ceph_assert(it);
+    for (it->lower_bound(string()); it->valid(); it->next()) {
+      ++cnt;
+    }
+    return cnt;
+  }
+
+  void commit_transaction()
+  {
+    t.register_on_commit(&mycond);
+    int r = queue_transaction(store, ch, std::move(t));
+    EXPECT_EQ(r, 0);
+    mycond.wait();
+    mycond.reset();
+    t = ObjectStore::Transaction();
+  }
+
+  BlueStore::OnodeRef get_onode(const coll_t& cid, const ghobject_t& hoid) {
+    BlueStore* bstore = dynamic_cast<BlueStore*> (store.get());
+    return bstore->debug_get_onode(cid, hoid);
+  }
+
+  size_t count_shared_blobs(BlueStore::OnodeRef o)
+  {
+    std::set<BlueStore::Blob*> visited;
+    size_t cnt = 0;
+    for (const auto& e : o->extent_map.extent_map) {
+      if (e.blob->get_blob().is_shared()) {
+        if (visited.emplace(e.blob.get()).second) {
+          cnt++;
+        }
+      }
+    }
+    return cnt;
+  }
+
+  coll_t cid;
+  ObjectStore::CollectionHandle ch;
+  uint16_t poolid;
+  ObjectStore::Transaction t;
+  MyCond mycond;
+  void prepare_store()
+  {
+    static constexpr uint64_t _1G = uint64_t(1024)*1024*1024;
+    SetVal(g_conf(), "bluestore_block_size", stringify(10 * _1G).c_str());
+    g_conf().apply_changes(nullptr);
+    DeferredSetup();
+    poolid = 1234;
+    cid = coll_t(spg_t(pg_t(1, poolid), shard_id_t::NO_SHARD));
+
+    ch = store->create_new_collection(cid);
+    {
+      ObjectStore::Transaction t;
+      t.create_collection(cid, 0);
+      int r = queue_transaction(store, ch, std::move(t));
+      ASSERT_EQ(r, 0);
+    }
+
+    ch.reset();
+    umount();
+  }
+
+  void cleanup_store()
+  {
+    mount();
+    ch = store->open_collection(cid);
+    {
+      ObjectStore::Transaction t;
+      t.remove_collection(cid);
+      int r = queue_transaction(store, ch, std::move(t));
+      ASSERT_EQ(r, 0);
+    }
+    ch.reset();
+    umount();
+  }
+};
+
 #endif // WITH_BLUESTORE
 
 class StoreTestSpecificAUSize : public StoreTestDeferredSetup {
@@ -1685,7 +1798,7 @@ TEST_P(StoreTestSpecificAUSize, ReproBug41901Test) {
 
   SetVal(g_conf(), "bluestore_write_v2", "false");
   SetVal(g_conf(), "bluestore_max_blob_size", "524288");
-  SetVal(g_conf(), "bluestore_debug_enforce_settings", "hdd");
+  SetVal(g_conf(), "bluestore_debug_enforce_settings", "hybrid");
   g_conf().apply_changes(nullptr);
   StartDeferred(65536);
 
@@ -3986,12 +4099,17 @@ TEST_P(StoreTest, SimpleCloneRangeTest) {
 }
 
 #if defined(WITH_BLUESTORE)
-TEST_P(StoreTest, BlueStoreReconstructAllocationsTest)
+TEST_P(StoreTestSpecificAUSize, BlueStoreReconstructAllocationsTest)
 {
   if (string(GetParam()) != "bluestore")
     return;
+  // As we rely on allocmap recovery which doesn't apply for hdd-only drive
+  // setup let's enforce SSD settings.
   SetVal(g_conf(), "bluestore_debug_inject_allocation_from_file_failure", "1.0");
+  SetVal(g_conf(), "bluestore_debug_enforce_settings", "ssd");
   g_conf().apply_changes(nullptr);
+
+  StartDeferred(0x1000);
 
   int r;
   coll_t cid;
@@ -4085,7 +4203,6 @@ TEST_P(StoreTest, BlueStoreReconstructAllocationsTest)
     {
       ch.reset();
       // this trims hoid one out of onode cache
-      // ASSERT_EQ(store->umount(), 0);
       EXPECT_EQ(store->mount(), 0);
       ch = store->open_collection(cid);
     }
@@ -7610,6 +7727,12 @@ INSTANTIATE_TEST_SUITE_P(
   ::testing::Values("bluestore")
 );
 
+INSTANTIATE_TEST_SUITE_P(
+  BlueStore,
+  UnsharingBlobsOnRemove,
+  ::testing::Values("bluestore")
+);
+
 #endif // WITH_BLUESTORE
 
 struct deferred_test_t {
@@ -10036,7 +10159,7 @@ TEST_P(StoreTestSpecificAUSize, ReproBug56488Test) {
   size_t alloc_size = 65536;
   size_t write_size = 4096;
   SetVal(g_conf(), "bluestore_write_v2", "false");
-  SetVal(g_conf(), "bluestore_debug_enforce_settings", "hdd");
+  SetVal(g_conf(), "bluestore_debug_enforce_settings", "hybrid");
   SetVal(g_conf(), "bluestore_block_db_create", "true");
   SetVal(g_conf(), "bluestore_block_db_size", stringify(1 << 30).c_str());
 
@@ -11749,6 +11872,230 @@ TEST_P(CorruptedOnodesTest, Recover_TolerateMissingHeadShard)
   cleanup_store();
 }
 
+// Replaces the named object's onode value and drops its extent-map shard
+// keys (replacements are non-sharded; leftover "...x" shards would be
+// flagged stray and keep the post-repair fsck dirty).
+static bool corrupt_onode(BlueStore* bs, const std::string& name,
+                          const bufferlist& new_val)
+{
+  KeyValueDB* pdb = bs->get_kv();
+  KeyValueDB::Iterator it = pdb->get_iterator("O");
+  auto trans = pdb->get_transaction();
+  bool corrupted = false;
+  it->seek_to_first();
+  while (it->valid()) {
+    if (it->key().contains(name)) {
+      if (it->key().ends_with("o")) {
+        trans->set("O", it->key(), new_val);
+        corrupted = true;
+      } else if (it->key().ends_with("x")) {
+        trans->rm_single_key("O", it->key());
+      }
+    }
+    it->next();
+  }
+  pdb->submit_transaction_sync(trans);
+  return corrupted;
+}
+
+enum class BadKind { truncated, version, blobid, spanning_id };
+
+// truncated:   garbage header -> buffer::error from onode decode
+// version:     spanning-blobs struct_v neither 1 nor 2
+//              -> ceph_assert_decode in decode_spanning_blobs()
+// blobid:      extent references blobs[0] which was never defined
+//              -> ceph_assert_decode in ExtentDecoderFull::consume_blobid()
+// spanning_id: extent references spanning blob #1 which doesn't exist
+//              -> ceph_assert_decode in ExtentMap::get_spanning_blob()
+static bufferlist make_bad_onode_val(BadKind kind)
+{
+  bufferlist val;
+  if (kind == BadKind::truncated) {
+    val.append(std::string(4, '\xff'));
+    return val;
+  }
+  const uint64_t flag = bluestore_onode_t::FLAG_DEBUG_FORCE_V2;
+  bluestore_onode_t on;
+  on.nid = 1;
+  size_t bound = 0;
+  denc(on, bound, flag);
+  {
+    auto ap = val.get_contiguous_appender(bound, true);
+    denc(on, ap, flag);                 // valid onode header
+  }
+  if (kind == BadKind::version) {
+    val.append(static_cast<char>(0xff));
+    return val;
+  }
+  bufferlist inner;  // inline extent map: v2, one extent with a bad reference
+  {
+    auto ap = inner.get_contiguous_appender(8, true);
+    denc((__u8)2, ap);                  // extent-map struct_v
+    denc_varint(uint32_t(1), ap);       // num extents
+    // low bits: CONTIGUOUS|ZEROOFFSET|SAMELENGTH(|SPANNING); id = 1
+    denc_varint(uint32_t((1 << 4) | 0x7 |
+                         (kind == BadKind::spanning_id ? 0x8 : 0)), ap);
+  }
+  bufferlist tail;
+  {
+    auto ap = tail.get_contiguous_appender(8 + inner.length(), true);
+    denc((__u8)2, ap);                  // spanning-blobs struct_v (valid)
+    denc_varint(uint32_t(0), ap);       // no spanning blobs
+    denc(inner, ap);                    // inline_bl
+  }
+  val.append(tail);
+  return val;
+}
+
+// One victim object per corruption shape, all in one store: fsck reports
+// them all without aborting.
+TEST_P(CorruptedOnodesTest, Fsck_TolerateCorruptedOnodes)
+{
+  SetVal(g_conf(), "bluestore_debug_inject_allocation_from_file_failure", "0");
+  // deterministic onode encoding: segment_size==0 => FLAG_DEBUG_FORCE_V2
+  SetVal(g_conf(), "bluestore_debug_onode_segmentation_random", "false");
+  SetVal(g_conf(), "bluestore_onode_segment_size", "0");
+  SetVal(g_conf(), "bluestore_fsck_quick_fix_threads", "2");
+  g_conf().apply_changes(nullptr);
+  prepare_store();
+
+  mount();
+  const BadKind kinds[] = {BadKind::truncated, BadKind::version,
+                           BadKind::blobid, BadKind::spanning_id};
+  ch = store->open_collection(cid);
+  for (int i = 0; i < 4; i++) {
+    ghobject_t hoid(hobject_t(sobject_t("victim" + std::to_string(i),
+                                        CEPH_NOSNAP), "", 1, 222, ""));
+    hoid.hobj.set_hash(0x10000000u * (i + 1));
+    ASSERT_EQ(write_object(cid, ch, hoid, 0x1000), 0);
+  }
+  ch.reset();
+  umount();                            // flush kv queue so onodes hit rocksdb
+  mount();
+  BlueStore* bs = dynamic_cast<BlueStore*>(store.get());
+  ceph_assert(bs);
+
+  for (int i = 0; i < 4; i++) {
+    ASSERT_TRUE(corrupt_onode(bs, "victim" + std::to_string(i),
+                              make_bad_onode_val(kinds[i])));
+  }
+  umount();
+  ASSERT_GE(store->fsck(false), 4);    // all four reported, no abort()
+  cleanup_store();
+}
+
+// Regular I/O has no tolerant_guard: the same corruption must still abort
+// via ceph_assert (coredump/backtrace preserved).
+TEST_P(CorruptedOnodesTest, CorruptedOnode_RegularPathStillCrashes)
+{
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  SetVal(g_conf(), "bluestore_debug_inject_allocation_from_file_failure", "0");
+  SetVal(g_conf(), "bluestore_debug_onode_segmentation_random", "false");
+  SetVal(g_conf(), "bluestore_onode_segment_size", "0");
+  g_conf().apply_changes(nullptr);
+  prepare_store();
+  // Persist the corruption, then fully tear down so no live store (threads,
+  // open RocksDB) is cloned across the death-test fork.
+  mount();
+  BlueStore* bs = dynamic_cast<BlueStore*>(store.get());
+  ceph_assert(bs);
+  ASSERT_TRUE(corrupt_onode(bs, "my_special_object",
+                            make_bad_onode_val(BadKind::version)));
+  umount();
+  // Child does its own clean mount; the cold read must decode the corrupt
+  // onode and abort via ceph_assert (no throwing_guard on the regular path).
+  EXPECT_DEATH({
+    mount();
+    auto ch2 = store->open_collection(cid);
+    ghobject_t hoid(
+      hobject_t(sobject_t("my_special_object", CEPH_NOSNAP), "", 1, 222, ""));
+    hoid.hobj.set_hash(0x80000000);
+    bufferlist bl;
+    (void)store->read(ch2, hoid, 0, 4, bl);
+    umount();
+  }, "FAILED ceph_assert");
+  cleanup_store();
+}
+
+
+TEST_P(CorruptedOnodesTest, Fsck_CreateDecodeThrow_DoesNotLeakOnode)
+{
+  SetVal(g_conf(), "bluestore_debug_inject_allocation_from_file_failure", "0");
+  prepare_store(); mount();
+  BlueStore* bs = dynamic_cast<BlueStore*>(store.get()); ceph_assert(bs);
+  // spanning-blob corruption throws INSIDE create_decode, before the raw
+  // Onode* reaches the OnodeRef -> exercises the unique_ptr<Onode> unwind.
+  ASSERT_TRUE(corrupt_onode(bs, "my_special_object",
+                            make_bad_onode_val(BadKind::spanning_id)));
+  umount();
+  auto onodes = []{ return int64_t(mempool::bluestore_cache_onode::allocated_items()); };
+  store->fsck(false);
+  int64_t before = onodes();
+  for (int i = 0; i < 20; ++i) EXPECT_GT(store->fsck(false), 0);
+  EXPECT_EQ(before, onodes());
+  cleanup_store();
+}
+
+TEST_P(CorruptedOnodesTest, Fsck_ExtentDecodeThrow_DoesNotLeakExtent)
+{
+  SetVal(g_conf(), "bluestore_debug_inject_allocation_from_file_failure", "0");
+  prepare_store(); mount();
+  BlueStore* bs = dynamic_cast<BlueStore*>(store.get()); ceph_assert(bs);
+  // extent-map corruption throws in decode_some while an Extent is pending
+  // in ExtentDecoderFull -> exercises the pending_extent unwind.
+  ASSERT_TRUE(corrupt_onode(bs, "my_special_object",
+                            make_bad_onode_val(BadKind::version)));
+  umount();
+  auto extents = []{ return int64_t(mempool::bluestore_extent::allocated_items()); };
+  store->fsck(false);
+  int64_t before = extents();
+  for (int i = 0; i < 20; ++i) EXPECT_GT(store->fsck(false), 0);
+  EXPECT_EQ(before, extents());
+  cleanup_store();
+}
+
+TEST_P(CorruptedOnodesTest, Fsck_ToleratesCorruptionDuringAllocationRecovery)
+{
+  g_ceph_context->_conf._clear_safe_to_start_threads();
+  SetVal(g_conf(), "bluestore_debug_enforce_settings", "ssd");
+  SetVal(g_conf(), "bluestore_allocation_recovery_threads", "0"); // single-threaded
+  // SetVal(g_conf(), "bluestore_allocation_recovery_threads", "4"); // multi-threaded
+  g_conf().apply_changes(nullptr);
+  prepare_store(); mount();
+  auto* bs = dynamic_cast<BlueStore*>(store.get()); ceph_assert(bs);
+  ASSERT_TRUE(corrupt_onode(bs, "my_special_object",
+                            make_bad_onode_val(BadKind::version)));
+  umount();
+  SetVal(g_conf(), "bluestore_debug_inject_allocation_from_file_failure", "1");
+  g_conf().apply_changes(nullptr);
+  EXPECT_GT(store->fsck(false), 0);
+  SetVal(g_conf(), "bluestore_debug_inject_allocation_from_file_failure", "0");
+  g_conf().apply_changes(nullptr);
+  cleanup_store();
+}
+
+TEST_P(CorruptedOnodesTest, ColdOpen_StillAssertsOnCorruptOnode)
+{
+  g_ceph_context->_conf._clear_safe_to_start_threads();
+  GTEST_FLAG_SET(death_test_style, "threadsafe");   // mount() leaves threads running
+  SetVal(g_conf(), "bluestore_debug_enforce_settings", "ssd");
+  SetVal(g_conf(), "bluestore_allocation_recovery_threads", "0");
+  g_conf().apply_changes(nullptr);
+  prepare_store(); mount();
+  auto* bs = dynamic_cast<BlueStore*>(store.get()); ceph_assert(bs);
+  ASSERT_TRUE(corrupt_onode(bs, "my_special_object",
+                            make_bad_onode_val(BadKind::version)));
+  umount();
+  SetVal(g_conf(), "bluestore_debug_inject_allocation_from_file_failure", "1");
+  g_conf().apply_changes(nullptr);
+  // cold_open() is ceph-bluestore-tool trim's entry point: read-only, but it
+  // discards space based on the recovered allocation, so it must not tolerate.
+  ASSERT_DEATH(bs->cold_open(), "FAILED ceph_assert");
+  SetVal(g_conf(), "bluestore_debug_inject_allocation_from_file_failure", "0");
+  g_conf().apply_changes(nullptr);
+  cleanup_store();
+}
+
 TEST_P(CorruptedOnodesTest, Fsck_FixMissingHeadShard)
 {
   SetVal(g_conf(), "bluestore_debug_inject_allocation_from_file_failure", "0");
@@ -11851,6 +12198,80 @@ TEST_P(CorruptedOnodesTest, Fsck_Fix3ExtraShards) {
   cleanup_store();
 }
 
+TEST_P(UnsharingBlobsOnRemove, FullCloneAndErase) {
+  SetVal(g_conf(), "bluestore_debug_inject_allocation_from_file_failure", "0");
+  prepare_store();
+
+  mount();
+  ch = store->create_new_collection(cid);
+  ghobject_t hoid_head(hobject_t(
+    sobject_t("LoremIpsum", CEPH_NOSNAP), "", 0x12345678, poolid, ""));
+
+  write_object(hoid_head, 0x0, 0x10000);
+
+  ghobject_t hoid_snap_1 = hoid_head;
+  hoid_snap_1.hobj.snap = 1;
+
+  t.clone(cid, hoid_head, hoid_snap_1);
+  commit_transaction();
+
+  BlueStore::OnodeRef oo = get_onode(cid, hoid_head);
+  size_t shared_blob_count = count_shared_blobs(oo);
+  EXPECT_GE(shared_blob_count, 1);
+  size_t shared_blob_trackers = count_shared_blob_trackers();
+  EXPECT_GE(shared_blob_trackers, 1);
+
+  t.remove(cid, hoid_snap_1);
+  commit_transaction();
+
+  shared_blob_count = count_shared_blobs(oo);
+  EXPECT_EQ(shared_blob_count, 0);
+  shared_blob_trackers = count_shared_blob_trackers();
+  EXPECT_EQ(shared_blob_trackers, 0);
+  oo.reset();
+
+  umount();
+  cleanup_store();
+}
+
+TEST_P(UnsharingBlobsOnRemove, UnshareOnPartial) {
+  SetVal(g_conf(), "bluestore_debug_inject_allocation_from_file_failure", "0");
+  SetVal(g_conf(), "bluestore_min_alloc_size", "16384");
+  prepare_store();
+
+  mount();
+  ch = store->create_new_collection(cid);
+
+  ghobject_t hoid_head(hobject_t(
+    sobject_t("LoremIpsum", CEPH_NOSNAP), "", 0x12345678, poolid, ""));
+
+  write_object(hoid_head, 0x0, 0xe000);
+
+  ghobject_t hoid_snap_1 = hoid_head;
+  hoid_snap_1.hobj.snap = 1;
+
+  t.clone(cid, hoid_head, hoid_snap_1);
+  commit_transaction();
+
+  BlueStore::OnodeRef oo = get_onode(cid, hoid_head);
+  size_t shared_blob_count = count_shared_blobs(oo);
+  EXPECT_GE(shared_blob_count, 1);
+  size_t shared_blob_trackers = count_shared_blob_trackers();
+  EXPECT_GE(shared_blob_trackers, 1);
+
+  t.remove(cid, hoid_snap_1);
+  commit_transaction();
+
+  shared_blob_count = count_shared_blobs(oo);
+  EXPECT_EQ(shared_blob_count, 0);
+  shared_blob_trackers = count_shared_blob_trackers();
+  EXPECT_EQ(shared_blob_trackers, 0);
+  oo.reset();
+
+  umount();
+  cleanup_store();
+}
+
 #endif // WITH_BLUESTORE
 
 TEST_P(StoreTestSpecificAUSize, BluestoreEnforceHWSettingsHdd) {
@@ -11858,7 +12279,7 @@ TEST_P(StoreTestSpecificAUSize, BluestoreEnforceHWSettingsHdd) {
     return;
 
   SetVal(g_conf(), "bluestore_write_v2", "false");
-  SetVal(g_conf(), "bluestore_debug_enforce_settings", "hdd");
+  SetVal(g_conf(), "bluestore_debug_enforce_settings", "hybrid");
   StartDeferred(0x1000);
 
   int r;
@@ -12216,7 +12637,7 @@ TEST_P(StoreTestSpecificAUSize, Ticket45195Repro) {
 
   SetVal(g_conf(), "bluestore_default_buffered_write", "true");
   SetVal(g_conf(), "bluestore_max_blob_size", "65536");
-  SetVal(g_conf(), "bluestore_debug_enforce_settings", "hdd");
+  SetVal(g_conf(), "bluestore_debug_enforce_settings", "hybrid");
   SetVal(g_conf(), "bluestore_fsck_on_mount", "false");
   g_conf().apply_changes(nullptr);
 
@@ -12608,8 +13029,9 @@ TEST_P(StoreTest, BlueFS_truncate_remove_race) {
 #endif  // WITH_BLUESTORE
 
 int main(int argc, char **argv) {
+  std::map<string, string> defaults = {{"debug_rocksdb","0/0"}};
   auto args = argv_to_vec(argc, argv);
-  auto cct = global_init(NULL, args, CEPH_ENTITY_TYPE_CLIENT,
+  auto cct = global_init(&defaults, args, CEPH_ENTITY_TYPE_CLIENT,
 			 CODE_ENVIRONMENT_UTILITY,
 			 CINIT_FLAG_NO_DEFAULT_CONFIG_FILE);
   common_init_finish(g_ceph_context);
@@ -12653,6 +13075,13 @@ int main(int argc, char **argv) {
   g_ceph_context->_conf.set_val_or_die(
     "enable_experimental_unrecoverable_data_corrupting_features", "*");
   g_ceph_context->_conf.apply_changes(nullptr);
+
+  char exe_path[PATH_MAX];
+  ssize_t exe_len = ::readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+  if (exe_len > 0) {
+    exe_path[exe_len] = '\0';
+    argv[0] = exe_path;
+  }
 
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

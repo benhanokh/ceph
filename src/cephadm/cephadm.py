@@ -10,6 +10,7 @@ import os
 import random
 import shlex
 import shutil
+import signal
 import socket
 import string
 import subprocess
@@ -60,6 +61,7 @@ from cephadmlib.constants import (
     SYSCTL_DIR,
     UNIT_DIR,
     DAEMON_FAILED_ERROR,
+    DISABLED_SERVICES,
 )
 from cephadmlib.context import CephadmContext
 from cephadmlib.context_getters import (
@@ -138,7 +140,13 @@ from cephadmlib.logging import (
     Highlight,
     LogDestination,
 )
-from cephadmlib.systemd import check_unit, check_units, terminate_service, enable_service
+from cephadmlib.systemd import (
+    check_unit,
+    check_units,
+    terminate_service,
+    enable_service,
+    start_disabled_services_after_maintenance_exit,
+)
 from cephadmlib import systemd_unit
 from cephadmlib.signals import send_signal_to_container_entrypoint
 from cephadmlib import runscripts
@@ -206,6 +214,7 @@ from cephadmlib.daemons import (
     Keepalived,
     Monitoring,
     NFSGanesha,
+    OSD,
     SMB,
     SNMPGateway,
     MgmtGateway,
@@ -230,6 +239,7 @@ from cephadmlib.listing_updaters import (
 )
 from cephadmlib.container_lookup import infer_local_ceph_image, identify
 from ceph.cephadm.d3n_types import D3NCache, D3NCacheError
+from ceph.cephadm.version_entry import UpgradeType, UpgradeStatus, CephVersionEntry
 from cephadmlib.user_utils import (
     setup_ssh_user,
     validate_user_exists,
@@ -651,8 +661,28 @@ def create_daemon_dirs(
 
     if keyring:
         keyring_path = os.path.join(data_dir, 'keyring')
+        config_json = fetch_configs(ctx)
+        key_path_exists = False
+        key_path_content = 'N/A'
+        try:
+            key_path_exists = os.path.exists(keyring_path)
+            key_path_content = open(keyring_path, 'r').read()
+        except Exception:
+            pass
+        update_bluestore_label_osd_keyring = False
+        if (
+            ident.daemon_type == 'osd'
+            and key_path_exists
+            and key_path_content != keyring
+        ):
+            # need to update keyring with ceph-bluestore-tool
+            update_bluestore_label_osd_keyring = True
         with write_new(keyring_path, owner=(uid, gid)) as f:
             f.write(keyring)
+        if update_bluestore_label_osd_keyring:
+            osd_daemon_form = OSD.create(ctx, ident)
+            # osd_daemon_form = OSD.init(ctx, ctx.fsid, ident.daemon_id)
+            osd_daemon_form.rotate_osd_lv_keyring(ctx, keyring_path)
 
     if daemon_type in Monitoring.components.keys():
         config_json = fetch_configs(ctx)
@@ -1177,7 +1207,7 @@ def deploy_daemon(
             if c:
                 # Disable automatic systemd enable for NFS and keepalived; the mgr
                 # starts them when appropriate (see cephadm serve / DISABLED_SERVICES).
-                enable_daemon = daemon_type not in ('nfs', 'keepalived')
+                enable_daemon = daemon_type not in DISABLED_SERVICES
                 deploy_daemon_units(
                     ctx,
                     ident,
@@ -1194,6 +1224,14 @@ def deploy_daemon(
             else:
                 raise RuntimeError('attempting to deploy a daemon without a container image')
     else:
+        # Agent reconfig must apply the same required_files as HTTP config push
+        # (agent.json, keyring, certs). Without this, SSH reconfig only restarts
+        # the unit and leaves a stale target_ip after mgr failover.
+        if daemon_type == CephadmAgent.daemon_type:
+            config_js = fetch_configs(ctx)
+            assert isinstance(config_js, dict)
+            cephadm_agent = CephadmAgent(ctx, ident.fsid, ident.daemon_id)
+            cephadm_agent.write_required_files(config_js)
         # On reconfig, update unit.meta so that port metadata
         # stays current without requiring a full redeploy.
         meta_path = os.path.join(data_dir, 'unit.meta')
@@ -1459,10 +1497,14 @@ class MgrListener(Thread):
     def __init__(self, agent: 'CephadmAgent') -> None:
         self.agent = agent
         self.stop = False
+        self._listen_socket: Optional[ssl.SSLSocket] = None
         super(MgrListener, self).__init__(target=self.run)
 
     def run(self) -> None:
         listenSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # Allow rebinding after restart while the prior socket is in TIME_WAIT.
+        # Does not allow stealing a port from a live LISTEN socket.
+        listenSocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listenSocket.bind(('0.0.0.0', int(self.agent.listener_port)))
         listenSocket.settimeout(60)
         listenSocket.listen(1)
@@ -1471,12 +1513,18 @@ class MgrListener(Thread):
         ssl_ctx.load_cert_chain(self.agent.listener_cert_path, self.agent.listener_key_path)
         ssl_ctx.load_verify_locations(self.agent.ca_path)
         secureListenSocket = ssl_ctx.wrap_socket(listenSocket, server_side=True)
+        self._listen_socket = secureListenSocket
         while not self.stop:
             try:
                 try:
                     conn, _ = secureListenSocket.accept()
                 except socket.timeout:
                     continue
+                except OSError:
+                    # Expected when shutdown() closes the listen socket.
+                    if self.stop:
+                        break
+                    raise
                 try:
                     length: int = int(conn.recv(10).decode())
                 except Exception as e:
@@ -1504,22 +1552,25 @@ class MgrListener(Thread):
                             self.agent.volume_gatherer.wakeup()
                             logger.debug(f'Got mgr message {data}')
             except Exception as e:
+                if self.stop:
+                    break
                 logger.error(f'Mgr Listener encountered exception: {e}')
 
     def shutdown(self) -> None:
         self.stop = True
+        if self._listen_socket is not None:
+            try:
+                self._listen_socket.close()
+            except Exception:
+                pass
+            self._listen_socket = None
 
     def handle_json_payload(self, data: Dict[Any, Any]) -> None:
         if 'counter' in data:
             self.agent.ack = int(data['counter'])
             if 'config' in data:
                 logger.info('Received new config from mgr')
-                config = data['config']
-                for filename in config:
-                    if filename in self.agent.required_files:
-                        file_path = os.path.join(self.agent.daemon_dir, filename)
-                        with write_new(file_path) as f:
-                            f.write(config[filename])
+                self.agent.write_required_files(data['config'])
                 self.agent.pull_conf_settings()
                 self.agent.wakeup()
         else:
@@ -1588,18 +1639,28 @@ class CephadmAgent(DaemonForm):
             if fname not in config:
                 raise Error('required file missing from config: %s' % fname)
 
-    def deploy_daemon_unit(self, config: Dict[str, str] = {}) -> None:
+    def write_required_files(self, config: Dict[str, str]) -> None:
+        """Write agent required config files. These are the same set that
+        HTTP config push applies to mgr.
+
+        Used by HTTP MgrListener updates, full deploy, and SSH reconfig so
+        target_ip, certs, and keyring are in sync across delivery paths.
+        """
         if not config:
             raise Error('Agent needs a config')
         assert isinstance(config, dict)
         self.validate(config)
-
-        # Create the required config files in the daemons dir, with restricted permissions
         for filename in config:
             if filename in self.required_files:
                 file_path = os.path.join(self.daemon_dir, filename)
                 with write_new(file_path) as f:
                     f.write(config[filename])
+
+    def deploy_daemon_unit(self, config: Dict[str, str] = {}) -> None:
+        if not config:
+            raise Error('Agent needs a config')
+        assert isinstance(config, dict)
+        self.write_required_files(config)
 
         unit_run_path = os.path.join(self.daemon_dir, 'unit.run')
         with write_new(unit_run_path) as f:
@@ -1627,7 +1688,18 @@ class CephadmAgent(DaemonForm):
     def unit_run(self) -> str:
         py3 = shutil.which('python3')
         binary_path = os.path.realpath(sys.argv[0])
-        return ('set -e\n' + f'{py3} {binary_path} agent --fsid {self.fsid} --daemon-id {self.daemon_id} &\n')
+        # Run the agent in the foreground under Type=simple with no trailing '&'
+        # so systemd's MainPID is the agent itself and stop/restart wait for it
+        # to exit
+        # - exec ensures that the agent is PID 1 of the service and receives
+        #   SIGTERM directly
+        # - TimeoutStopSec=30 in agent.service.j2 ensures that a SIGKILL is sent
+        #   if the agent does not exit within 30 seconds. This is a safegaurd
+        #   to ensure that the agent is stopped if it gets stuck.
+        return (
+            'set -e\n'
+            f'exec {py3} {binary_path} agent --fsid {self.fsid} --daemon-id {self.daemon_id}\n'
+        )
 
     def unit_file(self) -> str:
         return templating.render(
@@ -1642,6 +1714,12 @@ class CephadmAgent(DaemonForm):
             self.ls_gatherer.shutdown()
         if self.volume_gatherer.is_alive():
             self.volume_gatherer.shutdown()
+        self.wakeup()
+
+    def join_threads(self, timeout: float = 2.0) -> None:
+        for t in (self.mgr_listener, self.ls_gatherer, self.volume_gatherer):
+            if t.is_alive():
+                t.join(timeout=timeout)
 
     def wakeup(self) -> None:
         self.event.set()
@@ -1934,6 +2012,7 @@ class AgentGatherer(Thread):
 
     def shutdown(self) -> None:
         self.stop = True
+        self.wakeup()
 
     def wakeup(self) -> None:
         self.event.set()
@@ -1948,7 +2027,16 @@ def command_agent(ctx: CephadmContext) -> None:
     if not os.path.isdir(agent.daemon_dir):
         raise Error(f'Agent daemon directory {agent.daemon_dir} does not exist. Perhaps agent was never deployed?')
 
-    agent.run()
+    def _handle_sigterm(signum: int, frame: object) -> None:
+        logger.info('Agent received SIGTERM, shutting down gracefully')
+        agent.shutdown()
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+    try:
+        agent.run()
+    finally:
+        agent.shutdown()
+        agent.join_threads()
 
 
 ##################################
@@ -3129,6 +3217,18 @@ def command_bootstrap(ctx):
     else:
         logger.info('Enabling the logrotate.timer service to perform daily log rotation.')
         enable_service(ctx, 'logrotate.timer')
+
+    # Stores bootstrap version in version tracker
+    bootstrap_time = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+    bootstrap_entry = CephVersionEntry(
+        version=image_ver,
+        upgrade_type=UpgradeType.BOOTSTRAP,
+        status=UpgradeStatus.COMPLETE,
+        command_options=None,
+        config_dump=json.loads(cli(['config', 'dump', '--format', 'json']))
+    ).to_json()
+    cli(['config-key', 'set', f'mgr/cephadm/version_history/{bootstrap_time}', json.dumps(bootstrap_entry)])
+
     return ctx.error_code
 
 ##################################
@@ -3258,8 +3358,9 @@ def command_deploy_from(ctx: CephadmContext) -> None:
     configuration parameters from an input JSON configuration file.
     """
     config_data = read_configuration_source(ctx)
-    logger.debug('Loaded deploy configuration: %r', config_data)
     apply_deploy_config_to_ctx(config_data, ctx)
+    if 'log_deploy_configuration' in ctx and ctx.log_deploy_configuration:
+        logger.debug('Loaded deploy configuration: %r', config_data)
     try:
         _common_deploy(ctx)
     except DaemonStartException:
@@ -4803,26 +4904,28 @@ def change_maintenance_mode(ctx: CephadmContext) -> str:
         # return success here or host will be permanently stuck in maintenance mode
         # as no daemons can be deployed so no systemd target will ever exist to disable.
         if not target_exists(ctx):
-            return 'skipped - systemd target not present on this host. Host removed from maintenance mode.'
-        # exit maintenance request
-        if not systemd_target_state(ctx, target):
+            msg = (
+                'skipped - systemd target not present on this host. '
+                'Host removed from maintenance mode.')
+        elif not systemd_target_state(ctx, target):
             _out, _err, code = call(ctx,
                                     ['systemctl', 'enable', target],
                                     verbosity=CallVerbosity.DEBUG)
             if code:
                 logger.error(f'Failed to enable the {target} target')
                 return 'failed - unable to enable the target'
-            else:
-                # starting a target waits by default
-                _out, _err, code = call(ctx,
-                                        ['systemctl', 'start', target],
-                                        verbosity=CallVerbosity.DEBUG)
-                if code:
-                    logger.error(f'Failed to start the {target} target')
-                    return 'failed - unable to start the target'
-                else:
-                    return f'success - systemd target {target} enabled and started'
-        return f'success - systemd target {target} enabled and started'
+            _out, _err, code = call(ctx,
+                                    ['systemctl', 'start', target],
+                                    verbosity=CallVerbosity.DEBUG)
+            if code:
+                logger.error(f'Failed to start the {target} target')
+                return 'failed - unable to start the target'
+            msg = f'success - systemd target {target} enabled and started'
+        else:
+            msg = f'success - systemd target {target} enabled and started'
+
+        start_disabled_services_after_maintenance_exit(ctx)
+        return msg
 
 
 @infer_fsid
@@ -5084,6 +5187,20 @@ def _add_deploy_parser_args(
         type=str,
         default=None,
         help='Send signal to daemon'
+    )
+    parser_deploy.add_argument(
+        '--log-deploy-configuration',
+        action='store_true',
+        default=False,
+        help=(
+            'Whether to log deploy config to cephadm.log. Could contain sensitive info '
+            'such as cephx keys. Only relevant at debug level logging.'
+        )
+    )
+    parser_deploy.add_argument(
+        '--osd-dm-crypt-key',
+        default=None,
+        help="dm-crypt key for OSD, needed for deployment if OSD's cephx keyring has been rotated"
     )
 
 

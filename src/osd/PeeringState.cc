@@ -838,6 +838,18 @@ void PeeringState::start_peering_interval(
   } else if (was_old_nonprimary || is_nonprimary()) {
     pl->clear_want_pg_temp();
   }
+
+  // Only reset the rebuild-time latch when the primary role actually
+  // changes across this interval transition. Routine peering restarts
+  // (e.g. acting-set churn from backfill peers being added/removed)
+  // that leave this OSD as primary throughout must not wipe an
+  // in-progress rebuild's start time.
+  if (!(was_old_primary && is_primary())) {
+    rebuild_start_time = utime_t();
+    rebuild_base_recovered = 0;
+    rebuild_had_redundancy_loss = false;
+  }
+
   clear_primary_state();
 
   pl->on_change(t);
@@ -1061,10 +1073,6 @@ void PeeringState::clear_primary_state()
   pg_log.reset_recovery_pointers();
 
   clear_recovery_state();
-
-  rebuild_start_time = utime_t();
-  rebuild_base_recovered = 0;
-  rebuild_had_redundancy_loss = false;
 
   pg_committed_to = eversion_t();
   missing_loc.clear();
@@ -1328,11 +1336,14 @@ void PeeringState::proc_lease(const pg_lease_t& l)
     readable_until_ub_from_primary = l.readable_until_ub;
   }
 
+  std::optional<ceph::signedspan> peer_clock_delta_lb, peer_clock_delta_ub;
+  hb_stamps[0]->get_peer_clock_delta(&peer_clock_delta_lb, &peer_clock_delta_ub);
+
   ceph::signedspan ru = ceph::signedspan::zero();
   if (l.readable_until != ceph::signedspan::zero() &&
-      hb_stamps[0]->peer_clock_delta_ub) {
-    ru = l.readable_until - *hb_stamps[0]->peer_clock_delta_ub;
-    psdout(20) << " peer_clock_delta_ub " << *hb_stamps[0]->peer_clock_delta_ub
+      peer_clock_delta_ub) {
+    ru = l.readable_until - *peer_clock_delta_ub;
+    psdout(20) << " peer_clock_delta_ub " << *peer_clock_delta_ub
 	       << " -> ru " << ru << dendl;
   }
   if (ru > readable_until) {
@@ -1343,9 +1354,9 @@ void PeeringState::proc_lease(const pg_lease_t& l)
   }
 
   ceph::signedspan ruub;
-  if (hb_stamps[0]->peer_clock_delta_lb) {
-    ruub = l.readable_until_ub - *hb_stamps[0]->peer_clock_delta_lb;
-    psdout(20) << " peer_clock_delta_lb " << *hb_stamps[0]->peer_clock_delta_lb
+  if (peer_clock_delta_lb) {
+    ruub = l.readable_until_ub - *peer_clock_delta_lb;
+    psdout(20) << " peer_clock_delta_lb " << *peer_clock_delta_lb
 	       << " -> ruub " << ruub << dendl;
   } else {
     ruub = pl->get_mnow() + l.interval;
@@ -4510,10 +4521,8 @@ std::optional<pg_stat_t> PeeringState::prepare_stats_for_publish(
      *  - num_objects_degraded, num_objects_misplaced, num_objects_recovered
      *
      * The PG rebuild stats are aggregated into the following recoverystate
-     * perf counters:
+     * perf counter:
      *  - rs_pg_rebuild_duration: rebuild duration LONGRUNAVG time counter
-     *  - rs_pg_rebuild_max_secs: maximum rebuild duration (secs)
-     *  - rs_pg_rebuild_min_secs: minimum rebuild duration (secs)
      *
      * Workflow:
      *  1. Only the acting primary OSD of the PG executes the logic to
@@ -4528,6 +4537,18 @@ std::optional<pg_stat_t> PeeringState::prepare_stats_for_publish(
      *     num_objects_recovered > 0 or the PG had confirmed redundancy loss
      *     at latch time, filtering out spurious state transitions. The latch
      *     is cleared after each recorded event.
+     *  4. The "recovered" (record) branch additionally requires the live
+     *     PG_STATE_ACTIVE bit, not just an empty degraded/misplaced count.
+     *     Right after a peering-interval restart, clear_primary_state()
+     *     wipes acting_recovery_backfill/missing_loc before peering has
+     *     repopulated them for the new interval; a publish landing in that
+     *     narrow mid-peering window sees num_objects_degraded == 0 and no
+     *     DEGRADED/UNDERSIZED bit set, which looks identical to a genuine
+     *     recovery completion even though the PG is still mid-transition
+     *     and about to go degraded again. Requiring PG_STATE_ACTIVE (never
+     *     set while PEERING) filters out that transient situation so it can't
+     *     prematurely record a truncated duration and reset the latch out
+     *     from under an in-progress rebuild.
      *
      * last_degraded is intentionally not used in the interim solution to
      * retain compatibility with older Ceph releases where this field doesn't
@@ -4562,24 +4583,18 @@ std::optional<pg_stat_t> PeeringState::prepare_stats_for_publish(
                        << info.pgid << " at " << rebuild_start_time << dendl;
           }
         }
-      } else if (rebuild_start_time != utime_t()) {
+      } else if (rebuild_start_time != utime_t() && (state & PG_STATE_ACTIVE)) {
         // PG recovered — record rebuild time if this was a genuine event.
+        // The PG_STATE_ACTIVE check excludes the transient mid-peering
+        // window (see point 4 above) where the degraded/misplaced counts
+        // can momentarily read as zero before peering has finished
+        // repopulating them for the new interval.
         const int64_t delta_recovered = num_recovered - rebuild_base_recovered;
         const utime_t rebuild_dur  = now - rebuild_start_time;
 
         if (rebuild_dur.to_msec() > 0 &&
             (delta_recovered > 0 || rebuild_had_redundancy_loss)) {
-          PerfCounters &perf = pl->get_peering_perf();
-          perf.tinc(rs_pg_rebuild_duration, rebuild_dur);
-
-          const uint64_t rebuild_secs = (uint64_t)rebuild_dur.sec();
-          if (rebuild_secs > perf.get(rs_pg_rebuild_max_secs)) {
-            perf.set(rs_pg_rebuild_max_secs, rebuild_secs);
-          }
-          const uint64_t cur_min = perf.get(rs_pg_rebuild_min_secs);
-          if (cur_min == 0 || rebuild_secs < cur_min) {
-            perf.set(rs_pg_rebuild_min_secs, rebuild_secs);
-          }
+          pl->get_peering_perf().tinc(rs_pg_rebuild_duration, rebuild_dur);
           psdout(15) << "rebuild-stats: recorded rebuild for " << info.pgid
                      << " duration=" << rebuild_dur
                      << " delta_recovered=" << delta_recovered << dendl;

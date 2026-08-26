@@ -101,12 +101,14 @@ struct ECCommon {
     extent_set extents;
     std::optional<std::vector<std::pair<int, int>>> subchunk;
     pg_shard_t pg_shard;
+    bool omap_source = false;
     bool operator==(const shard_read_t &other) const;
 
     void print(std::ostream &os) const {
       os << "shard_read_t(extents=[" << extents << "]"
           << ", subchunk=" << subchunk
           << ", pg_shard=" << pg_shard
+          << ", omap_source=" << omap_source
           << ")";
     }
   };
@@ -207,7 +209,7 @@ struct ECCommon {
     std::optional<std::map<std::string, ceph::buffer::list, std::less<>>> attrs;
     std::optional<ceph::buffer::list> omap_header;
     std::optional<std::map<std::string, ceph::buffer::list>> omap_entries;
-    bool omap_complete;
+    bool omap_complete = false;
     ECUtil::shard_extent_map_t buffers_read;
     ECUtil::shard_extent_set_t processed_read_requests;
     shard_id_set zero_length_reads;
@@ -453,7 +455,20 @@ struct ECCommon {
         read_request_t &read_request,
         bool for_recovery,
         bool want_attrs,
-        bool want_omap_header);
+        bool want_omap_header,
+        bool want_omap_keys);
+
+    /**
+     * Ensures a primary-capable shard with clean omap is present in shard_reads.
+     *
+     * @param error_shards Optional set of shards with errors to exclude
+     * @return 0 on success, -EIO if no suitable shard found
+     */
+    int ensure_primary_shard_for_omap(
+        const hobject_t &hoid,
+        read_request_t &read_request,
+        bool for_recovery,
+        const std::optional<std::set<pg_shard_t>> &error_shards = std::nullopt);
 
     void get_all_avail_shards(
         const hobject_t &hoid,
@@ -714,7 +729,7 @@ struct ECCommon {
     // Set by on_change, forces first write in each interval to be
     // a full write to avoid PWLC spanning intervals. Fixes
     // https://tracker.ceph.com/issues/73891
-    bool first_write_in_interval;
+    bool first_write_in_interval = false;
 
     RMWPipeline(CephContext *cct,
                 ceph::ErasureCodeInterfaceRef ec_impl,

@@ -23,7 +23,6 @@ security fixes.
 
    Tentacle (v20.2.*) <tentacle>
    Squid (v19.2.*) <squid>
-   Reef (v18.2.*) <reef>
 
 .. ceph_releases:: releases.yml current
 
@@ -40,6 +39,7 @@ receive bug fixes or backports).
    :maxdepth: 1
    :hidden:
 
+   Reef (v18.2.*) <reef>
    Quincy (v17.2.*) <quincy>
    Pacific (v16.2.*) <pacific>
    Octopus (v15.2.*) <octopus>
@@ -68,6 +68,8 @@ Release timeline
 .. _20.2.0: tentacle#v20-2-0-tentacle
 .. _20.2.1: tentacle#v20-2-1-tentacle
 .. _20.2.2: tentacle#v20-2-2-tentacle
+.. _20.2.3: tentacle#v20-2-3-tentacle
+.. _20.2.4: tentacle#v20-2-4-tentacle
 
 .. _Squid: squid
 .. _19.2.0: squid#v19-2-0-squid
@@ -75,6 +77,8 @@ Release timeline
 .. _19.2.2: squid#v19-2-2-squid
 .. _19.2.3: squid#v19-2-3-squid
 .. _19.2.4: squid#v19-2-4-squid
+.. _19.2.5: squid#v19-2-5-squid
+.. _19.2.6: squid#v19-2-6-squid
 
 .. _Reef: reef
 .. _18.2.0: reef#v18-2-0-reef

@@ -105,7 +105,6 @@ using ceph::bufferlist;
 using ceph::bufferptr;
 using ceph::Formatter;
 using ceph::decode;
-using ceph::decode_noclear;
 using ceph::encode;
 using ceph::encode_destructively;
 
@@ -875,6 +874,12 @@ bool PrimaryLogPG::check_laggy(OpRequestRef& op)
 
     // go to laggy state
     state_set(PG_STATE_LAGGY);
+    const auto& acting_osds = recovery_state.get_acting();
+    auto msg = fmt::format("PG {} marked LAGGY; acting [{}]",
+                           get_pgid(), fmt::join(acting_osds, ","));
+    dout(0) << __func__ << " " << msg << dendl;
+    osd->clog->warn() << msg;
+
     publish_stats_to_osd();
   }
   dout(10) << __func__ << " not readable" << dendl;
@@ -2724,6 +2729,15 @@ PrimaryLogPG::cache_result_t PrimaryLogPG::maybe_handle_manifest_detail(
       MOSDOp *m = static_cast<MOSDOp*>(op->get_nonconst_req());
       ceph_assert(m->get_type() == CEPH_MSG_OSD_OP);
       hobject_t head = m->get_hobj();
+
+      // Balanced/Localized reads can be sent to a replica shard
+      // which cannot test if an object is degarded or backfilling
+      // redirect these requests to the primary
+      if (!is_primary()) {
+        dout(20) << __func__ << " need to redirect to primary" << dendl;
+        osd->reply_op_error(op, -EAGAIN);
+        return cache_result_t::REPLIED_WITH_EAGAIN;
+      }
 
       if (is_degraded_or_backfilling_object(head)) {
 	dout(20) << __func__ << ": " << head << " is degraded, waiting" << dendl;
@@ -4650,8 +4664,7 @@ void PrimaryLogPG::do_scan(
       auto p = m->get_data().cbegin();
 
       // take care to preserve ordering!
-      bi.clear_objects();
-      decode_noclear(bi.objects, p);
+      decode(bi.objects, p);
       dout(10) << __func__ << " bi.begin=" << bi.begin << " bi.end=" << bi.end
                << " bi.objects.size()=" << bi.objects.size() << dendl;
 
@@ -8503,6 +8516,7 @@ inline int PrimaryLogPG::_delete_oid(
     oi.set_flag(object_info_t::FLAG_WHITEOUT);
     ctx->delta_stats.num_whiteouts++;
     t->create(soid);
+    ctx->use_replace_op = true;
     osd->logger->inc(l_osd_tier_whiteout);
     return 0;
   }

@@ -35,7 +35,6 @@
 #include "crimson/common/log.h"
 #include "crimson/net/Connection.h"
 #include "crimson/net/Messenger.h"
-#include "crimson/os/cyanstore/cyan_store.h"
 #include "crimson/os/futurized_collection.h"
 #include "crimson/osd/ec_backend.h"
 #include "crimson/osd/ec_recovery_backend.h"
@@ -351,7 +350,7 @@ unsigned PG::get_target_pg_log_entries() const
   const unsigned local_num_pgs = shard_services.get_num_local_pgs();
   const unsigned local_target =
     local_conf().get_val<uint64_t>("osd_target_pg_log_entries_per_osd") /
-    seastar::smp::count;
+    seastar::this_smp_shard_count();
   const unsigned min_pg_log_entries =
     local_conf().get_val<uint64_t>("osd_min_pg_log_entries");
   if (local_num_pgs > 0 && local_target > 0) {
@@ -1101,7 +1100,7 @@ PG::interruptible_future<> PG::complete_error_log(const ceph_tid_t& rep_tid,
   log_update.waiting_on.erase(pg_whoami);
   if (log_update.waiting_on.empty()) {
     log_entry_update_waiting_on.erase(rep_tid);
-    peering_state.complete_write(version, last_complete);
+    complete_write(version, last_complete);
     logger().debug("complete_error_log: write complete,"
                    " erasing rep_tid {}", rep_tid);
   } else {
@@ -1111,7 +1110,7 @@ PG::interruptible_future<> PG::complete_error_log(const ceph_tid_t& rep_tid,
       log_update.all_committed.get_shared_future()
     ).then_interruptible([this, last_complete, rep_tid, version] {
       logger().debug("complete_error_log: rep_tid {} awaited ", rep_tid);
-      peering_state.complete_write(version, last_complete);
+      complete_write(version, last_complete);
       ceph_assert(!log_entry_update_waiting_on.contains(rep_tid));
       return seastar::now();
     });

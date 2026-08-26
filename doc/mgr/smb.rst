@@ -1172,7 +1172,9 @@ cephfs
         connect to CephFS. ``samba-vfs`` automatically selects the preferred VFS
         based implementation, currently ``samba-vfs/proxied``. This option is
         suitable for the majority of use cases and can be left unspecified for most
-        shares.
+        shares. When a proxied provider is in use, cephadm automatically
+        deploys a ``cephfs-proxy`` sidecar next to each Samba instance;
+        see :ref:`smb-cephfs-proxy`.
     qos
         Optional object. Quality of Service settings for the share. Fields:
         
@@ -1567,14 +1569,122 @@ fsid
 mon_host
     String. The ``mon_host`` string (as sourced from a ceph.conf file)
 cephfs_user
-    Object. Fields:
+    Optional object. Required if the cluster will host CephFS-backed shares.
+    Fields:
 
     name
-        String. A ceph user name indicating the cephx user that will
+        String. A Ceph user name indicating the CephX user that will
         access the CephFS volume(s) on the external cluster
     key
-        String. The Base64 encoded key value corresponding to the cephx
+        String. The Base64 encoded key value corresponding to the CephX
         user name provided
+rgw_user
+    Optional object. Required if the cluster will host RGW-backed shares.
+    Fields:
+
+    name
+        String. A Ceph user name indicating the CephX user that will
+        access the RGW bucket(s) on the external cluster
+    key
+        String. The Base64 encoded key value corresponding to the CephX
+        user name provided
+
+.. note::
+   At least one of ``cephfs_user`` or ``rgw_user`` must be configured.
+   Configure only the user(s) needed for your share types:
+
+   - CephFS-only clusters: Configure only ``cephfs_user``
+   - RGW-only clusters: Configure only ``rgw_user``
+   - Mixed clusters: Configure both ``cephfs_user`` and ``rgw_user``
+
+Examples
+++++++++
+
+External cluster with CephFS support only:
+
+.. code-block:: yaml
+
+    resource_type: ceph.smb.ext.cluster
+    external_ceph_cluster_id: external-cephfs
+    cluster:
+      fsid: "12345678-1234-1234-1234-123456789abc"
+      mon_host: "10.0.1.10:6789,10.0.1.11:6789"
+      cephfs_user:
+        name: "client.external-cephfs"
+        key: "AQC1234567890abcdefghijklmnopqrstuvwxyz=="
+
+External cluster with RGW support only:
+
+.. code-block:: yaml
+
+    resource_type: ceph.smb.ext.cluster
+    external_ceph_cluster_id: external-rgw
+    cluster:
+      fsid: "12345678-1234-1234-1234-123456789abc"
+      mon_host: "10.0.1.10:6789,10.0.1.11:6789"
+      rgw_user:
+        name: "client.external-rgw"
+        key: "AQD9876543210zyxwvutsrqponmlkjihgfedcba=="
+
+External cluster with both CephFS and RGW support:
+
+.. code-block:: yaml
+
+    resource_type: ceph.smb.ext.cluster
+    external_ceph_cluster_id: external-mixed
+    cluster:
+      fsid: "12345678-1234-1234-1234-123456789abc"
+      mon_host: "10.0.1.10:6789,10.0.1.11:6789"
+      cephfs_user:
+        name: "client.external-cephfs"
+        key: "AQC1234567890abcdefghijklmnopqrstuvwxyz=="
+      rgw_user:
+        name: "client.external-rgw"
+        key: "AQD9876543210zyxwvutsrqponmlkjihgfedcba=="
+
+
+.. important::
+   **RGW Shares on External Clusters Require Manual Credentials**
+
+   When creating RGW shares on external clusters, you **must** manually define
+   RGW credentials using the ``ceph.smb.rgw.credential`` resource. Unlike local
+   clusters where credentials can be auto-fetched, external clusters cannot
+   automatically retrieve S3 access keys.
+
+   Example configuration with manual RGW credentials:
+
+   .. code-block:: yaml
+
+       resources:
+         # Define the external cluster with rgw_user
+         - resource_type: ceph.smb.ext.cluster
+           external_ceph_cluster_id: external-rgw
+           cluster:
+             fsid: "12345678-1234-1234-1234-123456789abc"
+             mon_host: "10.0.1.10:6789,10.0.1.11:6789"
+             rgw_user:
+               name: "client.external-rgw"
+               key: "AQD9876543210zyxwvutsrqponmlkjihgfedcba=="
+
+         # Define RGW credentials manually (REQUIRED for external clusters)
+         - resource_type: ceph.smb.rgw.credential
+           rgw_credential_id: my-s3-creds
+           user_id: s3-user
+           access_key_id: AKIAIOSFODNN7EXAMPLE
+           secret_access_key: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+
+         # RGW share referencing the manual credentials
+         - resource_type: ceph.smb.share
+           cluster_id: my-cluster
+           share_id: s3-share
+           name: "S3 Share"
+           rgw:
+             bucket: my-bucket
+             credential_ref: my-s3-creds
+
+   The ``rgw_user`` in the external cluster definition provides the CephX
+   credentials for accessing the RGW service, while the ``ceph.smb.rgw.credential``
+   resource provides the S3 access key and secret key for bucket operations.
 
 
 A Declarative Configuration Example
@@ -1688,10 +1798,11 @@ cluster has been configured for at least one share. The ``placement`` field of
 the cluster resource is passed onto the orchestration layer and is used to
 determine on what nodes of the Ceph cluster Samba containers will be run.
 
-At this time Samba services can only listen on port 445. Due to this
-restriction only one Samba server, as part of one cluster, may run on a single
-Ceph node at a time. Ensure that the placement specs on each cluster do not
-overlap.
+The Samba containers may run on the same hosts if, and only if, the services
+use different IP addresses and/or ports. If the placement spec allows more than
+one container to run on the same host, use the ``bind_addrs`` field, the
+``custom_ports`` field, or some combination, in the cluster resource to ensure
+that the Samba server instances do not conflict.
 
 The ``smb`` clusters are fully isolated from each other. This means that, as
 long as you have sufficient resources in your Ceph cluster, you can run multiple
@@ -1732,6 +1843,49 @@ at the prompt. Refer to the `smbclient documentation`_ for more details.
 
 .. _smbclient documentation:
    https://www.samba.org/samba/docs/current/man-html/smbclient.1.html
+
+.. _smb-cephfs-proxy:
+
+The CephFS Proxy Sidecar
+========================
+
+When a cluster hosts CephFS-backed shares that use the default
+``samba-vfs/proxied`` provider (see the ``provider`` share field
+above), the smb module adds the ``cephfs-proxy`` feature to the smb
+service specification that it generates, and cephadm deploys a
+``cephfs-proxy`` sidecar container alongside each Samba instance. No
+operator action is needed, and the sidecar is not a separate
+orchestrator service. The sidecar always runs on the same host as
+its Samba instance and shares that instance's ``/run`` mount and
+namespaces.
+
+The sidecar container runs the ``libcephfsd`` daemon. Unlike the
+Samba containers, which use images from the samba-container project,
+the sidecar uses the Ceph container image; the ``smb`` service
+intentionally runs containers from both images. Without the proxy,
+every SMB client connection opens its own ``libcephfs`` instance
+with its own private cache, which can consume large amounts of
+memory on busy servers. The proxy multiplexes the client connections
+over shared CephFS mounts for connections with identical
+configuration, serving a greater number of concurrent clients with
+fewer server-side resources. When the number of clients is very
+large, there may be some impact to individual client performance.
+
+Points useful when troubleshooting:
+
+* The proxy listens on the UNIX socket ``/run/libcephfsd.sock``
+  inside the ``/run`` mount that the smb instance's containers
+  share.
+* The daemon binary is ``/usr/sbin/libcephfsd``. It runs as a
+  sidecar container in the ``smb`` service, with a ``proxy`` suffix
+  in the container name.
+* The proxy is only deployed when at least one share uses the
+  proxied provider. Shares using ``samba-vfs/classic`` or
+  ``samba-vfs/new`` connect to CephFS directly from the Samba
+  container.
+
+For design details, see the developer documentation in
+``doc/dev/libcephfs_proxy.rst``.
 
 .. _smb-remote-control:
 

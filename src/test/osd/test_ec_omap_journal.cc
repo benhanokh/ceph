@@ -17,6 +17,7 @@
 #include "test/unit.cc"
 
 #include "osd/ECOmapJournal.h"
+#include "osd/ECBackend.h"
 #include "common/dout.h"
 
 class MockDoutPrefixProvider : public DoutPrefixProvider {
@@ -517,6 +518,32 @@ TEST(ecomapjournal, ClearOmap) {
   ASSERT_EQ(1u, ranges.size());
   EXPECT_TRUE(ranges.contains(""));
   EXPECT_TRUE(ranges.at("") == std::nullopt);
+}
+
+TEST(ecomapjournal, ClearOmapTombstonesCachedKeys) {
+  MockDoutPrefixProvider dpp;
+  ECOmapJournal journal(dpp);
+  const hobject_t hoid("obj_clear_cached", CEPH_NOSNAP, 1, 0, "nspace");
+
+  // Process an insert first so the keys land in the cached key_map.
+  journal.add_entry(hoid, create_insert_entry(eversion_t(1, 1), 1, 3));
+  {
+    auto [updates, ranges] = journal.get_value_updates(hoid);
+    ASSERT_TRUE(updates.at(make_key(1)).value.has_value());
+    ASSERT_TRUE(updates.at(make_key(2)).value.has_value());
+    ASSERT_TRUE(updates.at(make_key(3)).value.has_value());
+  }
+
+  // A later clear_omap must mark the already-cached keys as tombstones.
+  journal.add_entry(hoid, ECOmapJournalEntry(eversion_t(1, 2), true, std::nullopt, {}));
+
+  auto [updates, ranges] = journal.get_value_updates(hoid);
+  ASSERT_TRUE(updates.contains(make_key(1)));
+  ASSERT_TRUE(updates.contains(make_key(2)));
+  ASSERT_TRUE(updates.contains(make_key(3)));
+  EXPECT_FALSE(updates.at(make_key(1)).value.has_value());
+  EXPECT_FALSE(updates.at(make_key(2)).value.has_value());
+  EXPECT_FALSE(updates.at(make_key(3)).value.has_value());
 }
 
 TEST(ecomapjournal, append_delete_clears_maps)
@@ -1424,4 +1451,30 @@ TEST(ecomapjournal, has_omap_updates_after_remove_entry)
   
   // Should not have updates after removing all entries
   ASSERT_FALSE(journal.has_omap_updates(test_hoid));
+}
+
+// A removed range spanning several adjacent keys erases all of them.
+TEST(ecbackend_remove_keys_in_ranges, removes_contiguous_block)
+{
+  std::map<std::string, ceph::buffer::list> out;
+  for (std::string_view k : {"k01", "k02", "k03", "k04", "k05", "k06"}) {
+    out[std::string(k)].append(k);
+  }
+  std::map<std::string, std::optional<std::string>> removed = {
+    {"k02", "k05"},  // -> erases k02, k03, k04
+  };
+
+  ECBackend::remove_keys_in_ranges(removed, &out);
+
+  std::vector<std::string> remaining;
+  for (const auto &[k, v] : out) {
+    remaining.push_back(k);
+  }
+  EXPECT_EQ((std::vector<std::string>{"k01", "k05", "k06"}), remaining);
+
+  // Surviving values must be untouched.
+  ASSERT_TRUE(out.contains("k05"));
+  ceph::buffer::list k05_bl;
+  k05_bl.append("k05");
+  EXPECT_TRUE(out["k05"].contents_equal(k05_bl));
 }

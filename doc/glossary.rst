@@ -203,9 +203,10 @@
 	CephX
                 The Ceph authentication protocol. CephX authenticates users and
                 daemons. CephX operates like Kerberos, but it has no single
-                point of failure. See the :ref:`High-availability
-                Authentication section<arch_high_availability_authentication>`
-                of the Architecture document and the :ref:`CephX Configuration
+                point of failure and allows authentication to a class of
+                services. See the :ref:`High-availability Authentication
+                section<arch_high_availability_authentication>` of the
+                Architecture document and the :ref:`CephX Configuration
                 Reference<rados-cephx-config-ref>`. 
 
 	Client
@@ -353,9 +354,8 @@
                 reduce the time it takes to read data from and to write to the
                 Ceph cluster. RGW bucket indexes are stored as omaps.
                 Erasure-coded pools, by default, cannot store RADOS omap data
-                structures. This functionality can be enabled in erasure-coded
-                pools with optimizations enabled by setting the
-                ``supports_omap`` flag to true.
+                structures. This functionality can be enabled in non-Crimson
+                erasure-coded pools by enabling EC optimizations.
                
                 Run the command ``ceph osd df`` to see the storage space used by
                 omaps on each OSD.
@@ -579,4 +579,4 @@
                 :ref:`Zones<radosgw-zones>`.
 
 .. _https://github.com/ceph: https://github.com/ceph
-.. _Cluster Map: ../architecture#cluster-map   
+.. _Cluster Map: ../architecture/scalability-high-availability#cluster-map   

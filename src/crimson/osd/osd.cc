@@ -29,6 +29,10 @@
 #include "messages/MOSDPGUpdateLogMissingReply.h"
 #include "messages/MOSDRepOpReply.h"
 #include "messages/MOSDScrub2.h"
+#include "messages/MOSDECSubOpWrite.h"
+#include "messages/MOSDECSubOpWriteReply.h"
+#include "messages/MOSDECSubOpRead.h"
+#include "messages/MOSDECSubOpReadReply.h"
 #include "messages/MOSDPGPCT.h"
 #include "messages/MPGStats.h"
 
@@ -106,11 +110,19 @@ OSD::OSD(int id, uint32_t nonce,
     mgrc{new crimson::mgr::Client{
       *public_msgr,
       *this,
+      // one lambda to perf-query them all
       [this](const ConfigPayload &config_payload) {
 	return set_perf_queries(config_payload);
       },
+      // one lambda to help _send_report() report them all
       [this] {
 	return get_perf_reports();
+      },
+      // one lambda to log-warn if pg stats report is stuck
+      [this](uint32_t skips) {
+	clog->warn() << fmt::format(
+	  "pg stats report stuck for ~{}s, store may be overloaded",
+	  skips * 5);
       }
     }},
     store{store},
@@ -478,7 +490,7 @@ seastar::future<> OSD::report_osd_stats()
 seastar::future<> OSD::start()
 {
   LOG_PREFIX(OSD::start);
-  INFO("seastar::smp::count {}", seastar::smp::count);
+  INFO("smp shard count {}", seastar::this_smp_shard_count());
   if (auto cpu_cores =
         local_conf().get_val<std::string>("crimson_cpu_set");
       cpu_cores.empty()) {
@@ -488,7 +500,7 @@ seastar::future<> OSD::start()
   ceph_assert(seastar::this_shard_id() == PRIMARY_CORE);
   DEBUG("starting store");
   uint32_t store_shards_num = co_await store.start();
-  co_await pg_to_shard_mappings.start(0, seastar::smp::count, store_shards_num);
+  co_await pg_to_shard_mappings.start(0, seastar::this_smp_shard_count(), store_shards_num);
   co_await osd_singleton_state.start_single(
         whoami, std::ref(*cluster_msgr), std::ref(*public_msgr),
         std::ref(*monc), std::ref(*mgrc));
@@ -513,7 +525,7 @@ seastar::future<> OSD::start()
     );
   auto stats_seconds = local_conf().get_val<int64_t>("crimson_osd_stat_interval");
   if (stats_seconds > 0) {
-    shard_stats.resize(seastar::smp::count);
+    shard_stats.resize(seastar::this_smp_shard_count());
     stats_timer.set_callback([this] {
       gate.dispatch_in_background("stats_osd", *this, [this] {
         return report_osd_stats();
@@ -600,7 +612,8 @@ seastar::future<> OSD::start()
       local_service.local_state.initialize_scheduler(local_service.get_cct(), *is_rotational);
     });
   } else {
-    throw std::runtime_error("No device class is set");
+    WARN("no device class set, defaulting is_rotational to false");
+    is_rotational = false;
   }
   monc->sub_want("osd_pg_creates", last_pg_create_epoch, 0);
   monc->sub_want("mgrmap", 0, 0);
@@ -722,8 +735,10 @@ seastar::future<> OSD::_add_device_class()
   }
 
   INFO("device_class is {} ", device_class);
+  std::string lowered = device_class;
+  std::transform(lowered.begin(), lowered.end(), lowered.begin(), ::tolower);
+  is_rotational = !(lowered == "ssd" || lowered == "random_block_ssd");
 
-  is_rotational = (device_class != "ssd");
   std::string cmd = fmt::format(
     R"({{"prefix": "osd crush set-device-class", "class": "{}", "ids": ["{}"]}})",
     device_class, stringify(whoami)
@@ -1189,6 +1204,7 @@ seastar::future<> OSD::_handle_osd_map(Ref<MOSDMap> m)
       co_return co_await get_shard_services().osdmap_subscribe(
         m->cluster_osdmap_trim_lower_bound - 1, true);
     }
+    start = first;
   }
 
   ceph::os::Transaction t;
@@ -1243,8 +1259,11 @@ seastar::future<> OSD::committed_osd_maps(
         co_return;
       }
       DEBUG("osd.{}: mark osd.{} down", whoami, osd_id);
+      // osd_id came from old_map->get_all_osds(); if it was purged in the new
+      // osdmap, osdmap->get_cluster_addrs(osd_id) would ceph_assert(exists()).
+      // old_map is guaranteed to contain osd_id and holds its last-known addr.
       co_await cluster_msgr->mark_down(
-        osdmap->get_cluster_addrs(osd_id).front());
+        old_map->get_cluster_addrs(osd_id).front());
     });
 
     co_await pg_shard_manager.update_map(std::move(o));

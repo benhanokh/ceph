@@ -34,8 +34,8 @@
 %else
 %bcond_with rbd_rwl_cache
 %endif
-%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler}
-%if 0%{?openEuler}
+%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler} || 0%{?openruyi}
+%if 0%{?openEuler} || 0%{?openruyi}
 %bcond_with system_pmdk
 %else
 %ifarch s390x aarch64
@@ -44,7 +44,11 @@
 %bcond_without system_pmdk
 %endif
 %endif
+%if 0%{?openruyi}
+%bcond_with selinux
+%else
 %bcond_without selinux
+%endif
 %bcond_without amqp_endpoint
 %bcond_without kafka_endpoint
 %bcond_without lttng
@@ -97,7 +101,7 @@
 %else
 %bcond_without jaeger
 %endif
-%if 0%{?fedora} || 0%{?suse_version} >= 1500 || 0%{?rhel}
+%if 0%{?fedora} || 0%{?suse_version} >= 1500 || 0%{?rhel} || 0%{?openruyi}
 # distros that ship cmd2 and/or colorama
 %bcond_without cephfs_shell
 %else
@@ -121,6 +125,7 @@
 # not x86_64
 %bcond_with system_qat
 %endif
+%bcond_with system_rdkafka
 %if 0%{?fedora} || 0%{?suse_version} || 0%{?rhel} || 0%{?openEuler}
 %global weak_deps 1
 %endif
@@ -133,7 +138,11 @@
 %{!?_selinux_policy_version: %global _selinux_policy_version 0.0.0}
 %endif
 %endif
+%if 0%{?openruyi}
+%bcond_with cephadm_bundling
+%else
 %bcond_without cephadm_bundling
+%endif
 %bcond_without cephadm_pip_deps
 %bcond_without dwz
 %if %{with dwz}
@@ -272,8 +281,8 @@ BuildRequires:  libatomic
 %endif
 %if 0%{with tcmalloc}
 # libprofiler did not build on ppc64le until 2.7.90
-%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler}
-BuildRequires:	gperftools-devel >= 2.7.90
+%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler} || 0%{?openruyi}
+BuildRequires:	pkgconfig(libtcmalloc) >= 2.7.90
 %endif
 %if 0%{?suse_version}
 BuildRequires:	gperftools-devel >= 2.4
@@ -309,7 +318,7 @@ BuildRequires:  procps
 BuildRequires:	python3
 BuildRequires:	python3-devel
 BuildRequires:	python3-setuptools
-BuildRequires:	python3-Cython
+BuildRequires:	python3dist(cython)
 BuildRequires:	python3-pip
 BuildRequires:	python3-wheel
 BuildRequires:	pkgconfig(snappy)
@@ -330,7 +339,11 @@ BuildRequires:  pkgconfig(yaml-cpp) >= 0.6
 BuildRequires:  pkgconfig(librabbitmq)
 %endif
 %if 0%{with kafka_endpoint}
-BuildRequires:  pkgconfig(rdkafka) >= 1.1.0
+%if 0%{with system_rdkafka}
+BuildRequires:  librdkafka-devel >= 2.11
+%else
+BuildRequires:  cyrus-sasl-devel
+%endif
 %endif
 %if 0%{with lua_packages}
 Requires:  lua-devel
@@ -348,9 +361,22 @@ BuildRequires:	python3dist(pyopenssl)
 BuildRequires:	socat
 BuildRequires:	python3dist(asyncssh)
 BuildRequires:	python3dist(natsort)
+%if 0%{?openruyi}
+BuildRequires:	python3dist(cryptography)
+BuildRequires:	python3dist(jsonpatch)
+BuildRequires:	python3dist(jinja2)
+BuildRequires:	python3dist(werkzeug)
+BuildRequires:	python3dist(mypy)
+BuildRequires:	python3dist(pecan)
+BuildRequires:	python3dist(requests-mock)
+BuildRequires:	python3dist(kubernetes)
+BuildRequires:	python3dist(asyncmock)
+BuildRequires:	python3dist(types-pyyaml)
+%endif
 %endif
 BuildRequires:	pkgconfig(thrift) >= 0.13.0
 BuildRequires:  pkgconfig(re2)
+BuildRequires:	pkgconfig(numa)
 %if 0%{with jaeger}
 BuildRequires:  bison
 BuildRequires:  flex
@@ -358,13 +384,6 @@ BuildRequires:	pkgconfig(nlohmann_json)
 BuildRequires:  pkgconfig(libevent)
 %endif
 %if 0%{with system_pmdk}
-%if 0%{?suse_version}
-BuildRequires:  pkgconfig(libndctl) >= 63
-%else
-BuildRequires:  pkgconfig(libndctl) >= 63
-BuildRequires:  pkgconfig(libdaxctl) >= 63
-%endif
-BuildRequires:  pkgconfig(libpmem)
 BuildRequires:  pkgconfig(libpmemobj) >= 1.8
 %endif
 %if 0%{with system_arrow}
@@ -422,10 +441,12 @@ Requires:	systemd
 BuildRequires:  boost-random
 BuildRequires:  libatomic
 BuildRequires:  ninja-build
-BuildRequires:  numactl-devel
 #BuildRequires:  krb5-devel
 BuildRequires:  CUnit-devel
 BuildRequires:	python3-devel
+%endif
+%if 0%{?openruyi}
+BuildRequires:	ninja
 %endif
 # distro-conditional make check dependencies
 %if 0%{with make_check}
@@ -444,6 +465,13 @@ BuildRequires:	xmlsec1-nss
 BuildRequires:	xmlsec1-openssl
 BuildRequires:	python3dist(scipy)
 BuildRequires:	python3dist(pyopenssl)
+%endif
+%if 0%{?openruyi}
+BuildRequires:	/usr/bin/promtool
+BuildRequires:	python3dist(scipy)
+BuildRequires:	python3dist(numpy)
+BuildRequires:	python3dist(tox)
+BuildRequires:	python3dist(pyfakefs)
 %endif
 BuildRequires:	jsonnet
 %if 0%{?suse_version}
@@ -472,9 +500,6 @@ BuildRequires:  openEuler-rpm-config
 # pkgconfig(cryptopp)), while el10 and SUSE's cryptopp/libcryptopp-devel
 # provide pkgconfig(libcryptopp); accept either.
 BuildRequires:  (pkgconfig(libcryptopp) or pkgconfig(cryptopp))
-%if 0%{?suse_version}
-BuildRequires:  libnuma-devel
-%endif
 %endif
 %if 0%{?rhel}
 BuildRequires: python-rpm-macros
@@ -665,7 +690,7 @@ Requires:       ceph-mgr = %{_epoch_prefix}%{version}-%{release}
 Requires:       ceph-mgr-smb = %{_epoch_prefix}%{version}-%{release}
 Requires:       ceph-grafana-dashboards = %{_epoch_prefix}%{version}-%{release}
 Requires:       ceph-prometheus-alerts = %{_epoch_prefix}%{version}-%{release}
-%if 0%{?fedora} || 0%{?rhel}
+%if 0%{?fedora} || 0%{?rhel} || 0%{?openruyi}
 Requires:       python3dist(grpcio)
 Requires:       python3dist(grpcio-tools)
 Requires:       python3dist(jmespath)
@@ -694,7 +719,7 @@ Group:          System/Filesystems
 %endif
 Requires:       ceph-mgr = %{_epoch_prefix}%{version}-%{release}
 Requires:       python3dist(numpy)
-%if 0%{?fedora} || 0%{?suse_version} || 0%{?openEuler}
+%if 0%{?fedora} || 0%{?suse_version} || 0%{?openEuler} || 0%{?openruyi}
 Requires:       python3dist(scikit-learn)
 %endif
 Requires:       python3dist(scipy)
@@ -796,7 +821,7 @@ Requires:       python3dist(jinja2)
 %if 0%{?suse_version}
 Requires:       openssh
 %endif
-%if 0%{?rhel} || 0%{?fedora} || 0%{?openEuler}
+%if 0%{?rhel} || 0%{?fedora} || 0%{?openEuler} || 0%{?openruyi}
 Requires:       openssh-clients
 %endif
 %description mgr-cephadm
@@ -1136,11 +1161,27 @@ Requires:	mailcap
 %if 0%{?weak_deps}
 Recommends:	gawk
 %endif
+%if 0%{with kafka_endpoint} && !0%{with system_rdkafka}
+Provides:	bundled(librdkafka) = 2.12.1
+%endif
 %description radosgw
 RADOS is a distributed object store used by the Ceph distributed
 storage system.  This package provides a REST gateway to the
 object store that aims to implement a superset of Amazon's S3
 service as well as the OpenStack Object Storage ("Swift") API.
+
+%package rgw-standalone
+Summary:	Rados REST gateway for filesystems
+%if 0%{?suse_version}
+Group:		System/Filesystems
+%endif
+Conflicts:	ceph-common
+Conflicts:	radosgw
+%description rgw-standalone
+This package provides an Object REST gateway (S3 and Swift) on
+top of a filesystem that aims to implement a superset of Amazon's S3
+service as well as the OpenStack Object Storage ("Swift") API.
+It does not require or provide any of the rest of the Ceph services.
 
 %package -n cephfs-top
 Summary:    top(1) like utility for Ceph Filesystem
@@ -1795,6 +1836,9 @@ cmake .. \
 %if 0%{with system_pmdk}
     -DWITH_SYSTEM_PMDK:BOOL=ON \
 %endif
+%if 0%{with system_rdkafka}
+    -DWITH_SYSTEM_RDKAFKA:BOOL=ON \
+%endif
 %if 0%{without jaeger}
     -DWITH_JAEGER:BOOL=OFF \
 %endif
@@ -1850,6 +1894,9 @@ popd
 
 %if 0%{with make_check}
 %check
+%if 0%{?openruyi}
+export CEPH_PYTHON_SYSTEM_SITE=true
+%endif
 # run in-tree unittests
 pushd %{_vpath_builddir}
 ctest %{_smp_mflags}
@@ -1871,7 +1918,7 @@ mv %{buildroot}%{_bindir}/crimson-osd %{buildroot}%{_bindir}/ceph-osd-crimson
 mv %{buildroot}%{_bindir}/ceph-osd %{buildroot}%{_bindir}/ceph-osd-classic
 
 install -m 0644 -D src/etc-rbdmap %{buildroot}%{_sysconfdir}/ceph/rbdmap
-%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler}
+%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler} || 0%{?openruyi}
 install -m 0644 -D etc/sysconfig/ceph %{buildroot}%{_sysconfdir}/sysconfig/ceph
 %endif
 %if 0%{?suse_version}
@@ -1905,7 +1952,7 @@ install -m 0644 -D udev/50-rbd.rules %{buildroot}%{_udevrulesdir}/50-rbd.rules
 # sudoers.d
 install -m 0440 -D sudoers.d/ceph-smartctl %{buildroot}%{_sysconfdir}/sudoers.d/ceph-smartctl
 
-%if 0%{?rhel} || 0%{?openEuler}
+%if 0%{?rhel} || 0%{?openEuler} || 0%{?openruyi}
 # Undefine -P flag as it is only supported with python version >= 3.11
 %undefine _py3_shebang_P
 
@@ -1991,7 +2038,7 @@ rm -rf %{_vpath_builddir}
 %{_libdir}/libmgr_op_tp.so*
 %endif
 %config(noreplace) %{_sysconfdir}/logrotate.d/ceph
-%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler}
+%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler} || 0%{?openruyi}
 %config(noreplace) %{_sysconfdir}/sysconfig/ceph
 %endif
 %if 0%{?suse_version}
@@ -2024,7 +2071,7 @@ if [ $1 -eq 1 ] ; then
 /usr/bin/systemctl preset ceph.target ceph-crash.service >/dev/null 2>&1 || :
 fi
 %endif
-%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler}
+%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler} || 0%{?openruyi}
 %systemd_post ceph.target ceph-crash.service
 %endif
 if [ $1 -eq 1 ] ; then
@@ -2035,7 +2082,7 @@ fi
 %if 0%{?suse_version}
 %service_del_preun ceph.target ceph-crash.service
 %endif
-%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler}
+%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler} || 0%{?openruyi}
 %systemd_preun ceph.target ceph-crash.service
 %endif
 
@@ -2069,6 +2116,7 @@ exit 0
 %{_bindir}/ceph-authtool
 %{_bindir}/ceph-conf
 %{_bindir}/ceph-dencoder
+%{_bindir}/ceph-diff-sorted
 %{_bindir}/ceph-rbdnamer
 %{_bindir}/ceph-syn
 %{_bindir}/cephfs-data-scan
@@ -2085,6 +2133,8 @@ exit 0
 %{_bindir}/rgw-gap-list
 %{_bindir}/rgw-gap-list-comparator
 %{_bindir}/rgw-orphan-list
+%{_bindir}/rgw-policy-check
+%{_bindir}/rgw-policy-test
 %{_bindir}/rgw-restore-bucket-index
 %{_sbindir}/mount.ceph
 %if 0%{?suse_version} && 0%{?suse_version} < 1550
@@ -2116,6 +2166,8 @@ exit 0
 %{_mandir}/man8/rbd-replay-prep.8*
 %{_mandir}/man8/rgw-orphan-list.8*
 %{_mandir}/man8/rgw-gap-list.8*
+%{_mandir}/man8/rgw-policy-check.8*
+%{_mandir}/man8/rgw-policy-test.8*
 %{_mandir}/man8/rgw-restore-bucket-index.8*
 %dir %{_datadir}/ceph/
 %{_datadir}/ceph/known_hosts_drop.ceph.com
@@ -2136,7 +2188,7 @@ exit 0
 %pre common
 CEPH_GROUP_ID=167
 CEPH_USER_ID=167
-%if 0%{?rhel} || 0%{?fedora} || 0%{?openEuler}
+%if 0%{?rhel} || 0%{?fedora} || 0%{?openEuler} || 0%{?openruyi}
 /usr/sbin/groupadd ceph -g $CEPH_GROUP_ID -o -r 2>/dev/null || :
 /usr/sbin/useradd ceph -u $CEPH_USER_ID -o -r -g ceph -s /sbin/nologin -c "Ceph daemons" -d %{_localstatedir}/lib/ceph 2>/dev/null || :
 %endif
@@ -2175,7 +2227,7 @@ if [ $1 -eq 1 ] ; then
   /usr/bin/systemctl preset ceph-mds@\*.service ceph-mds.target >/dev/null 2>&1 || :
 fi
 %endif
-%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler}
+%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler} || 0%{?openruyi}
 %systemd_post ceph-mds@\*.service ceph-mds.target
 %endif
 if [ $1 -eq 1 ] ; then
@@ -2186,7 +2238,7 @@ fi
 %if 0%{?suse_version}
 %service_del_preun ceph-mds@\*.service ceph-mds.target
 %endif
-%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler}
+%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler} || 0%{?openruyi}
 %systemd_preun ceph-mds@\*.service ceph-mds.target
 %endif
 
@@ -2223,7 +2275,7 @@ if [ $1 -eq 1 ] ; then
   /usr/bin/systemctl preset ceph-mgr@\*.service ceph-mgr.target >/dev/null 2>&1 || :
 fi
 %endif
-%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler}
+%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler} || 0%{?openruyi}
 %systemd_post ceph-mgr@\*.service ceph-mgr.target
 %endif
 if [ $1 -eq 1 ] ; then
@@ -2234,7 +2286,7 @@ fi
 %if 0%{?suse_version}
 %service_del_preun ceph-mgr@\*.service ceph-mgr.target
 %endif
-%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler}
+%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler} || 0%{?openruyi}
 %systemd_preun ceph-mgr@\*.service ceph-mgr.target
 %endif
 
@@ -2406,7 +2458,7 @@ if [ $1 -eq 1 ] ; then
   /usr/bin/systemctl preset ceph-mon@\*.service ceph-mon.target >/dev/null 2>&1 || :
 fi
 %endif
-%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler}
+%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler} || 0%{?openruyi}
 %systemd_post ceph-mon@\*.service ceph-mon.target
 %endif
 if [ $1 -eq 1 ] ; then
@@ -2417,7 +2469,7 @@ fi
 %if 0%{?suse_version}
 %service_del_preun ceph-mon@\*.service ceph-mon.target
 %endif
-%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler}
+%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler} || 0%{?openruyi}
 %systemd_preun ceph-mon@\*.service ceph-mon.target
 %endif
 
@@ -2458,7 +2510,7 @@ if [ $1 -eq 1 ] ; then
   /usr/bin/systemctl preset cephfs-mirror@\*.service cephfs-mirror.target >/dev/null 2>&1 || :
 fi
 %endif
-%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler}
+%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler} || 0%{?openruyi}
 %systemd_post cephfs-mirror@\*.service cephfs-mirror.target
 %endif
 if [ $1 -eq 1 ] ; then
@@ -2469,7 +2521,7 @@ fi
 %if 0%{?suse_version}
 %service_del_preun cephfs-mirror@\*.service cephfs-mirror.target
 %endif
-%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler}
+%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler} || 0%{?openruyi}
 %systemd_preun cephfs-mirror@\*.service cephfs-mirror.target
 %endif
 
@@ -2507,7 +2559,7 @@ if [ $1 -eq 1 ] ; then
   /usr/bin/systemctl preset ceph-rbd-mirror@\*.service ceph-rbd-mirror.target >/dev/null 2>&1 || :
 fi
 %endif
-%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler}
+%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler} || 0%{?openruyi}
 %systemd_post ceph-rbd-mirror@\*.service ceph-rbd-mirror.target
 %endif
 if [ $1 -eq 1 ] ; then
@@ -2518,7 +2570,7 @@ fi
 %if 0%{?suse_version}
 %service_del_preun ceph-rbd-mirror@\*.service ceph-rbd-mirror.target
 %endif
-%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler}
+%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler} || 0%{?openruyi}
 %systemd_preun ceph-rbd-mirror@\*.service ceph-rbd-mirror.target
 %endif
 
@@ -2548,7 +2600,7 @@ if [ $1 -eq 1 ] ; then
   /usr/bin/systemctl preset ceph-immutable-object-cache@\*.service ceph-immutable-object-cache.target >/dev/null 2>&1 || :
 fi
 %endif
-%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler}
+%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler} || 0%{?openruyi}
 %systemd_post ceph-immutable-object-cache@\*.service ceph-immutable-object-cache.target
 %endif
 if [ $1 -eq 1 ] ; then
@@ -2559,7 +2611,7 @@ fi
 %if 0%{?suse_version}
 %service_del_preun ceph-immutable-object-cache@\*.service ceph-immutable-object-cache.target
 %endif
-%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler}
+%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler} || 0%{?openruyi}
 %systemd_preun ceph-immutable-object-cache@\*.service ceph-immutable-object-cache.target
 %endif
 
@@ -2584,14 +2636,11 @@ fi
 %{_libexecdir}/rbd-nbd/rbd-nbd_quiesce
 
 %files radosgw
-%{_bindir}/ceph-diff-sorted
 %{_bindir}/radosgw
 %{_bindir}/radosgw-token
 %{_bindir}/radosgw-es
 %{_bindir}/radosgw-object-expirer
-%{_bindir}/rgw-policy-check
 %{_mandir}/man8/radosgw.8*
-%{_mandir}/man8/rgw-policy-check.8*
 %dir %{_localstatedir}/lib/ceph/radosgw
 %{_unitdir}/ceph-radosgw@.service
 %{_unitdir}/ceph-radosgw.target
@@ -2602,7 +2651,7 @@ if [ $1 -eq 1 ] ; then
   /usr/bin/systemctl preset ceph-radosgw@\*.service ceph-radosgw.target >/dev/null 2>&1 || :
 fi
 %endif
-%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler}
+%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler} || 0%{?openruyi}
 %systemd_post ceph-radosgw@\*.service ceph-radosgw.target
 %endif
 if [ $1 -eq 1 ] ; then
@@ -2613,7 +2662,7 @@ fi
 %if 0%{?suse_version}
 %service_del_preun ceph-radosgw@\*.service ceph-radosgw.target
 %endif
-%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler}
+%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler} || 0%{?openruyi}
 %systemd_preun ceph-radosgw@\*.service ceph-radosgw.target
 %endif
 
@@ -2631,6 +2680,19 @@ if [ $1 -ge 1 ] ; then
   fi
 fi
 
+%files rgw-standalone
+%dir %{_docdir}/ceph
+%doc %{_docdir}/ceph/sample.ceph.conf
+%dir %{_libdir}/ceph
+%{_libdir}/ceph/libceph-common.so.*
+%{_bindir}/rgw-standalone
+%{_bindir}/rgw-standalone-admin
+%dir %{_localstatedir}/lib/ceph/radosgw
+
+%post rgw-standalone -p /sbin/ldconfig
+
+%postun rgw-standalone -p /sbin/ldconfig
+
 %files osd
 %{_bindir}/ceph-clsinfo
 %{_bindir}/ceph-erasure-code-tool
@@ -2647,7 +2709,7 @@ if [ $1 -eq 1 ] ; then
   /usr/bin/systemctl preset ceph-osd@\*.service ceph-osd.target >/dev/null 2>&1 || :
 fi
 %endif
-%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler}
+%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler} || 0%{?openruyi}
 %systemd_post ceph-osd@\*.service ceph-osd.target
 %endif
 if [ $1 -eq 1 ] ; then
@@ -2659,7 +2721,7 @@ fi
 %if 0%{?suse_version}
 %service_del_preun ceph-osd@\*.service ceph-osd.target
 %endif
-%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler}
+%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler} || 0%{?openruyi}
 %systemd_preun ceph-osd@\*.service ceph-osd.target
 %endif
 
@@ -2724,7 +2786,7 @@ if [ $1 -eq 1 ] ; then
   /usr/bin/systemctl preset ceph-volume@\*.service >/dev/null 2>&1 || :
 fi
 %endif
-%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler}
+%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler} || 0%{?openruyi}
 %systemd_post ceph-volume@\*.service
 %endif
 
@@ -2732,7 +2794,7 @@ fi
 %if 0%{?suse_version}
 %service_del_preun ceph-volume@\*.service
 %endif
-%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler}
+%if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler} || 0%{?openruyi}
 %systemd_preun ceph-volume@\*.service
 %endif
 

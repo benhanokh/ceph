@@ -293,6 +293,29 @@ export class CdValidators {
   }
 
   /**
+   * Validator that checks whether the control value is a Base64 encoded JSON string.
+   * Whitespace characters are ignored. Skips validation when value is empty.
+   * @returns {ValidatorFn} Returns error map with `invalidBase64Json` if validation fails.
+   */
+  static base64Json(): ValidatorFn {
+    return (control: AbstractControl): ValidationErrors | null => {
+      const value = (control.value || '').replace(/\s/g, '');
+      if (isEmptyInputValue(value)) {
+        return null;
+      }
+      if (!/^[A-Za-z0-9+/]+=*$/.test(value)) {
+        return { invalidBase64Json: true };
+      }
+      try {
+        JSON.parse(atob(value));
+        return null;
+      } catch {
+        return { invalidBase64Json: true };
+      }
+    };
+  }
+
+  /**
    * Validate form control if condition is true with validators.
    *
    * @param {AbstractControl} formControl
@@ -312,18 +335,22 @@ export class CdValidators {
   ) {
     conditionalValidators = conditionalValidators.concat(permanentValidators);
 
-    formControl.setValidators((control: AbstractControl): {
-      [key: string]: any;
-    } => {
-      const value = condition.call(this);
-      if (value) {
-        return Validators.compose(conditionalValidators)(control);
+    formControl.setValidators(
+      (
+        control: AbstractControl
+      ): {
+        [key: string]: any;
+      } => {
+        const value = condition.call(this);
+        if (value) {
+          return Validators.compose(conditionalValidators)(control);
+        }
+        if (permanentValidators.length > 0) {
+          return Validators.compose(permanentValidators)(control);
+        }
+        return null;
       }
-      if (permanentValidators.length > 0) {
-        return Validators.compose(permanentValidators)(control);
-      }
-      return null;
-    });
+    );
 
     watchControls.forEach((control: AbstractControl) => {
       control.valueChanges.subscribe(() => {
@@ -348,7 +375,7 @@ export class CdValidators {
       if (!ctrl1 || !ctrl2) {
         return null;
       }
-      if (ctrl1.value !== ctrl2.value) {
+      if (ctrl2.value && ctrl1.value !== ctrl2.value) {
         const errors = _.merge({}, ctrl2.errors, { match: true });
         ctrl2.setErrors(errors);
       } else {
@@ -566,7 +593,8 @@ export class CdValidators {
       let errorName: string;
       // - Bucket names cannot be formatted as IP address.
       constraints.push(() => {
-        const ipv4Rgx = /^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/i;
+        const ipv4Rgx =
+          /^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/i;
         const ipv6Rgx = /^(?:[a-f0-9]{1,4}:){7}[a-f0-9]{1,4}$/i;
         const name = control.value;
         let notIP = true;
@@ -707,7 +735,8 @@ export class CdValidators {
 
   static oauthAddressTest(): ValidatorFn {
     // Pattern matches: IPv4 addresses or hostnames (with or without dots, like 'localhost')
-    const OAUTH2_HTTPS_ADDRESS_PATTERN = /^((\d{1,3}\.){3}\d{1,3}|([a-zA-Z0-9-_]+\.)*[a-zA-Z0-9-_]+)$/;
+    const OAUTH2_HTTPS_ADDRESS_PATTERN =
+      /^((\d{1,3}\.){3}\d{1,3}|([a-zA-Z0-9-_]+\.)*[a-zA-Z0-9-_]+)$/;
     return (control: AbstractControl): Record<string, boolean> | null => {
       if (!control.value) {
         return null;

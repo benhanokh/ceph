@@ -1068,8 +1068,6 @@ generated key is added to the keyring without replacing an existing key pair.
 If ``access-key`` is specified and refers to an existing key owned by the user
 then it will be modified.
 
-.. versionadded:: Luminous
-
 A ``tenant`` may either be specified as a part of uid or as an additional
 request param.
 
@@ -1162,8 +1160,6 @@ A tenant name may also specified as a part of ``uid``, by following the syntax
 :Type: Boolean
 :Example: False [False]
 :Required: No
-
-.. versionadded:: Jewel
 
 ``tenant``
 
@@ -2939,14 +2935,12 @@ Dedup
 =====
 
 The Admin Operations API can be used to manage RGW object deduplication.
-See `Full RGW Object Dedup`_ for additional details on the dedup feature and
+See :ref:`radosgw-s3-dedup` for additional details on the dedup feature and
 CLI commands.
-
-.. _Full RGW Object Dedup: ../s3_objects_dedup
 
 To view dedup status, the user must have ``dedup=read`` capability. To
 control dedup operations, the user must have ``dedup=write`` capability.
-See the `Admin Guide`_ for details.
+See the :ref:`radosgw-admin-guide` for details.
 
 Get Dedup Stats
 ~~~~~~~~~~~~~~~

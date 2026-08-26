@@ -7,6 +7,7 @@
 #include <seastar/core/metrics.hh>
 
 #include "include/buffer.h"
+#include "crimson/common/coroutine.h"
 #include "crimson/os/seastore/lba/btree_lba_manager.h"
 #include "crimson/os/seastore/lba/lba_btree_node.h"
 #include "crimson/os/seastore/logging.h"
@@ -17,6 +18,12 @@ SET_SUBSYS(seastore_lba);
  * - INFO:  mkfs
  * - DEBUG: modification operations
  * - TRACE: read operations, DEBUG details
+ */
+
+/**
+ * \file
+ * This file implements BtreeLBAManager - the LBA (logical → physical) address
+ * translation layer.
  */
 
 template <> struct fmt::formatter<
@@ -35,8 +42,15 @@ template <> struct fmt::formatter<
   }
 };
 
+// -------------------------------------------------------------------------
+// Template specializations for the LBA tree.
+// These wire the generic FixedKVBtree infrastructure to the LBA-specific
+// root, stats, and node types.
+// -------------------------------------------------------------------------
+
 namespace crimson::os::seastore {
 
+/** get_tree_stats<LBABtree> → Transaction::lba_tree_stats */
 template <typename T>
 Transaction::tree_stats_t& get_tree_stats(Transaction &t)
 {
@@ -48,6 +62,7 @@ get_tree_stats<
   crimson::os::seastore::lba::LBABtree>(
   Transaction &t);
 
+/** get_phy_tree_root<LBABtree> → root_t::lba_root (paddr + depth of tree root) */
 template <typename T>
 phy_tree_root_t& get_phy_tree_root(root_t &r)
 {
@@ -58,6 +73,11 @@ template phy_tree_root_t&
 get_phy_tree_root<
   crimson::os::seastore::lba::LBABtree>(root_t &r);
 
+/**
+ * Synchronous root-node fetch: returns the LBA root node extent from cache.
+ * If the root_block is pending (being mutated), the root node is fetched
+ * from the prior (stable) instance.  Asserts the node is in cache.
+ */
 template <>
 CachedExtentRef get_phy_tree_root_node_sync<
   crimson::os::seastore::lba::LBABtree>(
@@ -77,6 +97,13 @@ CachedExtentRef get_phy_tree_root_node_sync<
   return ret;
 }
 
+/**
+ * Async root-node fetch: returns (found, future<node>).  If the root node
+ * pointer is known (lba_root_node != null), returns {true, future} that
+ * resolves via get_extent_viewable_by_trans (may block if not yet readable).
+ * Otherwise returns {false, ready-future} signaling the caller should fall
+ * back to reading from disk via get_internal_node/get_leaf_node.
+ */
 template <>
 const get_phy_tree_root_node_ret get_phy_tree_root_node<
   crimson::os::seastore::lba::LBABtree>(
@@ -104,6 +131,12 @@ const get_phy_tree_root_node_ret get_phy_tree_root_node<
   }
 }
 
+/**
+ * TreeRootLinker specialization for LBA tree.  Bidirectionally links the
+ * RootBlock and the LBA root node (internal or leaf) so that the tree can
+ * be traversed from the root, and the root node can find its way back to
+ * the RootBlock.
+ */
 template <typename RootT>
 class TreeRootLinker<RootBlock, RootT> {
 public:
@@ -124,6 +157,13 @@ template class TreeRootLinker<RootBlock, lba::LBALeafNode>;
 
 namespace crimson::os::seastore::lba {
 
+// ---------------------------------------------------------------------------
+// Public API implementations
+// ---------------------------------------------------------------------------
+
+/**
+ * mkfs: create the initial empty LBA tree (single empty leaf root).
+ */
 BtreeLBAManager::mkfs_ret
 BtreeLBAManager::mkfs(
   Transaction &t)
@@ -133,9 +173,18 @@ BtreeLBAManager::mkfs(
   auto croot = co_await cache.get_root(t);
   assert(croot);
   assert(croot->is_mutation_pending());
-  croot->get_root().lba_root = LBABtree::mkfs(croot, get_context(t));
+  croot->get_root().lba_root =
+    co_await LBABtree::mkfs(croot, get_context(t)
+    ).handle_error_interruptible(
+      mkfs_iertr::pass_further{},
+      crimson::ct_error::assert_all("unexpected error")
+    );
 }
 
+/**
+ * get_cursors (public): fetch the btree, then delegate to the internal
+ * overload that takes an op_context + btree reference.
+ */
 BtreeLBAManager::get_cursors_ret
 BtreeLBAManager::get_cursors(
   Transaction &t,
@@ -150,6 +199,9 @@ BtreeLBAManager::get_cursors(
   co_return co_await get_cursors(c, btree, laddr, length);
 }
 
+/**
+ * get_cursor (by laddr): exact match or containing-range match.
+ */
 BtreeLBAManager::get_cursor_ret
 BtreeLBAManager::get_cursor(
   Transaction &t,
@@ -172,6 +224,11 @@ BtreeLBAManager::get_cursor(
   }
 }
 
+/**
+ * get_cursor (by extent): navigates from the data extent up to its parent
+ * leaf node via get_parent_node(), then constructs a cursor at the extent's
+ * laddr.  Avoids a full root-to-leaf tree traversal.
+ */
 BtreeLBAManager::get_cursor_ret
 BtreeLBAManager::get_cursor(
   Transaction &t,
@@ -204,6 +261,11 @@ BtreeLBAManager::get_cursor(
   co_return btree.get_cursor(c, leaf, extent.get_laddr());
 }
 
+/**
+ * get_cursors (internal): range query.  Starts with upper_bound_right(laddr)
+ * to find the first entry whose range overlaps the query, then iterates
+ * forward collecting cursors until key >= laddr + length.
+ */
 BtreeLBAManager::get_cursors_ret
 BtreeLBAManager::get_cursors(
   op_context_t c,
@@ -232,6 +294,11 @@ BtreeLBAManager::get_cursors(
   co_return ret;
 }
 
+/**
+ * resolve_indirect_cursor: given an indirect mapping (laddr → local_clone_id),
+ * reconstruct the intermediate key and look up the direct mapping that owns
+ * the physical data.  Asserts exactly one direct cursor is found.
+ */
 BtreeLBAManager::resolve_indirect_cursor_ret
 BtreeLBAManager::resolve_indirect_cursor(
   op_context_t c,
@@ -239,6 +306,7 @@ BtreeLBAManager::resolve_indirect_cursor(
   const LBACursor &indirect_cursor)
 {
   ceph_assert(indirect_cursor.is_indirect());
+  ceph_assert(!indirect_cursor.has_shadow_paddr());
   return get_cursors(
     c,
     btree,
@@ -256,6 +324,7 @@ BtreeLBAManager::resolve_indirect_cursor(
   });
 }
 
+/** lower_bound: simple btree lower_bound, returns cursor at first entry >= laddr. */
 BtreeLBAManager::lower_bound_ret
 BtreeLBAManager::lower_bound(
   Transaction &t,
@@ -267,6 +336,107 @@ BtreeLBAManager::lower_bound(
   co_return iter.get_cursor(c);
 }
 
+BtreeLBAManager::upper_bound_right_ret
+BtreeLBAManager::upper_bound_right(
+  Transaction &t,
+  laddr_t laddr)
+{
+  auto c = get_context(t);
+  auto btree = co_await get_btree<LBABtree>(c);
+  auto iter = co_await btree.upper_bound_right(c, laddr);
+  if (iter.is_end()) {
+    co_await upper_bound_right_iertr::future<LBACursorRef>(
+      crimson::ct_error::enoent::make());
+  }
+  assert(iter.get_key() >= laddr);
+  co_return iter.get_cursor(c);
+}
+
+BtreeLBAManager::promote_extent_ret
+BtreeLBAManager::promote_extent(
+  Transaction &t,
+  LBACursor &cursor,
+  std::vector<LogicalChildNodeRef> extents)
+{
+  LOG_PREFIX(BtreeLBAManager::promote_extent);
+  auto laddr = cursor.get_laddr();
+  ceph_assert(!extents.empty());
+  ceph_assert(!cursor.is_indirect());
+  ceph_assert(laddr == extents.front()->get_laddr());
+  DEBUGT("promote cursor {} with {} extents",
+	 t, cursor, extents.size());
+  auto c = get_context(t);
+  auto btree = co_await get_btree<LBABtree>(c);
+  auto iter = btree.make_partial_iter(c, cursor);
+  auto orig_val = iter.get_val();
+  if (extents.size() == 1) {
+    auto new_val = orig_val;
+    ceph_assert(new_val.pladdr.is_paddr());
+    new_val.shadow_paddr = new_val.pladdr.get_paddr();
+    auto extent = extents.front().get();
+    auto paddr = extent->get_paddr();
+    new_val.pladdr = pladdr_t(paddr);
+    TRACET("promote {} from {} to {}",
+	   t, iter.get_key(), new_val.shadow_paddr, paddr);
+    assert(extent->is_pending());
+    assert(!extent->has_parent_tracker());
+    iter = btree.update(c, iter, new_val, extent);
+    assert(extent->has_parent_tracker());
+  } else {
+    auto insert_iter = co_await btree.remove(c, std::move(iter));
+    for (auto &extent : extents) {
+      auto offset = extent->get_laddr().get_byte_distance<extent_len_t>(laddr);
+      auto new_val = orig_val;
+      new_val.shadow_paddr = orig_val.pladdr.get_paddr().add_offset(offset);
+      new_val.pladdr = pladdr_t(extent->get_paddr());
+      new_val.len = extent->get_length();
+      new_val.checksum = extent->get_last_committed_crc();
+      TRACET("insert promoted cursor {} {}",
+	     c.trans, extent->get_laddr(), new_val);
+      assert(!extent->has_parent_tracker());
+      auto [iter, inserted] = co_await btree.insert(
+	c, std::move(insert_iter), extent->get_laddr(), new_val, extent.get());
+      ceph_assert(inserted);
+      assert(extent->has_parent_tracker());
+      insert_iter = co_await iter.next(c);
+    }
+  }
+  co_return;
+}
+BtreeLBAManager::demote_extent_ret
+BtreeLBAManager::demote_extent(
+  Transaction &t,
+  LBACursor &cursor,
+  LogicalChildNode &extent)
+{
+  assert(cursor.is_viewable());
+  assert(!cursor.is_end());
+  assert(!cursor.is_indirect());
+  assert(cursor.has_shadow_paddr());
+  auto c = get_context(t);
+  auto btree = co_await get_btree<LBABtree>(c);
+  auto ret = co_await _update_mapping(
+    t,
+    cursor,
+    [&extent](lba_map_val_t val) {
+      assert(val.pladdr.is_paddr());
+      assert(val.shadow_paddr == extent.get_paddr());
+      val.pladdr = pladdr_t(val.shadow_paddr);
+      val.shadow_paddr = P_ADDR_NULL;
+      return val;
+    },
+    &extent
+  ).handle_error_interruptible(
+    demote_extent_iertr::pass_further{},
+    crimson::ct_error::assert_all("unexpected enoent"));
+  co_return ret;
+}
+
+/**
+ * reserve_region: insert a zero-mapping (P_ADDR_ZERO) at the specified laddr.
+ * Uses the cursor as a btree insertion hint.  The reserved_ptr child pointer
+ * marks this leaf entry as a placeholder (no real data extent yet).
+ */
 BtreeLBAManager::alloc_extent_ret
 BtreeLBAManager::reserve_region(
   Transaction &t,
@@ -284,6 +454,7 @@ BtreeLBAManager::reserve_region(
   lba_map_val_t val{
     len,
     pladdr_t{P_ADDR_ZERO},
+    P_ADDR_NULL,
     EXTENT_DEFAULT_REF_COUNT,
     0,
     type};
@@ -296,6 +467,12 @@ BtreeLBAManager::reserve_region(
   co_return iter.get_cursor(c);
 }
 
+/**
+ * alloc_extents (with cursor hint): insert mappings for extents that already
+ * have assigned laddrs, using 'cursor' as a btree hint.  Processes extents
+ * in reverse order so each insertion stays near the hint position (since the
+ * hint is at the end of the target range).
+ */
 BtreeLBAManager::alloc_extents_ret
 BtreeLBAManager::alloc_extents(
   Transaction &t,
@@ -319,6 +496,7 @@ BtreeLBAManager::alloc_extents(
       lba_map_val_t{
 	ext->get_length(),
 	pladdr_t{ext->get_paddr()},
+        P_ADDR_NULL,
 	EXTENT_DEFAULT_REF_COUNT,
 	ext->get_last_committed_crc(),
         ext->get_type()},
@@ -340,6 +518,12 @@ BtreeLBAManager::alloc_extents(
   co_return ret;
 }
 
+/**
+ * clone_mapping: create an indirect mapping at 'laddr' that references the
+ * direct mapping 'mapping' via inter_key.  The indirect entry stores
+ * inter_key.get_local_clone_id() as its pladdr.  If updateref is true,
+ * the target direct mapping's refcount is incremented first.
+ */
 BtreeLBAManager::clone_mapping_ret
 BtreeLBAManager::clone_mapping(
   Transaction &t,
@@ -372,6 +556,7 @@ BtreeLBAManager::clone_mapping(
     lba_map_val_t{
       len,
       pladdr_t{inter_key.get_local_clone_id()},
+      P_ADDR_NULL,
       EXTENT_DEFAULT_REF_COUNT,
       0,
       mapping->get_extent_type()},
@@ -383,6 +568,14 @@ BtreeLBAManager::clone_mapping(
     mapping};
 }
 
+// ---------------------------------------------------------------------------
+// Internal lookup helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * get_cursor (internal, exact): lower_bound + check for exact key match.
+ * Returns enoent if laddr is not found.
+ */
 BtreeLBAManager::get_cursor_ret
 BtreeLBAManager::get_cursor(
   op_context_t c,
@@ -405,6 +598,26 @@ BtreeLBAManager::get_cursor(
   });
 }
 
+// ---------------------------------------------------------------------------
+// Address allocation internals
+// ---------------------------------------------------------------------------
+
+/**
+ * search_insert_position: find a free laddr near 'hint' that can accommodate
+ * 'length' bytes without overlapping existing mappings.
+ *
+ * Algorithm:
+ *   1. Start at upper_bound_right(hint.lower_boundary()) - first entry that
+ *      could conflict with the hint range.
+ *   2. While there is a conflict (overlap or hint-policy violation):
+ *      a. gen_random policy: pick a new random hint and re-search.
+ *      b. linear policy: advance hint past the conflicting entry and try
+ *         the next position.  May loop back to the beginning of the
+ *         address space if the hint wraps past the object boundary.
+ *   3. Return the chosen laddr and the btree iterator at the insertion point.
+ *
+ * Warns if > 32 attempts (possible fragmentation or misconfigured hints).
+ */
 BtreeLBAManager::search_insert_position_ret
 BtreeLBAManager::search_insert_position(
   op_context_t c,
@@ -500,6 +713,12 @@ BtreeLBAManager::search_insert_position(
   co_return insert_position_t{hint.addr, iter};
 }
 
+/**
+ * alloc_contiguous_mappings: allocate a contiguous block of laddrs for
+ * multiple mappings.  search_insert_position finds a single starting laddr
+ * for the total length; each info's key is then set sequentially from that
+ * base.  All entries are inserted via insert_mappings.
+ */
 BtreeLBAManager::alloc_mappings_ret
 BtreeLBAManager::alloc_contiguous_mappings(
   Transaction &t,
@@ -532,6 +751,12 @@ BtreeLBAManager::alloc_contiguous_mappings(
   });
 }
 
+/**
+ * alloc_sparse_mappings: allocate mappings at pre-assigned, non-contiguous
+ * laddrs.  Each info already has a key; the base offset is adjusted by the
+ * difference between hint.addr and the allocated starting laddr.  The
+ * entries must be sorted and non-overlapping.
+ */
 BtreeLBAManager::alloc_mappings_ret
 BtreeLBAManager::alloc_sparse_mappings(
   Transaction &t,
@@ -570,6 +795,18 @@ BtreeLBAManager::alloc_sparse_mappings(
   });
 }
 
+/**
+ * insert_mappings: the inner loop that inserts all alloc_infos into the btree.
+ *
+ * Phase 1 (forward): for each info, call btree.insert() at 'iter', advance
+ *   iter to next.  For direct mappings, sets the extent's laddr if not yet
+ *   assigned.  Uses reserved_ptr for indirect/zero mappings (no real child).
+ *
+ * Phase 2 (backward): walk iter backward alloc_infos.size() times to collect
+ *   cursors for all inserted entries.  This is necessary because forward
+ *   insertions can invalidate previously-created cursors (splits reallocate
+ *   leaf nodes), so cursors are only safe to create after all inserts complete.
+ */
 BtreeLBAManager::alloc_mappings_ret
 BtreeLBAManager::insert_mappings(
   op_context_t c,
@@ -634,11 +871,21 @@ BtreeLBAManager::insert_mappings(
   });
 }
 
+// ---------------------------------------------------------------------------
+// Extent lifecycle - cache warm-up, GC, rewrite
+// ---------------------------------------------------------------------------
+
 static bool is_lba_node(const CachedExtent &e)
 {
   return is_lba_node(e.get_type());
 }
 
+/**
+ * _init_cached_extent: determine if extent 'e' is live in the LBA tree.
+ * For logical (data) extents: lower_bound(laddr), check paddr match, and
+ *   if live, link the extent into the leaf's children[] array.
+ * For tree nodes (internal/leaf): delegate to btree.init_cached_extent.
+ */
 base_iertr::template future<>
 _init_cached_extent(
   op_context_t c,
@@ -709,6 +956,10 @@ BtreeLBAManager::check_child_trackers(
 }
 #endif
 
+/**
+ * scan_mappings: iterate all direct mappings in [begin, end), calling f
+ * for each.  Indirect mappings (pladdr.is_laddr()) are skipped.
+ */
 BtreeLBAManager::scan_mappings_ret
 BtreeLBAManager::scan_mappings(
   Transaction &t,
@@ -735,7 +986,8 @@ BtreeLBAManager::scan_mappings(
 	  }
 	  ceph_assert((pos.get_key() + pos.get_val().len) > begin);
 	  if (pos.get_val().pladdr.is_paddr()) {
-	    f(pos.get_key(), pos.get_val().pladdr.get_paddr(), pos.get_val().len);
+	    f(pos.get_key(), pos.get_val().pladdr.get_paddr(),
+	      pos.get_val().shadow_paddr, pos.get_val().len);
 	  }
 	  return LBABtree::iterate_repeat_ret_inner(
 	    interruptible::ready_future_marker{},
@@ -744,6 +996,12 @@ BtreeLBAManager::scan_mappings(
     });
 }
 
+/**
+ * rewrite_extent: GC entry point - relocate an LBA tree node to a new
+ * segment.  Only processes LBA internal/leaf nodes; skips non-LBA extents.
+ * Delegates to LBABtree::rewrite_extent which allocates a fresh copy and
+ * patches the parent pointer.
+ */
 BtreeLBAManager::rewrite_extent_ret
 BtreeLBAManager::rewrite_extent(
   Transaction &t,
@@ -771,6 +1029,15 @@ BtreeLBAManager::rewrite_extent(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Update operations
+// ---------------------------------------------------------------------------
+
+/**
+ * update_mapping: update a single mapping's paddr, length, and checksum.
+ * Called during commit when a data extent has been relocated.  Validates
+ * old paddr/length match before patching.  Returns the new refcount.
+ */
 BtreeLBAManager::update_mapping_ret
 BtreeLBAManager::update_mapping(
   Transaction& t,
@@ -796,11 +1063,19 @@ BtreeLBAManager::update_mapping(
       assert(!addr.is_null());
       lba_map_val_t ret = in;
       ceph_assert(in.pladdr.is_paddr());
-      ceph_assert(in.pladdr.get_paddr() == prev_addr);
       ceph_assert(in.len == prev_len);
-      ret.pladdr = addr;
-      ret.len = len;
-      ret.checksum = checksum;
+      if (prev_addr == in.pladdr.get_paddr()) {
+        ret.pladdr = addr;
+        ret.len = len;
+        ret.checksum = checksum;
+        if (ret.shadow_paddr != P_ADDR_NULL) {
+          ceph_assert(
+            addr.get_device_id() != ret.shadow_paddr.get_device_id());
+        }
+      } else {
+        ceph_assert(in.shadow_paddr == prev_addr);
+        ret.shadow_paddr = addr;
+      }
       return ret;
     },
     &nextent
@@ -816,6 +1091,12 @@ BtreeLBAManager::update_mapping(
   co_return res->get_refcount();
 }
 
+/**
+ * update_mappings: batch version - for each extent, navigate from the data
+ * extent up to its parent leaf (via get_parent_node), construct a cursor,
+ * then call _update_mapping to patch paddr + checksum.  The nullptr child
+ * argument means the child pointer is already correct in the leaf.
+ */
 BtreeLBAManager::update_mappings_ret
 BtreeLBAManager::update_mappings(
   Transaction& t,
@@ -851,13 +1132,27 @@ BtreeLBAManager::update_mappings(
 	  return this->_update_mapping(
 	    c.trans,
 	    *cursor,
-	    [prev_addr, addr, len, checksum](
+	    [prev_addr, addr, len, checksum, extent, c](
 	      const lba_map_val_t &in) {
 	      lba_map_val_t ret = in;
 	      ceph_assert(in.pladdr.is_paddr());
-	      ceph_assert(in.pladdr.get_paddr() == prev_addr);
 	      ceph_assert(in.len == len);
-	      ret.pladdr = addr;
+	      if (likely(in.pladdr.get_paddr() == prev_addr)) {
+                ret.pladdr = addr;
+                if (c.trans.get_src() == transaction_type_t::TRIM_DIRTY) {
+                  // This is a dirty onode/omap extent that are rewritten,
+                  // the shadow extent should be removed.
+                  ret.shadow_paddr = P_ADDR_NULL;
+                }
+              } else {
+                // this can only happen when the extent is EXIST_CLEAN
+                // and is demoted onto the cold tier by a DEMOTE trans.
+                assert(in.shadow_paddr == P_ADDR_NULL);
+                assert(extent->is_exist_clean());
+                assert(extent->get_paddr() == in.pladdr.get_paddr());
+                assert(c.cache.is_on_cold_tier(extent->get_paddr()));
+                assert(!c.cache.is_on_cold_tier(prev_addr));
+              }
 	      ret.checksum = checksum;
 	      return ret;
 	    },
@@ -882,6 +1177,12 @@ BtreeLBAManager::update_mappings(
   });
 }
 
+/**
+ * get_physical_extent_if_live: check if an LBA tree node at (type, paddr,
+ * laddr) is still reachable from the tree root.  Used by the cleaner/GC
+ * to decide whether an on-disk node needs to be rewritten or can be
+ * reclaimed.  Delegates to btree.get_internal_if_live or get_leaf_if_live.
+ */
 BtreeLBAManager::get_physical_extent_if_live_ret
 BtreeLBAManager::get_physical_extent_if_live(
   Transaction &t,
@@ -909,6 +1210,10 @@ BtreeLBAManager::get_physical_extent_if_live(
     });
 }
 
+/**
+ * Register Seastar metrics under the "LBA" group: alloc_extents (bytes)
+ * and alloc_extents_iter_nexts (search iterations).
+ */
 void BtreeLBAManager::register_metrics(store_index_t store_index)
 {
   LOG_PREFIX(BtreeLBAManager::register_metrics);
@@ -934,6 +1239,14 @@ void BtreeLBAManager::register_metrics(store_index_t store_index)
   );
 }
 
+/**
+ * _update_mapping: core update primitive.
+ * Creates a partial iterator from the cursor, applies f(old_val) to compute
+ * the new value.  If refcount drops to 0 → btree.remove (entry is deleted).
+ * Otherwise → btree.update (in-place value change with CoW).
+ * The LogicalChildNode* is linked as the leaf's child pointer when non-null
+ * and not already tracked.
+ */
 BtreeLBAManager::_update_mapping_ret
 BtreeLBAManager::_update_mapping(
   Transaction &t,
@@ -972,6 +1285,17 @@ BtreeLBAManager::_update_mapping(
   }
 }
 
+/**
+ * scan_mapped_space: two-pass full tree scan for space accounting.
+ *
+ * Pass 1 (data): iterate all leaf entries from L_ADDR_MIN; for each direct
+ *   mapping (non-indirect, non-zero paddr), invoke scan_visitor with the
+ *   physical address, length, type, and laddr.
+ *
+ * Pass 2 (tree nodes): re-traverse from L_ADDR_MIN with a tree_visitor
+ *   callback that fires for every internal and leaf node visited during
+ *   the descent.  This captures the tree's own metadata space usage.
+ */
 BtreeLBAManager::scan_mapped_space_ret
 BtreeLBAManager::scan_mapped_space(
   Transaction &t,
@@ -1026,6 +1350,11 @@ BtreeLBAManager::scan_mapped_space(
   }
 }
 
+/**
+ * get_containing_cursor: find the mapping whose range [key, key+len)
+ * contains laddr.  Uses upper_bound_right(laddr) and checks bounds.
+ * Returns enoent if no mapping spans laddr.
+ */
 BtreeLBAManager::get_cursor_ret
 BtreeLBAManager::get_containing_cursor(
   op_context_t c,
@@ -1064,6 +1393,17 @@ BtreeLBAManager::get_end_mapping(
 }
 #endif
 
+/**
+ * remap_mappings: split/shrink an existing mapping into multiple pieces
+ * according to the remap entries.  Each remap specifies an (offset, length)
+ * sub-range of the original mapping.
+ *
+ * The first remap replaces the original entry (via btree.replace); subsequent
+ * remaps are inserted as new entries (via btree.insert).  For indirect
+ * mappings, the local_clone_id is preserved; for direct mappings, the paddr
+ * is adjusted by the sub-range offset.  After all modifications, cursors are
+ * refreshed in parallel since inserts may have invalidated earlier ones.
+ */
 BtreeLBAManager::remap_ret
 BtreeLBAManager::remap_mappings(
   Transaction &t,
@@ -1103,6 +1443,9 @@ BtreeLBAManager::remap_mappings(
       } else {
         auto paddr = val.pladdr.get_paddr();
         val.pladdr = paddr + cur_off;
+        if (val.shadow_paddr != P_ADDR_NULL) {
+          val.shadow_paddr = val.shadow_paddr.add_offset(cur_off);
+        }
       }
       val.len = remap.len;
       val.refcount = EXTENT_DEFAULT_REF_COUNT;
@@ -1143,40 +1486,108 @@ BtreeLBAManager::remap_mappings(
   co_return ret;
 }
 
+/**
+ * update_paddr_sync: synchronous paddr update for a mapping already in cache.
+ * Used when a background rewrite transaction has relocated an extent --
+ * the current transaction's pending leaf already has the entry, and we
+ * just need to patch its paddr.  Uses lower_bound_sync (no I/O).
+ */
 void BtreeLBAManager::update_paddr_sync(
   Transaction &t,
   laddr_t laddr,
-  paddr_t paddr)
+  paddr_t paddr,
+  extent_len_t len,
+  std::optional<paddr_t> shadow)
 {
   LOG_PREFIX(BtreeLBAManager::update_paddr_sync);
   DEBUGT("laddr={}, paddr={}", t, laddr, paddr);
   auto c = get_context(t);
   auto btree = get_btree_sync<LBABtree>(c);
   auto iter = btree.lower_bound_sync(c, laddr);
-  assert(iter.get_leaf_node()->is_pending());
-  auto child = iter.get_leaf_node()->get_child_sync<LogicalChildNode>(
-    c.trans, c.cache, iter.get_leaf_pos(), iter.get_key());
-  ceph_assert(child);
-  if (child->is_initial_pending()) {
-    TRACET("{} is initial_pending, skipping", t, *child);
-    return;
+  while (iter.get_key() + iter.get_val().len <= laddr + len) {
+    assert(iter.get_leaf_node()->is_pending());
+    if (iter.get_val().pladdr.is_laddr() ||
+        iter.get_val().pladdr.get_paddr().is_zero()) {
+      TRACET("skipping mapping {}~{}", t, iter.get_key(), iter.get_val());
+      if (!iter.next_sync(c)) {
+        // can't reach the next mapping, which means the next
+        // mapping mustn't have been touched by the current
+        // transactions, we don't need to continue, just leave
+        return;
+      }
+      continue;
+    }
+    auto child = iter.get_leaf_node()->get_child_sync<LogicalChildNode>(
+      c.trans, c.cache, iter.get_leaf_pos(), iter.get_key());
+    ceph_assert(is_valid_child_ptr(child.get()));
+    if (child->is_initial_pending()) {
+      TRACET("{} is initial_pending, skipping", t, *child);
+      if (!iter.next_sync(c)) {
+        // can't reach the next mapping, which means the next
+        // mapping mustn't have been touched by the current
+        // transactions, we don't need to continue, just leave
+        return;
+      }
+      continue;
+    }
+    ceph_assert(child->is_exist_clean());
+    auto cursor = iter.get_cursor(c);
+    extent_len_t off = cursor->get_laddr().get_byte_distance<
+      extent_len_t>(laddr);
+    paddr_t shadow_paddr;
+    if (shadow) {
+      // the committing txn changed the shadow
+      // to *shadow
+      shadow_paddr = *shadow;
+      if (shadow_paddr != P_ADDR_NULL) {
+        shadow_paddr = shadow_paddr + off;
+      }
+    } else if (cursor->has_shadow_paddr()) {
+      // shadow is preserved by the committer,
+      // and the copy inherited one, so the source
+      // was promoted when it's copied
+      shadow_paddr = cursor->get_shadow_paddr();
+    } else {
+      // shadow is preserved, and nothing is
+      // inherited: not currently promoted
+      shadow_paddr = P_ADDR_NULL;
+    }
+    iter = btree.update(
+      c,
+      std::move(iter),
+      lba_map_val_t{
+        cursor->get_length(),
+        pladdr_t{paddr + off},
+        shadow_paddr,
+        cursor->get_refcount(),
+        cursor->get_checksum(),
+        cursor->get_extent_type()},
+      nullptr,
+      modification_t::TRANS_SYNC);
+    if (!iter.next_sync(c)) {
+      // can't reach the next mapping, which means the next
+      // mapping mustn't have been touched by the current
+      // transactions, we don't need to continue, just leave
+      return;
+    }
   }
-  ceph_assert(child->is_exist_clean());
-  auto cursor = iter.get_cursor(c);
-  assert(cursor->get_laddr() == laddr);
-  btree.update(
-    c,
-    std::move(iter),
-    lba_map_val_t{
-      cursor->get_length(),
-      pladdr_t{std::move(paddr)},
-      cursor->get_refcount(),
-      cursor->get_checksum(),
-      cursor->get_extent_type()},
-    nullptr,
-    modification_t::TRANS_SYNC);
 }
 
+// ---------------------------------------------------------------------------
+// Move / clone operations
+// ---------------------------------------------------------------------------
+
+/**
+ * _copy_mapping: copy the mapping at 'src' to 'dest_laddr' without removing
+ * src.  Steps:
+ *   1. Build partial iterators for both src and dest cursors.
+ *   2. Determine the pladdr: for indirect → local_clone_id, for direct → paddr.
+ *   3. Register the key copy with the transaction (new_lba_key_copied) so
+ *      that if a background rewrite changes src's paddr before commit, the
+ *      dest copy gets patched too (via update_paddr_sync callback).
+ *   4. btree.copy() inserts the new entry using src's value.
+ *   5. Refresh src (may have been invalidated by the insert's splits).
+ */
 BtreeLBAManager::move_mapping_ret
 BtreeLBAManager::_copy_mapping(
   op_context_t c,
@@ -1213,8 +1624,10 @@ BtreeLBAManager::_copy_mapping(
   c.trans.new_lba_key_copied(
     ret.src->get_key(),
     dest_laddr,
-    [this, c](laddr_t laddr, paddr_t paddr) {
-      update_paddr_sync(c.trans, laddr, paddr);
+    ret.src->get_length(),
+    [this, c](laddr_t laddr, paddr_t paddr,
+              extent_len_t len, std::optional<paddr_t> shadow) {
+      update_paddr_sync(c.trans, laddr, paddr, len, shadow);
     });
   auto [niter, inserted] = co_await btree.copy(
       c,
@@ -1228,6 +1641,12 @@ BtreeLBAManager::_copy_mapping(
   co_return ret;
 }
 
+/**
+ * _move_mapping: copy src to dest_laddr, then remove src by decrementing
+ * its refcount to 0 (which triggers _update_mapping → btree.remove).
+ * After removal, refreshes dest and advances dest's cursor to the next
+ * entry (so the caller gets the position after the moved mapping).
+ */
 BtreeLBAManager::move_mapping_ret
 BtreeLBAManager::_move_mapping(
   Transaction &t,
@@ -1261,6 +1680,16 @@ BtreeLBAManager::_move_mapping(
   co_return ret;
 }
 
+/**
+ * move_and_clone_direct_mapping: copy src to dest_laddr (transferring the
+ * data extent), then convert the original src mapping into an indirect one
+ * that points to the new dest mapping.  This is used during snapshot
+ * operations: the data extent lives at the new location, and the old laddr
+ * becomes a clone reference to it.
+ *
+ * After converting src to indirect, its child pointer is reset (the data
+ * extent is now owned by dest, not src).
+ */
 BtreeLBAManager::move_mapping_ret
 BtreeLBAManager::move_and_clone_direct_mapping(
   Transaction &t,
@@ -1291,6 +1720,7 @@ BtreeLBAManager::move_and_clone_direct_mapping(
       lba_map_val_t val = in;
       val.pladdr = ret.dest->get_key().get_local_clone_id();
       val.checksum = 0;
+      val.shadow_paddr = P_ADDR_NULL;
       return val;
     },
     nullptr

@@ -1,5 +1,6 @@
 #include <common/perf_counters_collection.h>
 
+#include <fmt/format.h>
 #include "test/librados/test_cxx.h"
 #include "test/librados/testcase_cxx.h"
 #include "crimson_utils.h"
@@ -11,7 +12,18 @@ using namespace librados;
 using namespace cls;
 using namespace rados::cls;
 
-typedef RadosTestPP LibRadosSplitOpPP;
+class LibRadosSplitOpPP : public RadosTestPP {
+public:
+  static void SetUpTestCase() {
+    auto pool_prefix = fmt::format("{}_", ::testing::UnitTest::GetInstance()->current_test_case()->name());
+    pool_name_default = get_temp_pool_name(pool_prefix);
+    std::map<std::string, std::string> config = {{"rados_replica_read_policy", "default"}};
+    ASSERT_EQ("", connect_cluster_pp(s_cluster, config));
+    ASSERT_EQ("", create_pool_pp(pool_name_default, s_cluster, 3));
+    s_cluster.wait_for_latest_osdmap();
+  }
+};
+
 typedef RadosTestECPP LibRadosSplitOpECPP;
 
 // After a write is committed, it isn't necessarily true that the log is
@@ -29,6 +41,7 @@ void RadosTestPPBase::ensure_log_committed(const char* oid, uint64_t offset, uin
 }
 
 TEST_P(LibRadosSplitOpPP, BigRead) {
+  SKIP_IF_CRIMSON();
   std::string min_split_size_str;
   ASSERT_EQ(0, cluster.conf_get("osd_min_split_replica_read_size", min_split_size_str));
   uint64_t min_split_size = std::stoull(min_split_size_str);
@@ -60,6 +73,7 @@ TEST_P(LibRadosSplitOpPP, BigRead) {
 }
 
 TEST_P(LibRadosSplitOpPP, ReadTwoShards) {
+  SKIP_IF_CRIMSON();
   // Read the osd_min_split_replica_read_size config value
   std::string min_split_size_str;
   ASSERT_EQ(0, cluster.conf_get("osd_min_split_replica_read_size", min_split_size_str));
@@ -129,6 +143,7 @@ TEST_P(LibRadosSplitOpPP, ReadTwoShards) {
 }
 
 TEST_P(LibRadosSplitOpPP, StatBeforeRead) {
+  SKIP_IF_CRIMSON();
   // Read the osd_min_split_replica_read_size config value
   std::string min_split_size_str;
   ASSERT_EQ(0, cluster.conf_get("osd_min_split_replica_read_size", min_split_size_str));
@@ -185,6 +200,7 @@ TEST_P(LibRadosSplitOpPP, StatBeforeRead) {
 }
 
 TEST_P(LibRadosSplitOpPP, GetXattrBeforeRead) {
+  SKIP_IF_CRIMSON();
   // Read the osd_min_split_replica_read_size config value
   std::string min_split_size_str;
   ASSERT_EQ(0, cluster.conf_get("osd_min_split_replica_read_size", min_split_size_str));

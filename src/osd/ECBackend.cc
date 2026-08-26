@@ -952,9 +952,20 @@ void ECBackend::handle_sub_read_reply(
       const auto& to_read = rop.to_read.at(oid);
       const auto& complete = rop.complete.at(oid);
       bool attrs_satisfied = !to_read.want_attrs || complete.attrs;
-      bool omap_satisfied  = !get_parent()->get_pool().supports_omap() 
-                             || (!to_read.want_omap_header && !to_read.want_omap_keys)
-                             || (complete.omap_header && complete.omap_complete);
+
+      bool omap_satisfied = true;
+      if (get_parent()->get_pool().supports_omap()
+          && (to_read.want_omap_header || to_read.want_omap_keys)) {
+        for (const auto &[shard_id, shard_read] : to_read.shard_reads) {
+          if (shard_read.omap_source) {
+            if (complete.errors.contains(shard_read.pg_shard)) {
+              omap_satisfied = false;
+            }
+            break;
+          }
+        }
+      }
+
       if (attrs_satisfied && omap_satisfied) {
         err = ec_impl->minimum_to_decode(want_to_read, have, dummy_minimum,
                                                     nullptr);
@@ -1009,6 +1020,7 @@ void ECBackend::handle_sub_read_reply(
         rop.to_read.at(oid).shard_reads.clear();
         rop.to_read.at(oid).want_attrs = false;
         rop.to_read.at(oid).want_omap_header = false;
+        rop.to_read.at(oid).want_omap_keys = false;
         ++is_complete;
       }
     }
@@ -1796,11 +1808,7 @@ int ECBackend::omap_get(
   }
 
   // Remove keys in removed_ranges
-  for (auto out_it = out->begin(); out_it != out->end(); ++out_it) {
-    if (should_be_removed(removed_ranges, out_it->first)) {
-      out->erase(out_it->first);
-    }
-  }
+  remove_keys_in_ranges(removed_ranges, out);
 
   // Apply updates in update_map
   for (const auto &[key, val_opt] : update_map) {
@@ -1874,4 +1882,13 @@ bool ECBackend::should_be_removed(
 
   // No ranges contain the key, return false
   return false;
+}
+
+void ECBackend::remove_keys_in_ranges(
+  const std::map<std::string, std::optional<std::string>>& removed_ranges,
+  std::map<std::string, ceph::buffer::list>* out) {
+  for (const auto& [start, end] : removed_ranges) {
+    out->erase(out->lower_bound(start),
+               end ? out->lower_bound(*end) : out->end());
+  }
 }

@@ -39,6 +39,8 @@
     bucket link                      link bucket to specified user
     bucket unlink                    unlink bucket from specified user
     bucket stats                     returns bucket statistics
+    bucket suspend                   suspend a bucket
+    bucket unsuspend                 unsuspend a bucket
     bucket rm                        remove bucket
     bucket check                     check bucket index by verifying size and object count stats
     bucket check olh                 check for olh index entries and objects that are pending removal
@@ -269,6 +271,8 @@
                                          mdlog list
                                          data sync status
                                          sync error trim
+                                         gc list
+                                         gc process
                                        required for:
                                          mdlog trim
      --gen=<gen-id>                    optional for:

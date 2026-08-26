@@ -322,6 +322,15 @@ void cls_rgw_bucket_link_olh(librados::ObjectWriteOperation& op, const cls_rgw_o
   op.exec(method::bucket_link_olh, in);
 }
 
+void cls_rgw_bucket_refresh_instance(librados::ObjectWriteOperation& op, const cls_rgw_obj_key& key)
+{
+  bufferlist in;
+  rgw_cls_refresh_instance_op call;
+  call.key = key;
+  encode(call, in);
+  op.exec(method::bucket_refresh_instance, in);
+}
+
 int cls_rgw_bucket_unlink_instance(librados::IoCtx& io_ctx, const string& oid,
                                    const cls_rgw_obj_key& key, const string& op_tag,
                                    const string& olh_tag, uint64_t olh_epoch, bool log_op,
@@ -651,7 +660,7 @@ void cls_rgw_gc_list(ObjectReadOperation& op, const string& marker,
 
 int cls_rgw_gc_list_decode(const bufferlist& out,
                            std::list<cls_rgw_gc_obj_info>& entries,
-                           bool *truncated, std::string& next_marker)
+                           bool& truncated, std::string& next_marker)
 {
   cls_rgw_gc_list_ret ret;
   try {
@@ -663,8 +672,7 @@ int cls_rgw_gc_list_decode(const bufferlist& out,
 
   entries.swap(ret.entries);
 
-  if (truncated)
-    *truncated = ret.truncated;
+  truncated = ret.truncated;
   next_marker = std::move(ret.next_marker);
   return 0;
 }

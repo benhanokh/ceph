@@ -60,6 +60,12 @@ void RecoveryBackend::clean_up(ceph::os::Transaction& t,
   replica_push_targets.clear();
 
   for (auto& [soid, recovery_waiter] : recovering) {
+    for (auto& kv : recovery_waiter->pushing) {
+      kv.second.clone_lock_manager.release_locks();
+    }
+    if (recovery_waiter->pull_info) {
+      recovery_waiter->pull_info->clone_lock_manager.release_locks();
+    }
     if (recovery_waiter->obc) {
       recovery_waiter->obc->interrupt(
 	  ::crimson::common::actingset_changed(
@@ -416,7 +422,7 @@ RecoveryBackend::handle_scan_digest(
   bi.end = m.end;
   {
     auto p = m.get_data().cbegin();
-    // take care to preserve ordering!
+    // Preserve ordering:
     bi.clear_objects();
     ::decode_noclear(bi.objects, p);
   }

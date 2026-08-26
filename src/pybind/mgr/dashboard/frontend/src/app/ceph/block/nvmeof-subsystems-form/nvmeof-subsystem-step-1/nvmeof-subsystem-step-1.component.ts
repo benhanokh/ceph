@@ -46,8 +46,10 @@ export class NvmeofSubsystemsStepOneComponent implements OnInit, TearsheetStep {
   ) {}
 
   DEFAULT_NQN = 'nqn.2001-07.com.ceph:' + Date.now();
-  NQN_REGEX = /^nqn\.(19|20)\d\d-(0[1-9]|1[0-2])\.\D{2,3}(\.[A-Za-z0-9-]+)+(:[A-Za-z0-9-\.]+(:[A-Za-z0-9-\.]+)*)$/;
-  NQN_REGEX_UUID = /^nqn\.2014-08\.org\.nvmexpress:uuid:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+  NQN_REGEX =
+    /^nqn\.(19|20)\d\d-(0[1-9]|1[0-2])\.\D{2,3}(\.[A-Za-z0-9-]+)+(:[A-Za-z0-9-\.]+(:[A-Za-z0-9-\.]+)*)$/;
+  NQN_REGEX_UUID =
+    /^nqn\.2014-08\.org\.nvmexpress:uuid:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
   customNQNValidator = CdValidators.custom(
     'nqnPattern',
@@ -84,8 +86,14 @@ export class NvmeofSubsystemsStepOneComponent implements OnInit, TearsheetStep {
     const subnetMaskValidators = [
       CdValidators.composeIf({ listenerMode: this.LISTENER_MODE.AUTO_FETCH }, [Validators.required])
     ];
+    // Empty array is a valid value for Validators.required in some paths; require
+    // at least one selected listener when Add manually is active.
+    const requireListeners = CdValidators.custom(
+      'required',
+      (value: ListenerItem[] | null | undefined) => !value || value.length === 0
+    );
     const listenersValidators = [
-      CdValidators.composeIf({ listenerMode: this.LISTENER_MODE.MANUAL }, [Validators.required])
+      CdValidators.composeIf({ listenerMode: this.LISTENER_MODE.MANUAL }, [requireListeners])
     ];
 
     if (this.listenersOnly) {

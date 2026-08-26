@@ -1196,7 +1196,6 @@ class TestIngressService:
             '        Enable_UDP = false;\n'
             '        NFS_Port = 2049;\n'
             '        allow_set_io_flusher_fail = true;\n'
-            '        HAProxy_Hosts = 192.168.122.111, 10.10.2.20, 192.168.122.222;\n'
             '        Monitoring_Port = 9587;\n'
             '}\n'
             '\n'
@@ -1209,8 +1208,8 @@ class TestIngressService:
             '}\n'
             '\n'
             'RADOS_KV {\n'
-            '        UserId = "nfs.foo.test.0.0";\n'
-            '        nodeid = 0;\n'
+            '        UserId = "nfs.foo";\n'
+            '        nodeid = "0";\n'
             '        pool = ".nfs";\n'
             '        namespace = "foo";\n'
             '}\n'
@@ -1220,21 +1219,9 @@ class TestIngressService:
             '}\n'
             '\n'
             'RADOS_URLS {\n'
-            '        UserId = "nfs.foo.test.0.0";\n'
+            '        UserId = "nfs.foo";\n'
             '        watch_url = '
             '"rados://.nfs/foo/conf-nfs.foo";\n'
-            '}\n'
-            '\n'
-            'CEPH {\n'
-            '        Ceph_Conf = "/etc/ceph/ceph.conf";\n'
-            '        umask = 0000;\n'
-            '        client_oc = false;\n'
-            '        async = false;\n'
-            '        zerocopy = false;\n'
-            '        use_old_uuid = false;\n'
-            '\n'
-            '        register_service = true;\n'
-            '        nodeid = "0";\n'
             '}\n'
             '\n'
             'RGW {\n'
@@ -1250,7 +1237,7 @@ class TestIngressService:
             'enable_rdma': False,
             'extra_args': ['-N', 'NIV_EVENT'],
             'keyring': (
-                '[client.nfs.foo.test.0.0]\n'
+                '[client.nfs.foo]\n'
                 'key = None\n'
             ),
             'namespace': 'foo',
@@ -1263,7 +1250,7 @@ class TestIngressService:
                 ),
                 'user': 'nfs.foo.test.0.0-rgw',
             },
-            'userid': 'nfs.foo.test.0.0',
+            'userid': 'nfs.foo',
         }
 
         nfs_daemons = [
@@ -1332,6 +1319,29 @@ class TestIngressService:
                 service_name=nfs_service.service_name(),
                 rank=0,
             ),
+        )
+        ganesha_conf = nfs_generated_conf['files']['ganesha.conf']
+        haproxy_hosts = {
+            ip.strip()
+            for line in ganesha_conf.splitlines()
+            if 'HAProxy_Hosts' in line
+            for ip in line.split('=', 1)[1].strip().rstrip(';').split(',')
+        }
+        assert haproxy_hosts == {
+            '192.168.122.111',
+            '10.10.2.20',
+            '192.168.122.222',
+        }
+
+        def without_haproxy_hosts(conf: str) -> str:
+            return '\n'.join(
+                line for line in conf.splitlines()
+                if 'HAProxy_Hosts' not in line
+            )
+
+        nfs_generated_conf['files']['ganesha.conf'] = without_haproxy_hosts(ganesha_conf)
+        nfs_expected_conf['files']['ganesha.conf'] = without_haproxy_hosts(
+            nfs_ganesha_txt
         )
         assert nfs_generated_conf == nfs_expected_conf
 

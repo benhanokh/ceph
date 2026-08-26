@@ -258,6 +258,41 @@ class TestCephadm(object):
             cephadm_module._add_host(HostSpec('test2'))
 
     @mock.patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('[]'))
+    @mock.patch("cephadm.utils.resolve_ip")
+    def test_re_add_host_resets_conn_on_addr_change(self, resolve_ip, cephadm_module):
+        resolve_ip.return_value = '192.168.122.1'
+        cephadm_module._add_host(HostSpec('test', '192.168.122.1'))
+        assert cephadm_module.inventory.get_addr('test') == '192.168.122.1'
+
+        with mock.patch.object(cephadm_module.ssh, 'reset_con') as mock_reset:
+            resolve_ip.return_value = '192.168.122.2'
+            cephadm_module._add_host(HostSpec('test', '192.168.122.2'))
+            mock_reset.assert_called_once_with('test')
+        assert cephadm_module.inventory.get_addr('test') == '192.168.122.2'
+
+    @mock.patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('[]'))
+    @mock.patch("cephadm.utils.resolve_ip")
+    def test_re_add_host_no_reset_on_same_addr(self, resolve_ip, cephadm_module):
+        resolve_ip.return_value = '192.168.122.1'
+        cephadm_module._add_host(HostSpec('test', '192.168.122.1'))
+
+        with mock.patch.object(cephadm_module.ssh, 'reset_con') as mock_reset:
+            cephadm_module._add_host(HostSpec('test', '192.168.122.1'))
+            mock_reset.assert_not_called()
+
+    @mock.patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('[]'))
+    @mock.patch("cephadm.utils.resolve_ip")
+    def test_update_host_addr_resets_conn_before_check(self, resolve_ip, cephadm_module):
+        resolve_ip.return_value = '192.168.122.1'
+        cephadm_module._add_host(HostSpec('test', '192.168.122.1'))
+
+        with mock.patch.object(cephadm_module.ssh, 'reset_con') as mock_reset:
+            resolve_ip.return_value = '192.168.122.2'
+            cephadm_module.update_host_addr('test', '192.168.122.2')
+            mock_reset.assert_called_with('test')
+            assert mock_reset.call_count == 2
+
+    @mock.patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('[]'))
     def test_service_ls(self, cephadm_module):
         with with_host(cephadm_module, 'test'):
             c = cephadm_module.list_daemons(refresh=True)
@@ -418,6 +453,48 @@ class TestCephadm(object):
             CephadmServe(cephadm_module)._refresh_host_daemons('myhost')
             dds = wait(cephadm_module, cephadm_module.list_daemons())
             assert {d.name() for d in dds} == {'rgw.myrgw.foobar', 'haproxy.test.bar'}
+
+    @mock.patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm(
+        json.dumps([
+            dict(
+                name='rgw.myrgw.running',
+                style='cephadm',
+                fsid='fsid',
+                container_id='container_id',
+                state='running',
+            ),
+            dict(
+                name='rgw.myrgw.unknown',
+                style='cephadm',
+                fsid='fsid',
+                container_id='container_id',
+                state='unknown',
+            ),
+            dict(
+                name='rgw.myrgw.error',
+                style='cephadm',
+                fsid='fsid',
+                container_id='container_id',
+                state='error',
+            ),
+        ])
+    ))
+    def test_unknown_state_not_error(self, cephadm_module: CephadmOrchestrator):
+        # Verify that daemons with state='unknown' from cephadm ls are not
+        # treated as errors and do not trigger CEPHADM_FAILED_DAEMON.
+        # See https://tracker.ceph.com/issues/65728
+        cephadm_module.service_cache_timeout = 10
+        with with_host(cephadm_module, 'myhost'):
+            CephadmServe(cephadm_module)._refresh_host_daemons('myhost')
+            dds = {d.name(): d for d in wait(cephadm_module, cephadm_module.list_daemons())}
+            # unknown should map to DaemonDescriptionStatus.unknown, not error
+            assert dds['rgw.myrgw.unknown'].status == DaemonDescriptionStatus.unknown
+            assert dds['rgw.myrgw.error'].status == DaemonDescriptionStatus.error
+            assert dds['rgw.myrgw.running'].status == DaemonDescriptionStatus.running
+            # only the error daemon should appear in get_error_daemons
+            error_names = {d.name() for d in cephadm_module.cache.get_error_daemons()}
+            assert 'rgw.myrgw.error' in error_names
+            assert 'rgw.myrgw.unknown' not in error_names
 
     @mock.patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('[]'))
     def test_daemon_action(self, cephadm_module: CephadmOrchestrator):
@@ -1079,6 +1156,28 @@ class TestCephadm(object):
                 [('nfs', 'foo2.host2')],
                 {'14649': {'id': 'nfs.foo-rgw.host1-rgw'}, '14650': {'id': 'nfs.foo2.host2-rgw'}},
             ),
+            # rgw-smb test cases
+            # Test 1: rgw-smb daemon matches smb daemon in cache - no stray
+            (
+                [('rgw-smb', '12345')],
+                [('smb', 'testcluster.a')],
+                [],
+                {'12345': {'id': 'smb.rgw.cluster.testcluster'}},
+            ),
+            # Test 2: multiple rgw-smb daemons match multiple smb daemons - no strays
+            (
+                [('rgw-smb', '12345'), ('rgw-smb', '12346')],
+                [('smb', 'cluster1.a'), ('smb', 'cluster2.b')],
+                [],
+                {'12345': {'id': 'smb.rgw.cluster.cluster1'}, '12346': {'id': 'smb.rgw.cluster.cluster2'}},
+            ),
+            # Test 3: rgw-smb daemon metadata doesn't match any smb daemon in cache - should be stray
+            (
+                [('rgw-smb', '12347')],
+                [('smb', 'cluster1.a'), ('smb', 'cluster2.b')],
+                [('rgw-smb', '12347')],
+                {'12347': {'id': 'smb.rgw.cluster.nonexistent'}},
+            ),
         ]
     )
     def test_check_for_stray_daemons(
@@ -1103,7 +1202,13 @@ class TestCephadm(object):
             # populate cephadm daemon cache
             dm = {}
             for daemon_type, daemon_id in cephadm_daemons:
-                dd = DaemonDescription(daemon_type=daemon_type, daemon_id=daemon_id)
+                # For SMB daemons, get based on service_name
+                if daemon_type == 'smb' and '.' in daemon_id:
+                    cluster_name = daemon_id.split('.')[0]
+                    dd = DaemonDescription(daemon_type=daemon_type, daemon_id=daemon_id,
+                                           service_name=f'smb.{cluster_name}')
+                else:
+                    dd = DaemonDescription(daemon_type=daemon_type, daemon_id=daemon_id)
                 dm[dd.name()] = dd
             cephadm_module.cache.update_host_daemons('host1', dm)
 
@@ -1726,7 +1831,7 @@ class TestCephadm(object):
                 placement=PlacementSpec(hosts=[HostPlacementSpec('test', '', 'x')], count=1),
                 unmanaged=True)
             ),  # noqa: E124
-            ('client.nfs.x', True, ServiceSpec(
+            ('client.nfs.id', True, ServiceSpec(
                 service_type='nfs',
                 service_id='id',
                 placement=PlacementSpec(hosts=[HostPlacementSpec('test', '', 'x')], count=1),
@@ -2339,6 +2444,80 @@ class TestCephadm(object):
 
         assert cephadm_module.inventory._inventory[hostname]['status'] == 'maintenance'
 
+    @mock.patch("cephadm.module.CephadmOrchestrator.mon_command")
+    @mock.patch("cephadm.serve.CephadmServe._run_cephadm")
+    @mock.patch("cephadm.CephadmOrchestrator._host_ok_to_stop")
+    @mock.patch("cephadm.module.HostCache.get_daemons_by_type")
+    @mock.patch("cephadm.module.HostCache.get_daemon_types")
+    @mock.patch("cephadm.module.HostCache.get_hosts")
+    def test_maintenance_enter_disables_nvmeof_gateways(
+            self, _hosts, _get_daemon_types, _get_daemons_by_type, _host_ok,
+            _run_cephadm, _mon_command, cephadm_module: CephadmOrchestrator):
+        hostname = 'host1'
+        nvmeof_daemon = DaemonDescription(
+            daemon_type='nvmeof',
+            daemon_id='pool1.grp1.host1.abcd',
+            hostname=hostname,
+        )
+        _run_cephadm.side_effect = async_side_effect(
+            ([''], ['something\nsuccess - systemd target xxx disabled'], 0))
+        _host_ok.return_value = 0, 'it is okay'
+        _get_daemon_types.return_value = ['nvmeof']
+        _get_daemons_by_type.return_value = [nvmeof_daemon]
+        _hosts.return_value = [hostname, 'other_host']
+        _mon_command.return_value = (0, '', '')
+        cephadm_module.spec_store.all_specs['nvmeof.pool1.grp1'] = ServiceSpec(
+            service_type='nvmeof', service_id='pool1.grp1', pool='pool1', group='grp1')
+        cephadm_module.inventory.add_host(HostSpec(hostname))
+
+        retval = cephadm_module.enter_host_maintenance(hostname)
+        assert retval.result_str().startswith('Daemons for Ceph cluster')
+        _mon_command.assert_called_once_with({
+            'prefix': 'nvme-gw disable',
+            'id': 'client.nvmeof.pool1.grp1.host1.abcd',
+            'pool': 'pool1',
+            'group': 'grp1',
+        })
+        _run_cephadm.assert_called_once()
+
+    @mock.patch("cephadm.module.CephadmOrchestrator.mon_command")
+    @mock.patch("cephadm.serve.CephadmServe._run_cephadm")
+    @mock.patch("cephadm.module.HostCache.get_daemon_types")
+    @mock.patch("cephadm.module.HostCache.get_daemons_by_type")
+    @mock.patch("cephadm.module.HostCache.get_hosts")
+    def test_maintenance_exit_enables_nvmeof_gateways(
+            self, _hosts, _get_daemons_by_type, _get_daemon_types,
+            _run_cephadm, _mon_command, cephadm_module: CephadmOrchestrator):
+        hostname = 'host1'
+        nvmeof_daemon = DaemonDescription(
+            daemon_type='nvmeof',
+            daemon_id='pool1.grp1.host1.abcd',
+            hostname=hostname,
+        )
+        _run_cephadm.side_effect = async_side_effect(([''], [
+            'something\nsuccess - systemd target xxx enabled and started'], 0))
+        _get_daemon_types.return_value = ['nvmeof']
+        _get_daemons_by_type.return_value = [nvmeof_daemon]
+        _hosts.return_value = [hostname, 'other_host']
+        _mon_command.return_value = (0, '', '')
+        cephadm_module.spec_store.all_specs['nvmeof.pool1.grp1'] = ServiceSpec(
+            service_type='nvmeof', service_id='pool1.grp1', pool='pool1', group='grp1')
+        cephadm_module.inventory.add_host(HostSpec(hostname, status='maintenance'))
+
+        retval = cephadm_module.exit_host_maintenance(hostname)
+        assert retval.result_str().startswith('Ceph cluster')
+        assert _run_cephadm.call_count == 2
+        _run_cephadm.assert_any_call(
+            hostname, cephadmNoImage, 'check-host', [], error_ok=False)
+        _run_cephadm.assert_any_call(
+            hostname, cephadmNoImage, 'host-maintenance', ['exit'], error_ok=True)
+        _mon_command.assert_called_once_with({
+            'prefix': 'nvme-gw enable',
+            'id': 'client.nvmeof.pool1.grp1.host1.abcd',
+            'pool': 'pool1',
+            'group': 'grp1',
+        })
+
     @mock.patch("cephadm.ssh.SSHManager._remote_connection")
     @mock.patch("cephadm.ssh.SSHManager._execute_command")
     @mock.patch("cephadm.ssh.SSHManager._check_execute_command")
@@ -2925,6 +3104,45 @@ Traceback (most recent call last):
         assert cephadm_module.spec_store._specs['crash'].unmanaged
         cephadm_module.spec_store.set_unmanaged('crash', False)
         assert not cephadm_module.spec_store._specs['crash'].unmanaged
+
+    def test_unmanaged_noop_note(self, cephadm_module):
+        # No matching spec (e.g. bare "osd" / adopted OSDs): no note — actions still run.
+        assert cephadm_module._unmanaged_noop_note('osd') is None
+
+        cephadm_module.spec_store._specs['rgw.foo'] = ServiceSpec(
+            'rgw', service_id='foo', unmanaged=False)
+        assert cephadm_module._unmanaged_noop_note('rgw.foo') is None
+
+        cephadm_module.spec_store.set_unmanaged('rgw.foo', True)
+        note = cephadm_module._unmanaged_noop_note('rgw.foo')
+        assert note is not None
+        assert 'rgw.foo is unmanaged' in note
+        assert 'set-managed rgw.foo' in note
+
+        # Unmanaged OSD drive-group: note is expected (apply/reconcile no-ops).
+        cephadm_module.spec_store._specs['osd.hdd'] = DriveGroupSpec(
+            service_id='hdd', unmanaged=True)
+        note = cephadm_module._unmanaged_noop_note('osd.hdd')
+        assert note is not None
+        assert 'osd.hdd is unmanaged' in note
+
+    @mock.patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('[]'))
+    def test_unmanaged_daemon_action_note(self, cephadm_module: CephadmOrchestrator):
+        with with_host(cephadm_module, 'test'):
+            # Deploy managed first, then mark unmanaged (add_daemon would overwrite the flag).
+            with with_service(cephadm_module,
+                              RGWSpec(service_id='myrgw.foobar'),
+                              host='test') as d_names:
+                assert d_names
+                cephadm_module.spec_store.set_unmanaged('rgw.myrgw.foobar', True)
+                d_name = d_names[0]
+                msg = wait(cephadm_module, cephadm_module.daemon_action('redeploy', d_name))
+                assert msg.startswith(f"Scheduled to redeploy {d_name} on host 'test'")
+                assert 'rgw.myrgw.foobar is unmanaged' in msg
+                assert 'set-managed rgw.myrgw.foobar' in msg
+
+                # Bare "osd" (no matching unmanaged drive-group) must not warn.
+                assert cephadm_module._unmanaged_noop_note('osd') is None
 
     def test_inventory_known_hostnames(self, cephadm_module):
         cephadm_module.inventory.add_host(HostSpec('host1', '1.2.3.1'))

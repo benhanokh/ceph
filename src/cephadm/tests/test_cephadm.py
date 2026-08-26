@@ -50,7 +50,8 @@ def _container_info(*args, **kwargs):
 def bootstrap_test_ctx(*args, **kwargs):
     with with_cephadm_ctx(*args, **kwargs) as ctx:
         ctx.no_cleanup_on_failure = True
-        yield ctx
+        with mock.patch('cephadm.CephContainer.run', return_value='[]'):
+            yield ctx
 
 
 class TestCephAdm(object):
@@ -1733,6 +1734,74 @@ class TestMaintenance:
         ctx.container_engine = mock_podman()
         retval = _cephadm.change_maintenance_mode(ctx)
         assert retval.startswith('failed')
+
+
+class TestMaintenanceExitDisabledServices(object):
+    fsid = '00000000-0000-0000-0000-000000000001'
+
+    @staticmethod
+    def _nfs_daemon_entry(fsid: str):
+        from cephadmlib.daemon_identity import DaemonIdentity
+        from cephadmlib.listing import DaemonEntry
+
+        identity = DaemonIdentity.from_name(fsid, 'nfs.foo.host1')
+        return DaemonEntry(
+            identity=identity,
+            status={
+                'style': 'cephadm:v1',
+                'name': 'nfs.foo.host1',
+                'fsid': fsid,
+                'systemd_unit': identity.unit_name,
+            },
+            data_dir='/var/lib/ceph',
+        )
+
+    @mock.patch('cephadmlib.systemd.call')
+    def test_start_disabled_services_after_maintenance_exit(self, _call):
+        from cephadmlib.systemd import start_disabled_services_after_maintenance_exit
+
+        ctx = _cephadm.CephadmContext()
+        ctx.fsid = self.fsid
+        entry = self._nfs_daemon_entry(self.fsid)
+        nfs_unit = entry.identity.unit_name
+        with mock.patch('cephadmlib.systemd.daemons_matching', return_value=[entry]):
+            _call.return_value = '', '', 0
+            start_disabled_services_after_maintenance_exit(ctx)
+        _call.assert_any_call(
+            ctx, ['systemctl', 'start', nfs_unit],
+            verbosity=_cephadm.CallVerbosity.DEBUG)
+
+    @mock.patch('os.listdir', return_value=[])
+    @mock.patch('cephadmlib.systemd.daemons_matching')
+    @mock.patch('cephadmlib.systemd.call')
+    @mock.patch('cephadm.call')
+    @mock.patch('cephadm.logger')
+    @mock.patch('cephadm.systemd_target_state')
+    @mock.patch('cephadm.target_exists')
+    def test_exit_starts_disabled_services(
+            self, _target_exists, _target_state, _logger, _cephadm_call,
+            _systemd_call, _daemons_matching, _listdir):
+        entry = self._nfs_daemon_entry(TestMaintenance.fsid)
+        nfs_unit = entry.identity.unit_name
+
+        def _matching(ctx, fsid=None, daemon_type=None):
+            if daemon_type == 'nfs':
+                return [entry]
+            return []
+
+        _daemons_matching.side_effect = _matching
+        _cephadm_call.side_effect = [('', '', 0), ('', '', 0)]
+        _systemd_call.return_value = '', '', 0
+        _target_state.return_value = False
+        _target_exists.return_value = True
+        ctx: _cephadm.CephadmContext = _cephadm.cephadm_init_ctx(
+            ['host-maintenance', 'exit', '--fsid', TestMaintenance.fsid])
+        ctx.container_engine = mock_podman()
+        retval = _cephadm.change_maintenance_mode(ctx)
+        assert retval.startswith('success')
+        _systemd_call.assert_any_call(
+            ctx, ['systemctl', 'start', nfs_unit],
+            verbosity=_cephadm.CallVerbosity.DEBUG)
 
 
 class TestMonitoring(object):

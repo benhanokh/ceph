@@ -17,6 +17,8 @@
 #include <boost/intrusive/list.hpp>
 #include "global/global_init.h"
 #include "global/signal_handler.h"
+#include "common/admin_socket.h"
+#include "common/cmdparse.h"
 #include "common/config.h"
 #include "common/errno.h"
 #include "common/Timer.h"
@@ -26,6 +28,7 @@
 #include "include/compat.h"
 #include "include/str_list.h"
 #include "include/stringify.h"
+#include "perfglue/heap_profiler.h"
 #include "rgw_kms_cache.h"
 #include "rgw_main.h"
 #include "rgw_asio_thread.h"
@@ -43,7 +46,9 @@
 #include "rgw_rest_account.h"
 #include "rgw_rest_bucket.h"
 #include "rgw_rest_metadata.h"
+#ifdef WITH_RADOSGW_RADOS
 #include "rgw_rest_log.h"
+#endif
 #include "rgw_rest_config.h"
 #include "rgw_rest_realm.h"
 #include "rgw_rest_ratelimit.h"
@@ -85,18 +90,63 @@
 #define dout_subsys ceph_subsys_rgw
 
 using namespace std;
+using TOPNSPC::common::cmd_getval;
 
 namespace {
   TracepointProvider::Traits rgw_op_tracepoint_traits(
     "librgw_op_tp.so", "rgw_op_tracing");
   TracepointProvider::Traits rgw_rados_tracepoint_traits(
     "librgw_rados_tp.so", "rgw_rados_tracing");
-}
+
+class RGWHeapProfilerHook : public AdminSocketHook {
+public:
+  int call(std::string_view command,
+	   const cmdmap_t& cmdmap,
+	   const ceph::buffer::list&,
+	   ceph::Formatter*,
+	   std::ostream& errss,
+	   ceph::buffer::list& out) override {
+    if (!ceph_using_tcmalloc()) {
+      errss << "not using tcmalloc";
+      return -EOPNOTSUPP;
+    }
+    string heapcmd;
+    if (!cmd_getval(cmdmap, "heapcmd", heapcmd)) {
+      errss << "unable to get value for command \"heap\"";
+      return -EINVAL;
+    }
+    vector<string> cmd_vec;
+    get_str_vec(heapcmd, cmd_vec);
+    string value;
+    if (cmd_getval(cmdmap, "value", value)) {
+      cmd_vec.push_back(value);
+    }
+    ostringstream ss;
+    ceph_heap_profiler_handle_command(cmd_vec, ss);
+    out.append(ss.str());
+    return 0;
+  }
+};
+
+} // anonymous namespace
 
 OpsLogFile* rgw::AppMain::ops_log_file;
 
-rgw::AppMain::AppMain(const DoutPrefixProvider* dpp) : dpp(dpp), context_pool_holder(dpp) {}
-rgw::AppMain::~AppMain() = default;
+rgw::AppMain::AppMain(const DoutPrefixProvider* dpp) : dpp(dpp), context_pool(dpp) {}
+
+rgw::AppMain::~AppMain()
+{
+  unregister_heap_profiler_hook();
+}
+
+void rgw::AppMain::unregister_heap_profiler_hook()
+{
+  if (heap_profiler_hook) {
+    g_ceph_context->get_admin_socket()->unregister_commands(heap_profiler_hook);
+    delete heap_profiler_hook;
+    heap_profiler_hook = nullptr;
+  }
+}
 
 void rgw::AppMain::init_frontends1(bool nfs) 
 {
@@ -239,7 +289,7 @@ int rgw::AppMain::init_storage()
   DriverManager::Config cfg = DriverManager::get_config(false, g_ceph_context);
   env.driver = DriverManager::get_storage(dpp, dpp->get_cct(),
           cfg,
-          context_pool_holder.get(),
+          *context_pool,
           site,
           run_gc,
           run_lc,
@@ -260,6 +310,21 @@ int rgw::AppMain::init_storage()
 void rgw::AppMain::init_perfcounters()
 {
   (void) rgw_perf_start(dpp->get_cct());
+
+  ceph_heap_profiler_init();
+  unregister_heap_profiler_hook();
+  heap_profiler_hook = new RGWHeapProfilerHook();
+  int r = g_ceph_context->get_admin_socket()->register_command(
+    "heap "
+    "name=heapcmd,type=CephChoices,strings="
+    "dump|start_profiler|stop_profiler|release|get_release_rate|set_release_rate|stats "
+    "name=value,type=CephString,req=false",
+    heap_profiler_hook,
+    "show heap usage info (available only if compiled with tcmalloc)");
+  if (r < 0) {
+    delete heap_profiler_hook;
+    heap_profiler_hook = nullptr;
+  }
 } /* init_perfcounters */
 
 void rgw::AppMain::init_http_clients()
@@ -463,11 +528,11 @@ int rgw::AppMain::init_frontends2(RGWLib* rgwlib)
       fe = new RGWLoadGenFrontend(env, config);
     }
     else if (framework == "beast") {
-      fe = new RGWAsioFrontend(env, config, *sched_ctx, context_pool_holder.get());
+      fe = new RGWAsioFrontend(env, config, *sched_ctx, *context_pool);
       if (g_conf()->rgw_crypt_s3_kms_cache_enabled) {
         env.kms_cache->initialize_ttl_reaper(
             g_conf()->rgw_beast_enable_async
-            ? std::optional(context_pool_holder.get().get_executor())
+            ? std::optional(context_pool->get_executor())
                 : nullopt);
       }
     }
@@ -539,7 +604,7 @@ int rgw::AppMain::init_frontends2(RGWLib* rgwlib)
       rgw_pauser->add_pauser(dedup_background.get());
     }
       reloader = std::make_unique<RGWRealmReloader>(
-          env, *implicit_tenant_context, service_map_meta, rgw_pauser.get(), context_pool_holder.get());
+          env, *implicit_tenant_context, service_map_meta, rgw_pauser.get(), *context_pool);
       realm_watcher->add_watcher(RGWRealmNotify::Reload, *reloader);
     }
   }
@@ -591,6 +656,14 @@ void rgw::AppMain::init_lua()
 #ifdef WITH_RADOSGW_RADOS
 void rgw::AppMain::init_dedup()
 {
+  auto run_dedup =
+    (g_conf()->rgw_enable_dedup_threads &&
+      ((!nfs) || (nfs && g_conf()->rgw_nfs_run_dedup_threads)));
+
+  if (!run_dedup) {
+    return;
+  }
+
   rgw::sal::Driver* driver = env.driver;
   if (driver->get_name() == "rados") { /* Supported for only RadosStore */
     try {
@@ -657,7 +730,7 @@ void rgw::AppMain::shutdown(std::function<void(void)> finalize_async_signals)
   env.driver->shutdown();
   // Do this before closing storage so requests don't try to call into
   // closed storage.
-  context_pool_holder.get().finish();
+  context_pool->finish();
 
   cfgstore.reset(); // deletes
   DriverManager::close_storage(env.driver);
@@ -681,6 +754,7 @@ void rgw::AppMain::shutdown(std::function<void(void)> finalize_async_signals)
   rgw::curl::cleanup_curl();
   g_conf().remove_observer(implicit_tenant_context.get());
   implicit_tenant_context.reset(); // deletes
+  unregister_heap_profiler_hook();
   rgw_perf_stop(g_ceph_context);
   ratelimiter.reset(); // deletes--ensure this happens before we destruct
 } /* AppMain::shutdown */

@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <iostream>
+#include <memory_resource>
 
 #include <boost/intrusive/list.hpp>
 
@@ -101,7 +102,7 @@ struct btree_cursor_stats_t {
 
 struct rbm_pending_ool_t {
   bool is_conflicted = false;
-  std::list<CachedExtentRef> pending_extents;
+  std::vector<CachedExtentRef> pending_extents;
 };
 
 /**
@@ -162,7 +163,7 @@ public:
       ref->set_invalid(*this);
       write_set.erase(*ref);
       assert(ref->prior_instance);
-      retired_set.emplace(ref->prior_instance, trans_id);
+      retired_set.emplace(ref->prior_instance, *this);
       assert(read_set.count(ref->prior_instance->get_paddr(), extent_cmp_t{}));
       ref->reset_prior_instance();
     } else {
@@ -171,7 +172,7 @@ public:
       // XXX: prevent double retire -- retired_set.count(ref->get_paddr()) == 0
       // If it's already in the set, insert here will be a noop,
       // which is what we want.
-      retired_set.emplace(ref, trans_id);
+      retired_set.emplace(ref, *this);
     }
   }
 
@@ -313,8 +314,9 @@ public:
     }
   }
 
-  auto get_delayed_alloc_list() {
-    std::list<CachedExtentRef> ret;
+  std::vector<CachedExtentRef> get_delayed_alloc_list() {
+    std::vector<CachedExtentRef> ret;
+    ret.reserve(delayed_alloc_list.size());
     for (auto& extent : delayed_alloc_list) {
       // delayed extents may be invalidated
       if (extent->is_valid()) {
@@ -327,8 +329,9 @@ public:
     return ret;
   }
 
-  auto get_valid_pre_alloc_list() {
-    std::list<CachedExtentRef> ret;
+  std::vector<CachedExtentRef> get_valid_pre_alloc_list() {
+    std::vector<CachedExtentRef> ret;
+    ret.reserve(pre_alloc_list.size() + pre_inplace_rewrite_list.size());
     assert(num_allocated_invalid_extents == 0);
     for (auto& extent : pre_alloc_list) {
       if (extent->is_valid()) {
@@ -340,7 +343,7 @@ public:
     for (auto& extent : pre_inplace_rewrite_list) {
       if (extent->is_valid()) {
 	ret.push_back(extent);
-      } 
+      }
     }
     return ret;
   }
@@ -360,6 +363,21 @@ public:
       return false;
     } else {
       assert(len == extent->get_length());
+      return true;
+    }
+  }
+
+  bool remove_from_retired_set(CachedExtent &ext) {
+    auto it = retired_set.find(ext.get_paddr());
+    if (it == retired_set.end()) {
+      return false;
+    }
+    auto &extent = it->extent;
+    if (extent->get_paddr() != ext.get_paddr()) {
+      return false;
+    } else {
+      assert(ext.get_length() == extent->get_length());
+      retired_set.erase(it);
       return true;
     }
   }
@@ -393,7 +411,7 @@ public:
     bool retired) {
     read_set.insert(item);
     if (retired) {
-      retired_set.emplace(item.ref, trans_id);
+      retired_set.emplace(item.ref, *this);
     }
   }
   void maybe_update_pending_paddr(
@@ -416,20 +434,41 @@ public:
       auto &mextent = *i;
       write_set.erase(mextent);
       extent_len_t off = 0;
-      if (new_paddr.is_absolute_segmented()) {
-        assert(mextent.get_paddr().as_seg_paddr().get_segment_id()
-          == old_paddr.as_seg_paddr().get_segment_id());
+      if (old_paddr.is_absolute_segmented()) {
+        assert(mextent.get_paddr().as_seg_paddr().get_segment_id() ==
+          old_paddr.as_seg_paddr().get_segment_id());
+        assert(mextent.get_paddr().as_seg_paddr().get_segment_off() >=
+          old_paddr.as_seg_paddr().get_segment_off());
         assert(mextent.get_paddr().as_seg_paddr().get_segment_off()
-          >= old_paddr.as_seg_paddr().get_segment_off());
-        off = mextent.get_paddr().as_seg_paddr().get_segment_off()
-          - old_paddr.as_seg_paddr().get_segment_off();
+                + mextent.get_length() <=
+          old_paddr.as_seg_paddr().get_segment_off() + len);
+        off = mextent.get_paddr().as_seg_paddr().get_segment_off() -
+          old_paddr.as_seg_paddr().get_segment_off();
       } else {
-        assert(new_paddr.is_absolute_random_block());
+        assert(mextent.get_paddr().is_absolute_random_block());
         off = mextent.get_paddr().as_blk_paddr().get_device_off() -
           old_paddr.as_blk_paddr().get_device_off();
       }
       mextent.set_paddr(new_paddr + off);
       write_set.insert(mextent);
+    }
+  }
+  void remove_shadow_from_write_set(
+    const paddr_t &shadow_paddr, extent_len_t len) {
+    std::vector<CachedExtent*> exts;
+    for (auto [bottom, top] = write_set.get_overlap(shadow_paddr, len);
+         bottom != top;
+         bottom++) {
+      auto &mextent = *bottom;
+      if (mextent.is_initial_pending()) {
+        assert(!mextent.is_shadow_extent());
+        continue;
+      }
+      assert(mextent.is_shadow_extent() && mextent.is_exist_clean());
+      exts.emplace_back(&mextent);
+    }
+    for (auto i :exts) {
+      write_set.erase(*i);
     }
   }
 
@@ -442,6 +481,26 @@ public:
   template <typename F>
   auto for_each_existing_block(F &&f) {
     std::for_each(existing_block_list.begin(), existing_block_list.end(), f);
+  }
+
+  template <typename F>
+  void for_each_mutated_extent(F &&f) {
+    std::for_each(
+      retired_set.begin(),
+      retired_set.end(),
+      [&f](auto &link) {
+        std::invoke(f, *link.extent);
+      });
+    std::for_each(
+      mutated_block_list.begin(),
+      mutated_block_list.end(),
+      [&f](auto &e) {
+        if (!e->is_valid() ||
+            e->is_exist_mutation_pending()) {
+          return;
+        }
+        std::invoke(f, *e->get_prior_instance());
+      });
   }
 
   const io_stat_t& get_fresh_block_stats() const {
@@ -520,7 +579,16 @@ public:
   friend class crimson::os::seastore::SeaStore;
   friend class TransactionConflictCondition;
 
+  uint64_t write_hit_hot = 0;
+  uint64_t write_hit_cold = 0;
+  uint64_t read_hit_hot = 0;
+  uint64_t read_hit_cold = 0;
+
   void reset_preserve_handle() {
+    write_hit_hot = 0;
+    write_hit_cold = 0;
+    read_hit_hot = 0;
+    read_hit_cold = 0;
     root.reset();
     offset = 0;
     delayed_temp_offset = 0;
@@ -547,7 +615,6 @@ public:
     ool_write_stats = {};
     rewrite_stats = {};
     conflicted = false;
-    need_wait_visibility = false;
     force_rewrite_conflict = false;
     assert(backref_entries.empty());
     if (!has_reset) {
@@ -557,6 +624,7 @@ public:
     views.clear();
     copied_lba_keys.clear();
     update_copied_lba_key = nullptr;
+    touched_prefix.clear();
   }
 
   bool did_reset() const {
@@ -569,13 +637,19 @@ public:
     uint64_t num_erases = 0;
     uint64_t num_updates = 0;
     int64_t extents_num_delta = 0;
+    uint64_t lookup_count = 0;
+    uint64_t nodes_visited = 0;
+    uint64_t string_cmp_count = 0;
 
     bool is_clear() const {
       return (depth == 0 &&
               num_inserts == 0 &&
               num_erases == 0 &&
               num_updates == 0 &&
-	      extents_num_delta == 0);
+	      extents_num_delta == 0 &&
+              lookup_count == 0 &&
+              nodes_visited == 0 &&
+              string_cmp_count == 0);
     }
   };
   tree_stats_t& get_onode_tree_stats() {
@@ -667,23 +741,37 @@ public:
     return cache_hint;
   }
 
+  void touch_laddr_prefix(laddr_t laddr) {
+    touched_prefix.insert(laddr.get_object_prefix());
+  }
+
+  std::unordered_set<laddr_t> &get_touched_laddr_prefix() {
+    return touched_prefix;
+  }
+
   btree_cursor_stats_t cursor_stats;
 
-  bool need_wait_visibility = false;
   bool force_rewrite_conflict = false;
 
+  struct lmapping_t {
+    laddr_t dest = L_ADDR_NULL;
+    extent_len_t len = 0;
+  };
   using update_copied_lba_key_func_t =
-    std::function<void (laddr_t, paddr_t)>;
+    std::function<void (laddr_t, paddr_t,
+                  extent_len_t, std::optional<paddr_t>)>;
   void new_lba_key_copied(
     laddr_t src,
     laddr_t dest,
+    extent_len_t len,
     update_copied_lba_key_func_t &&func) {
-    copied_lba_keys.emplace(src, dest);
+    copied_lba_keys.emplace(src, lmapping_t{dest, len});
     if (!update_copied_lba_key) {
       update_copied_lba_key = std::move(func);
     }
   }
-  void maybe_sync_copied_lba_key(laddr_t laddr, paddr_t paddr) {
+  void maybe_sync_copied_lba_key(
+    laddr_t laddr, paddr_t paddr, std::optional<paddr_t> shadow) {
     if (likely(copied_lba_keys.empty())) {
       return;
     }
@@ -692,8 +780,9 @@ public:
     if (it == copied_lba_keys.end()) {
       return;
     }
-    laddr_t key = it->second;
-    update_copied_lba_key(key, paddr);
+    laddr_t key = it->second.dest;
+    extent_len_t len = it->second.len;
+    update_copied_lba_key(key, paddr, len, shadow);
   }
   RootBlockRef peek_root() {
     return root;
@@ -856,33 +945,47 @@ private:
 
   /**
    * lists of fresh blocks, holds refcounts, subset of write_set
+   *
+   * Backed by a small inline arena so that typical transactions
+   * (fewer than ~200 total entries across all lists) never touch
+   * the heap for list storage.  The monotonic_buffer_resource falls
+   * back to upstream (new/delete) for very large transactions.
    */
   io_stat_t fresh_block_stats;
   uint64_t num_delayed_invalid_extents = 0;
   uint64_t num_allocated_invalid_extents = 0;
+
+  static constexpr std::size_t BLOCK_LIST_ARENA_BYTES = 4096;
+  alignas(std::max_align_t)
+    std::byte block_list_arena_[BLOCK_LIST_ARENA_BYTES];
+  std::pmr::monotonic_buffer_resource block_list_mr_{
+    block_list_arena_, BLOCK_LIST_ARENA_BYTES};
+
   /// fresh blocks with delayed allocation,
   /// may become inline_block_list or ool_block_list below
-  std::list<CachedExtentRef> delayed_alloc_list;
+  std::pmr::vector<CachedExtentRef> delayed_alloc_list{&block_list_mr_};
   /// fresh blocks with pre-allocated addresses with RBM,
   /// should be released upon conflicts,
   /// will be added to ool_block_list below
-  std::list<CachedExtentRef> pre_alloc_list;
+  std::pmr::vector<CachedExtentRef> pre_alloc_list{&block_list_mr_};
   /// dirty blocks for inplace rewrite with RBM,
   /// will be added to inplace inplace_ool_block_list below
-  std::list<LogicalCachedExtentRef> pre_inplace_rewrite_list;
+  std::pmr::vector<LogicalCachedExtentRef>
+    pre_inplace_rewrite_list{&block_list_mr_};
 
   /// fresh blocks that will be committed with inline journal record
-  std::list<CachedExtentRef> inline_block_list;
+  std::pmr::vector<CachedExtentRef> inline_block_list{&block_list_mr_};
   /// fresh blocks that will be committed with out-of-line record
-  std::list<CachedExtentRef> ool_block_list;
+  std::pmr::vector<CachedExtentRef> ool_block_list{&block_list_mr_};
   /// dirty blocks that will be committed out-of-line with inplace rewrite
-  std::list<LogicalCachedExtentRef> inplace_ool_block_list;
+  std::pmr::vector<LogicalCachedExtentRef>
+    inplace_ool_block_list{&block_list_mr_};
 
   /// list of mutated blocks, holds refcounts, subset of write_set
-  std::list<CachedExtentRef> mutated_block_list;
+  std::pmr::vector<CachedExtentRef> mutated_block_list{&block_list_mr_};
 
   /// partial blocks of extents on disk, with data and refcounts
-  std::list<CachedExtentRef> existing_block_list;
+  std::pmr::vector<CachedExtentRef> existing_block_list{&block_list_mr_};
   existing_block_stats_t existing_block_stats;
 
   std::list<view_ref> views;
@@ -893,6 +996,8 @@ private:
    * Set of extents retired by *this.
    */
   retired_extent_set_t retired_set;
+
+  std::unordered_set<laddr_t> touched_prefix;
 
   /// stats to collect when commit or invalidate
   tree_stats_t onode_tree_stats;
@@ -924,7 +1029,7 @@ private:
 
   cache_hint_t cache_hint = CACHE_HINT_TOUCH;
 
-  std::map<laddr_t, laddr_t> copied_lba_keys;
+  std::map<laddr_t, lmapping_t> copied_lba_keys;
   update_copied_lba_key_func_t update_copied_lba_key;
 };
 using TransactionRef = Transaction::Ref;
@@ -967,7 +1072,6 @@ constexpr bool should_use_no_conflict_publish(const Transaction &t,
 
   return !t.force_rewrite_conflict && is_rewrite_transaction(t.get_src());
 }
-
 
 }
 

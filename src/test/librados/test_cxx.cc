@@ -108,13 +108,13 @@ int destroy_ec_profile_and_rule_pp(Rados &cluster,
 }
 
 std::string create_one_ec_pool_pp(const std::string &pool_name,
-  Rados &cluster, bool optimised_ec, bool enable_omap)
+  Rados &cluster, bool fast_ec)
 {
   std::string err = connect_cluster_pp(cluster);
   if (err.length())
     return err;
 
-  err = create_ec_pool_pp(pool_name, cluster, optimised_ec, enable_omap);
+  err = create_ec_pool_pp(pool_name, cluster, fast_ec);
   if (err.length()) {
     cluster.shutdown();
     return err;
@@ -123,29 +123,40 @@ std::string create_one_ec_pool_pp(const std::string &pool_name,
   return err;
 }
 
-std::string create_pool_pp(const std::string &pool_name, Rados &cluster) {
-  int ret = cluster.pool_create(pool_name.c_str());
-  if (ret) {
-    cluster.shutdown();
-    std::ostringstream oss;
-    oss << "cluster.pool_create(" << pool_name << ") failed with error " << ret;
-    return oss.str();
+std::string create_pool_pp(const std::string &pool_name, Rados &cluster, int size) {
+  std::ostringstream oss;
+  int ret;
+  if (size > 0) {
+    ret = cluster.mon_command(
+      "{\"prefix\": \"osd pool create\", \"pool\": \"" + pool_name +
+      "\", \"size\": " + std::to_string(size) + "}",
+      {}, NULL, NULL);
+    if (ret) {
+      oss << "mon_command osd pool create pool:" << pool_name
+          << " size:" << size << " failed with error " << ret;
+      return oss.str();
+    }
+  } else {
+    ret = cluster.pool_create(pool_name.c_str());
+    if (ret) {
+      cluster.shutdown();
+      oss << "cluster.pool_create(" << pool_name << ") failed with error " << ret;
+      return oss.str();
+    }
   }
 
   IoCtx ioctx;
   ret = cluster.ioctx_create(pool_name.c_str(), ioctx);
   if (ret < 0) {
     cluster.shutdown();
-    std::ostringstream oss;
-    oss << "cluster.ioctx_create(" << pool_name << ") failed with error "
-        << ret;
+    oss << "cluster.ioctx_create(" << pool_name << ") failed with error " << ret;
     return oss.str();
   }
   ioctx.application_enable("rados", true);
   return "";
 }
 
-std::string create_ec_pool_pp(const std::string &pool_name, Rados &cluster, bool optimised_ec, bool enable_omap) {
+std::string create_ec_pool_pp(const std::string &pool_name, Rados &cluster, bool fast_ec) {
   std::ostringstream oss;
   int ret = destroy_ec_profile_and_rule_pp(cluster, pool_name, oss);
   if (ret) {
@@ -170,7 +181,7 @@ std::string create_ec_pool_pp(const std::string &pool_name, Rados &cluster, bool
     return oss.str();
   }
 
-  if (optimised_ec) {
+  if (fast_ec) {
     bufferlist inbl;
     ret = cluster.mon_command(
       "{\"prefix\": \"osd pool set\", \"pool\": \"" + pool_name +
@@ -181,20 +192,6 @@ std::string create_ec_pool_pp(const std::string &pool_name, Rados &cluster, bool
       destroy_ec_profile_pp(cluster, pool_name, oss);
       oss << "rados_mon_command osd pool set failed with error " << ret;
       return oss.str();
-    }
-
-    if (enable_omap) {
-      bufferlist inbl, outbl;
-      std::ostringstream oss;
-      oss << "{\"prefix\": \"osd pool set\", \"pool\": \"" << pool_name
-          << "\", \"var\": \"supports_omap\", \"val\": \"true\"}";
-      ret = cluster.mon_command(oss.str(), std::move(inbl), &outbl, nullptr);
-      if (ret) {
-        destroy_one_ec_pool_pp(pool_name, cluster);
-        destroy_ec_profile_pp(cluster, pool_name, oss);
-        oss << "rados_mon_command osd pool set failed with error " << ret;
-        return oss.str();
-      }
     }
   }
 
@@ -317,4 +314,23 @@ int destroy_one_ec_pool_pp(const std::string &pool_name, Rados &cluster)
 
 int destroy_pool_pp(const std::string &pool_name, Rados &cluster) {
   return cluster.pool_delete(pool_name.c_str());
+}
+
+int destroy_ec_pool_pp(const std::string &pool_name, Rados &cluster) {
+  int ret = cluster.pool_delete(pool_name.c_str());
+  if (ret) {
+    return ret;
+  }
+
+  CephContext *cct = static_cast<CephContext*>(cluster.cct());
+  if (!cct->_conf->mon_fake_pool_delete) { // hope this is in [global]
+    std::ostringstream oss;
+    ret = destroy_ec_profile_and_rule_pp(cluster, pool_name, oss);
+    if (ret) {
+      return ret;
+    }
+  }
+
+  cluster.wait_for_latest_osdmap();
+  return 0;
 }

@@ -48,10 +48,10 @@ describe('RbdSnapshotFormModalComponent', () => {
     fixture.detectChanges();
 
     const header = fixture.debugElement.nativeElement.querySelector('cds-modal-header h3');
-    expect(header.textContent).toBe('Create RBD Snapshot');
+    expect(header.textContent.trim()).toBe('Create RBD Snapshot');
 
     const button = fixture.debugElement.nativeElement.querySelector('cd-submit-button');
-    expect(button.textContent).toBe('Create RBD Snapshot');
+    expect(button.textContent.trim()).toBe('Create RBD Snapshot');
   });
 
   it('should show "Rename" text', () => {
@@ -60,10 +60,10 @@ describe('RbdSnapshotFormModalComponent', () => {
     fixture.detectChanges();
 
     const header = fixture.debugElement.nativeElement.querySelector('cds-modal-header h3');
-    expect(header.textContent).toBe('Rename RBD Snapshot');
+    expect(header.textContent.trim()).toBe('Rename RBD Snapshot');
 
     const button = fixture.debugElement.nativeElement.querySelector('cd-submit-button');
-    expect(button.textContent).toBe('Rename RBD Snapshot');
+    expect(button.textContent.trim()).toBe('Rename RBD Snapshot');
   });
 
   it('should enable the mirror image snapshot creation when peer is configured', () => {
@@ -77,12 +77,14 @@ describe('RbdSnapshotFormModalComponent', () => {
 
   // TODO: Fix this test. It is failing after updating the jest.
   // It looks like it is not recognizing if radio button is disabled or not
-  // it('should disable the mirror image snapshot creation when peer is not configured', () => {
-  //   spyOn(rbdMirrorService, 'getPeerForPool').and.returnValue(of([]));
-  //   component.mirroring = 'snapshot';
-  //   component.ngOnInit();
-  //   fixture.detectChanges();
-  //   const radio = fixture.debugElement.nativeElement.querySelector('#mirrorImageSnapshot');
-  //   expect(radio.disabled).toBe(true);
-  // });
+  it('should disable the mirror image snapshot creation when peer is not configured', () => {
+    spyOn(rbdMirrorService, 'getPeerForPool').and.returnValue(of([]));
+    component.mirroring = 'snapshot';
+    component.ngOnInit();
+    fixture.detectChanges();
+    const checkboxElement =
+      fixture.debugElement.nativeElement.querySelector('#mirrorImageSnapshot');
+    const input = checkboxElement.querySelector('input');
+    expect(input.disabled).toBe(true);
+  });
 });

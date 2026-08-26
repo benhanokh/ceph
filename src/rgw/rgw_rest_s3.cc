@@ -74,9 +74,6 @@
 #include "rgw_rest_iam.h"
 #include "rgw_rest_bucket_logging.h"
 #include "rgw_sts.h"
-#ifdef WITH_RADOSGW_RADOS
-#include "rgw_sal_rados.h"
-#endif
 #include "rgw_cksum_pipe.h"
 #include "rgw_s3select.h"
 
@@ -122,8 +119,14 @@ static inline std::string get_s3_expiration_header(
   req_state* s,
   const ceph::real_time& mtime)
 {
+  /* Use the client-supplied request key (s->object_key), not the
+   * OLH-resolved key. OLH resolution fills in the current version's instance
+   * id even when the client did not request a specific version, which would
+   * otherwise make every versioned-bucket response look like a versionId
+   * request. s3_expiration_header() keys its current-version decision off an
+   * empty instance. */
   return rgw::lc::s3_expiration_header(
-    s, s->object->get_key(), s->tagset, mtime, s->bucket_attrs);
+    s, s->object_key, s->tagset, mtime, s->bucket_attrs);
 }
 
 static inline bool get_s3_multipart_abort_header(
@@ -3094,7 +3097,7 @@ int RGWPutObj_ObjStore_S3::get_decrypt_filter(
     bufferlist* manifest_bl)
 {
   static constexpr bool copy_source = true;
-  rgw_crypt_src_identity src_identity{copy_source_bucket_info.bucket.bucket_id, copy_source_bucket_name, copy_source_object_name};
+  rgw_crypt_src_identity src_identity{copy_source_bucket_info.bucket.marker, copy_source_bucket_name, copy_source_object_name};
   // part_num=0 for copy source (full object read)
   return ::get_decrypt_filter(filter, cb, s, attrs, manifest_bl, nullptr, copy_source,
                               0, 0, &src_identity);
@@ -3801,7 +3804,7 @@ void RGWRestoreObj_ObjStore_S3::send_response()
     } else if (st == rgw::sal::RGWRestoreStatus::CloudRestored) {
       rgw::sal::Attrs attrs;
       ceph::real_time expiration_date;
-      rgw::sal::RGWRestoreType rt;
+      rgw::sal::RGWRestoreType rt = rgw::sal::RGWRestoreType::None;
       attrs = s->object->get_attrs();
       auto expire_iter = attrs.find(RGW_ATTR_RESTORE_EXPIRY_DATE);
       auto type_iter = attrs.find(RGW_ATTR_RESTORE_TYPE);
@@ -3969,6 +3972,32 @@ int RGWCopyObj_ObjStore_S3::get_params(optional_yield y)
       return -EINVAL;
     }
     md_directive = tmp_md_d;
+  }
+
+  copy_source_tags = true;
+
+  auto tagging_directive = s->info.env->get("HTTP_X_AMZ_TAGGING_DIRECTIVE");
+  if (tagging_directive) {
+    if (strcasecmp(tagging_directive, "REPLACE") == 0) {
+      RGWObjTags new_tags;
+      auto tag_str = s->info.env->get("HTTP_X_AMZ_TAGGING");
+      if (tag_str) {
+        int r = new_tags.set_from_string(tag_str);
+        if (r < 0) {
+          ldpp_dout(this, 0) << "setting obj tags failed with " << r << dendl;
+          if (r == -ERR_INVALID_TAG) {
+            r = -EINVAL;
+          }
+          return r;
+        }
+      }
+      obj_tags = std::move(new_tags);
+      copy_source_tags = false;
+    } else if (strcasecmp(tagging_directive, "COPY") != 0) {
+      s->err.message = "Unknown tagging directive.";
+      ldpp_dout(this, 0) << s->err.message << dendl;
+      return -EINVAL;
+    }
   }
 
   if (source_zone.empty() &&
@@ -4552,7 +4581,7 @@ void RGWPutBucketOwnershipControls_ObjStore_S3::send_response()
     set_req_state_err(s, op_ret);
   }
   dump_errno(s);
-  end_header(s);
+  end_header(s, this);
 }
 
 void RGWGetBucketOwnershipControls_ObjStore_S3::send_response()
@@ -4582,7 +4611,7 @@ void RGWDeleteBucketOwnershipControls_ObjStore_S3::send_response()
 
   set_req_state_err(s, op_ret);
   dump_errno(s);
-  end_header(s);
+  end_header(s, this);
 }
 
 void RGWGetRequestPayment_ObjStore_S3::send_response()
@@ -4664,7 +4693,7 @@ void RGWSetRequestPayment_ObjStore_S3::send_response()
   if (op_ret)
     set_req_state_err(s, op_ret);
   dump_errno(s);
-  end_header(s);
+  end_header(s, this);
 }
 
 int RGWInitMultipart_ObjStore_S3::get_params(optional_yield y)
@@ -5265,7 +5294,7 @@ void RGWPutObjRetention_ObjStore_S3::send_response()
     set_req_state_err(s, op_ret);
   }
   dump_errno(s);
-  end_header(s);
+  end_header(s, this);
 }
 
 void RGWGetObjRetention_ObjStore_S3::send_response()
@@ -5290,7 +5319,7 @@ void RGWPutObjLegalHold_ObjStore_S3::send_response()
     set_req_state_err(s, op_ret);
   }
   dump_errno(s);
-  end_header(s);
+  end_header(s, this);
 }
 
 void RGWGetObjLegalHold_ObjStore_S3::send_response()
@@ -5335,7 +5364,7 @@ void RGWPutBucketPublicAccessBlock_ObjStore_S3::send_response()
     set_req_state_err(s, op_ret);
   }
   dump_errno(s);
-  end_header(s);
+  end_header(s, this);
 }
 
 void RGWGetBucketPublicAccessBlock_ObjStore_S3::send_response()
@@ -6482,7 +6511,7 @@ AWSGeneralAbstractor::get_v4_canonical_headers(
   const std::string_view& signedheaders,
   const bool using_qs) const
 {
-  return rgw::auth::s3::get_v4_canonical_headers(info, signedheaders,
+  return rgw::auth::s3::get_v4_canonical_headers(cct, info, signedheaders,
                                                  using_qs, false);
 }
 
@@ -6900,7 +6929,7 @@ AWSGeneralBoto2Abstractor::get_v4_canonical_headers(
   const std::string_view& signedheaders,
   const bool using_qs) const
 {
-  return rgw::auth::s3::get_v4_canonical_headers(info, signedheaders,
+  return rgw::auth::s3::get_v4_canonical_headers(cct, info, signedheaders,
                                                  using_qs, true);
 }
 
@@ -7323,24 +7352,14 @@ rgw::auth::s3::STSEngine::get_session_token(const DoutPrefixProvider* dpp, const
     return -EINVAL;
   }
 
-  auto* cryptohandler = cct->get_crypto_handler(CEPH_CRYPTO_AES);
-  if (! cryptohandler) {
-    return -EINVAL;
-  }
-  string secret_s = cct->_conf->rgw_sts_key;
-  if (secret_s.empty()) {
+  if (cct->_conf->rgw_sts_key.empty()) {
     ldpp_dout(dpp, 1) << "ERROR: rgw sts key not set" << dendl;
     return -EINVAL;
   }
-  buffer::ptr secret(secret_s.c_str(), secret_s.length());
-  int ret = 0;
-  if (ret = cryptohandler->validate_secret(secret); ret < 0) {
-    ldpp_dout(dpp, 0) << "ERROR: Invalid secret key" << dendl;
-    return -EINVAL;
-  }
   string error;
-  std::unique_ptr<CryptoKeyHandler> keyhandler(cryptohandler->get_key_handler(secret, error));
+  auto keyhandler = STS::secret_to_handler(cct, cct->_conf->rgw_sts_key, error);
   if (! keyhandler) {
+    ldpp_dout(dpp, 0) << "Invalid rgw sts key; " << error << dendl;
     return -EINVAL;
   }
   error.clear();
@@ -7349,7 +7368,7 @@ rgw::auth::s3::STSEngine::get_session_token(const DoutPrefixProvider* dpp, const
   buffer::list en_input, dec_output;
   en_input = buffer::list::static_from_string(decodedSessionToken);
 
-  ret = keyhandler->decrypt(en_input, dec_output, &error);
+  int ret = keyhandler->decrypt_ext(cct, 14, en_input, dec_output, &error);
   if (ret < 0) {
     ldpp_dout(dpp, 0) << "ERROR: Decryption failed: " << error << dendl;
     return -EPERM;

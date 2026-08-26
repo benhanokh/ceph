@@ -104,6 +104,13 @@ as follows:
 :command:`bucket stats`
   List bucket statistics plus other internal information about a bucket.
 
+:command:`bucket suspend`
+  Suspend an individual bucket. S3 requests against the bucket fail with
+  ``403 BucketSuspended``.
+
+:command:`bucket unsuspend`
+  Unsuspend a previously suspended bucket.
+
 :command:`bucket rm`
   Remove a bucket.
 
@@ -639,7 +646,7 @@ Options
 
 .. option:: --shard-id=<shard-id>
 
-   Optional for mdlog list, bi list, data sync status. Required for ``mdlog trim``.
+   Optional for mdlog list, bi list, data sync status, gc list, gc process. Required for ``mdlog trim``.
 
 .. option:: --max-entries=<entries>
 

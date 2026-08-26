@@ -39,6 +39,26 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
+def _is_log_only_config(nfs_config: str) -> bool:
+    """Return True if nfs_config contains only LOG block(s).
+
+    NFS-Ganesha picks up LOG changes via RADOS watch/notify without
+    requiring a daemon restart.  If the config is empty, unparseable,
+    or contains any non-LOG top-level block, return False so the caller
+    falls back to the safe restart path.
+    """
+    try:
+        blocks = GaneshaConfParser(nfs_config).parse()
+    except Exception:
+        log.warning("Failed to parse user config, assuming restart is needed")
+        return False
+    if not blocks:
+        return False
+    block_names = [b.block_name for b in blocks]
+    log.debug("Parsed user config blocks: %s", block_names)
+    return all(name == 'LOG' for name in block_names)
+
+
 def resolve_ip(hostname: str) -> str:
     try:
         r = socket.getaddrinfo(hostname, None, flags=socket.AI_CANONNAME,
@@ -170,8 +190,12 @@ class NFSCluster:
             tls_debug: bool = False,
             tls_min_version: Optional[str] = None,
             tls_ciphers: Optional[str] = None,
+            ip_addrs: Optional[Dict[str, str]] = None,
+            monitoring_ip_addrs: Optional[Dict[str, str]] = None,
+            monitoring_port: Optional[int] = None,
             enable_rdma: bool = False,
             rdma_port: Optional[int] = None,
+            ingress_placement: Optional[str] = None,
     ) -> None:
         if not port:
             port = 2049   # default nfs port
@@ -182,9 +206,12 @@ class NFSCluster:
                 ingress_mode = IngressType.default
             ingress_mode = ingress_mode.canonicalize()
             pspec = PlacementSpec.from_string(placement)
+            ingress_pspec = PlacementSpec.from_string(ingress_placement) if ingress_placement else None
             if ingress_mode == IngressType.keepalive_only:
                 # enforce count=1 for nfs over keepalive only
                 pspec.count = 1
+                if ingress_pspec:
+                    ingress_pspec.count = 1
 
             ganesha_port = 10000 + port  # semi-arbitrary, fix me someday
             frontend_port: Optional[int] = port
@@ -216,6 +243,9 @@ class NFSCluster:
                                   tls_debug=tls_debug,
                                   tls_min_version=tls_min_version,
                                   tls_ciphers=tls_ciphers,
+                                  ip_addrs=ip_addrs,
+                                  monitoring_ip_addrs=monitoring_ip_addrs,
+                                  monitoring_port=monitoring_port,
                                   enable_rdma=enable_rdma,
                                   rdma_port=rdma_port)
             completion = self.mgr.apply_nfs(spec)
@@ -223,7 +253,7 @@ class NFSCluster:
             ispec = IngressSpec(service_type='ingress',
                                 service_id='nfs.' + cluster_id,
                                 backend_service='nfs.' + cluster_id,
-                                placement=pspec,
+                                placement=ingress_pspec or pspec,
                                 frontend_port=frontend_port,
                                 monitor_port=7000 + port,   # semi-arbitrary, fix me someday
                                 virtual_ip=virtual_ip,
@@ -246,6 +276,9 @@ class NFSCluster:
                                   tls_debug=tls_debug,
                                   tls_min_version=tls_min_version,
                                   tls_ciphers=tls_ciphers,
+                                  ip_addrs=ip_addrs,
+                                  monitoring_ip_addrs=monitoring_ip_addrs,
+                                  monitoring_port=monitoring_port,
                                   enable_rdma=enable_rdma,
                                   rdma_port=rdma_port)
             completion = self.mgr.apply_nfs(spec)
@@ -281,8 +314,12 @@ class NFSCluster:
             tls_debug: bool = False,
             tls_min_version: Optional[str] = None,
             tls_ciphers: Optional[str] = None,
+            ip_addrs: Optional[Dict[str, str]] = None,
+            monitoring_ip_addrs: Optional[Dict[str, str]] = None,
+            monitoring_port: Optional[int] = None,
             enable_rdma: bool = False,
             rdma_port: Optional[int] = None,
+            ingress_placement: Optional[str] = None,
     ) -> None:
         try:
             if virtual_ip:
@@ -322,8 +359,12 @@ class NFSCluster:
                     tls_debug=tls_debug,
                     tls_min_version=tls_min_version,
                     tls_ciphers=tls_ciphers,
+                    ip_addrs=ip_addrs,
+                    monitoring_ip_addrs=monitoring_ip_addrs,
+                    monitoring_port=monitoring_port,
                     enable_rdma=enable_rdma,
-                    rdma_port=rdma_port
+                    rdma_port=rdma_port,
+                    ingress_placement=ingress_placement
                 )
                 return
             raise NonFatalError(f"{cluster_id} cluster already exists")
@@ -402,7 +443,6 @@ class NFSCluster:
                     if len(svc.ports) > 1:
                         monitor_port = svc.ports[1]
         except orchestrator.OrchestratorError:
-            # No ingress service found for this cluster
             log.debug(f"No ingress service found for NFS cluster {cluster_id}")
 
         # Build backend list with daemon information
@@ -412,17 +452,13 @@ class NFSCluster:
                 continue
 
             try:
-                # Resolve daemon IP
                 if daemon.ip:
                     ip = daemon.ip
                 elif daemon.hostname in hosts_map:
-                    # Use cached host data
                     ip = resolve_ip(hosts_map[daemon.hostname].addr)
                 else:
-                    # Fallback to hostname resolution
                     ip = resolve_ip(daemon.hostname)
 
-                # Get daemon status
                 status = orchestrator.DaemonDescriptionStatus.to_str(daemon.status)
 
                 backends.append({
@@ -437,14 +473,11 @@ class NFSCluster:
                     f" on {daemon.hostname} in cluster {cluster_id}")
                 continue
 
-        # Sort backends by hostname for consistent output
         backends.sort(key=lambda x: x["hostname"])
 
-        # Determine deployment type based on ingress configuration and actual daemon count
         deployment_type = "standalone"
         placement = None
 
-        # Get NFS service spec for placement information first
         nfs_sc = self.mgr.describe_service(
             service_type='nfs',
             service_name=f'nfs.{cluster_id}'
@@ -456,17 +489,13 @@ class NFSCluster:
                 break
 
         if ingress_mode:
-            # Determine deployment type from placement spec (source of truth)
-            # Note: Using placement.count instead of len(backends) to avoid race conditions
             if placement and placement.count and placement.count > 1:
                 deployment_type = "active-active"
             elif len(backends) > 1:
-                # Fallback to actual daemon count if placement.count not set
                 deployment_type = "active-active"
             else:
                 deployment_type = "active-passive"
 
-        # Build result dictionary
         r: Dict[str, Any] = {
             'deployment_type': deployment_type,
             'virtual_ip': virtual_ip,
@@ -474,7 +503,6 @@ class NFSCluster:
             'placement': placement.to_json() if placement else {},
         }
 
-        # Add ingress configuration to result
         if ingress_mode:
             r['ingress_mode'] = ingress_mode.value
         if ingress_port is not None:
@@ -524,7 +552,14 @@ class NFSCluster:
                 rados_obj.write_obj(nfs_config, user_conf_obj_name(cluster_id),
                                     conf_obj_name(cluster_id))
                 log.debug("Successfully saved %s's user config: \n %s", cluster_id, nfs_config)
-                restart_nfs_service(self.mgr, cluster_id)
+                if _is_log_only_config(nfs_config):
+                    log.debug("LOG-only config detected for %s, "
+                              "skipping restart (RADOS notify will reload)",
+                              cluster_id)
+                else:
+                    log.debug("Non-LOG config detected for %s, "
+                              "restarting NFS service", cluster_id)
+                    restart_nfs_service(self.mgr, cluster_id)
                 return
             raise ClusterNotFound()
         except NotImplementedError:
@@ -539,9 +574,17 @@ class NFSCluster:
                 rados_obj = self._rados(cluster_id)
                 if not rados_obj.check_config(USER_CONF_PREFIX):
                     raise NonFatalError("NFS-Ganesha User Config does not exist")
+                existing_conf = rados_obj.read_obj(user_conf_obj_name(cluster_id))
                 rados_obj.remove_obj(user_conf_obj_name(cluster_id),
                                      conf_obj_name(cluster_id))
-                restart_nfs_service(self.mgr, cluster_id)
+                if existing_conf and _is_log_only_config(existing_conf):
+                    log.debug("LOG-only config removed for %s, "
+                              "skipping restart (RADOS notify will reload)",
+                              cluster_id)
+                else:
+                    log.debug("Non-LOG config removed for %s, "
+                              "restarting NFS service", cluster_id)
+                    restart_nfs_service(self.mgr, cluster_id)
                 return
             raise ClusterNotFound()
         except NotImplementedError:

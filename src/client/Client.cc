@@ -888,6 +888,7 @@ void Client::trim_cache(bool trim_kernel_dcache)
 {
   uint64_t max = cct->_conf->client_cache_size;
   ldout(cct, 20) << "trim_cache size " << lru.lru_get_size() << " max " << max << dendl;
+  assert_lru_num_pinned_sane("trim_cache start");
   unsigned last = 0;
   while (lru.lru_get_size() != last) {
     last = lru.lru_get_size();
@@ -899,8 +900,12 @@ void Client::trim_cache(bool trim_kernel_dcache)
     if (!dn)
       break;  // done
 
+    assert_lru_num_pinned_sane("trim_cache before evict", dn);
+
     trim_dentry(dn);
   }
+
+  assert_lru_num_pinned_sane("trim_cache end");
 
   if (trim_kernel_dcache && lru.lru_get_size() > max)
     _invalidate_kernel_dcache();
@@ -935,6 +940,8 @@ void Client::trim_cache_for_reconnect(MetaSession *s)
   for(list<Dentry*>::iterator p = skipped.begin(); p != skipped.end(); ++p)
     lru.lru_insert_mid(*p);
 
+  assert_lru_num_pinned_sane("trim_cache_for_reconnect end");
+
   ldout(cct, 20) << __func__ << " mds." << mds
 		 << " trimmed " << trimmed << " dentries" << dendl;
 
@@ -944,6 +951,12 @@ void Client::trim_cache_for_reconnect(MetaSession *s)
 
 void Client::trim_dentry(Dentry *dn)
 {
+  // dn come straight out of lru.lru_get_next_expire() in trim_cache(), it
+  // should still be attached to its dir. we touch dn->dir right below
+  // (before unlink() get a chance to check it itself), so better we assert
+  // it here too, otherwise we would just segfault on the dereference with
+  // no clue at all. See https://tracker.ceph.com/issues/77947.
+  ceph_assert(dn->dir);
   ldout(cct, 15) << "trim_dentry unlinking dn " << dn->name 
 		 << " in dir "
 		 << std::hex << dn->dir->parent_inode->ino << std::dec
@@ -1417,7 +1430,7 @@ bool Client::_wrap_name(Inode& diri, std::string& dname, std::string& alternate_
     int r = fscrypt_denc->get_encrypted_fname(dname, &_enc_name, &_alt_name, false);
     if (r < 0) {
       ldout(cct, 0) << __FILE__ << ":" << __LINE__ << ": failed to encrypt filename" << dendl;
-      return r;
+      return false;
     }
     dname = std::move(_enc_name);
     if (alternate_name.empty()) {
@@ -1428,7 +1441,7 @@ bool Client::_wrap_name(Inode& diri, std::string& dname, std::string& alternate_
       int r = fscrypt_denc->get_encrypted_fname(alternate_name, &_enc_name, &_alt_name, true);
       if (r < 0) {
         ldout(cct, 0) << __FILE__ << ":" << __LINE__ << ": failed to encrypt filename" << dendl;
-        return r;
+        return false;
       }
       alternate_name = std::move(_alt_name);
     }
@@ -3734,8 +3747,24 @@ void Client::close_dir(Dir *dir)
   ceph_assert(dir->is_empty());
   ceph_assert(in->dir == dir);
   ceph_assert(in->dentries.size() < 2);     // dirs can't be hard-linked
-  if (!in->dentries.empty())
-    in->get_first_parent()->put();   // unpin dentry
+  if (!in->dentries.empty()) {
+    Dentry *pdn = in->get_first_parent();
+    // this will remove the "dir -> dn" pin from parent dentry. if that
+    // make its ref go down to 1, it become lru-unpinned and can be
+    // evicted on next trim_cache() run (may even happen inside same
+    // call, from _try_to_trim_inode() or from tick thread). we add log
+    // here so if "num_pinned" go wrong in some future crash dump, we
+    // have at least a clue what caused it.
+    // See: https://tracker.ceph.com/issues/74625,
+    // https://tracker.ceph.com/issues/77947
+    ldout(cct, 15) << __func__ << " dropping dir pin on parent dn " << pdn->name
+		   << " (dn " << pdn << ") ref " << pdn->ref << " -> " << (pdn->ref - 1)
+		   << dendl;
+    pdn->put();   // unpin dentry, note: pdn could be freed by put() already,
+                  // do not touch it below this line.
+
+    assert_lru_num_pinned_sane("close_dir after parent unpin");
+  }
   
   delete in->dir;
   in->dir = 0;
@@ -3800,6 +3829,13 @@ void Client::unlink(Dentry *dn, bool keepdir, bool keepdentry)
   // See: https://tracker.ceph.com/issues/74625
   DentryRef dnref(dn);
 
+  // dn must be still linked into its dir at this point. this was a concern
+  // that came up during review of the DentryRef fix - in theory somebody
+  // could call us with a dn that close_dir()/detach() already unlinked.
+  // better to assert here than dereference a null dn->dir few lines below.
+  // See https://tracker.ceph.com/issues/77947.
+  ceph_assert(dn->dir);
+
   ldout(cct, 15) << "unlink dir " << dn->dir->parent_inode << " '" << dn->name << "' dn " << dn
 		 << " inode " << dn->inode << dendl;
 
@@ -3819,8 +3855,9 @@ void Client::unlink(Dentry *dn, bool keepdir, bool keepdentry)
     // unlink from dir
     Dir *dir = dn->dir;
     dn->detach();
+    ceph_assert(dn->dir == nullptr);   // detach() must clear it
 
-    // delete den
+    assert_lru_num_pinned_sane("unlink before lru_remove", dn);
     lru.lru_remove(dn);
     dn->put();
 
@@ -7044,14 +7081,14 @@ int Client::mount(const std::string &mount_root, const UserPerm& perms,
 #if defined(__linux__)
   // dummy encryption?
   if (cct->_conf.get_val<bool>("client_fscrypt_dummy_encryption")) {
-    client_lock.unlock();
+    cl.unlock();
 
     r = fscrypt_dummy_encryption();
     if (r < 0) {
       return r;
     }
 
-    client_lock.lock();
+    cl.lock();
   }
 #endif
   /*
@@ -7372,7 +7409,9 @@ int Client::fscrypt_dummy_encryption() {
     char keyid[FSCRYPT_KEY_IDENTIFIER_SIZE];
     int r = add_fscrypt_key(key, sizeof(key), keyid);
     if (r < 0) {
-      goto err;
+      // The key was not added, so keyid is not populated and there is
+      // nothing to remove.
+      return r;
     }
 
     // set dummy encryption policy
@@ -7386,6 +7425,7 @@ int Client::fscrypt_dummy_encryption() {
     memcpy(policy.master_key_identifier, keyid, FSCRYPT_KEY_IDENTIFIER_SIZE);
     r = ll_set_fscrypt_policy_v2(root.get(), policy);
     if (r < 0) {
+      ldout(cct, 0) << __func__ << "(): failed to set dummy encryption policy: r=" << r << dendl;
       goto err;
     }
 
@@ -7398,7 +7438,11 @@ int Client::fscrypt_dummy_encryption() {
     memcpy(key_spec.u.identifier, keyid, FSCRYPT_KEY_IDENTIFIER_SIZE);
     arg.removal_status_flags = 0;
     arg.key_spec = key_spec;
-    r = remove_fscrypt_key(&arg);
+    // Preserve the original failure; don't mask it with the removal result.
+    int r2 = remove_fscrypt_key(&arg);
+    if (r2 < 0) {
+      ldout(cct, 0) << __func__ << "(): failed to remove fscrypt key: r=" << r2 << dendl;
+    }
     return r;
 }
 #endif
@@ -8790,13 +8834,15 @@ int Client::_do_setattr(Inode *in, struct ceph_statx *stx, int mask,
       in->ctime = ceph_clock_now();
       in->mark_caps_dirty(CEPH_CAP_FILE_WR);
       mask &= ~CEPH_SETATTR_ATIME;
-    } else if (!in->caps_issued_mask(CEPH_CAP_FILE_SHARED) ||
-	       in->atime != utime_t(stx->stx_atime)) {
-      args.setattr.atime = utime_t(stx->stx_atime);
-      inode_drop |= CEPH_CAP_FILE_CACHE | CEPH_CAP_FILE_RD |
-                    CEPH_CAP_FILE_WR;
     } else {
-      mask &= ~CEPH_SETATTR_ATIME;
+      /* If we do not hold EXCL or WR caps, we MUST pass this request to the MDS
+       * regardless of whether the new atime matches the old cached atime.
+       * This ensures the network mask preserves CEPH_SETATTR_ATIME so the MDS
+       * can handle POSIX compliance and bump ctime. A client with SHARED caps
+       * cannot mutate metadata or bump ctime locally too.
+       */
+      args.setattr.atime = utime_t(stx->stx_atime);
+      inode_drop |= CEPH_CAP_FILE_CACHE | CEPH_CAP_FILE_RD | CEPH_CAP_FILE_WR;
     }
   }
 
@@ -10477,6 +10523,7 @@ int Client::file_blockdiff(struct scan_state_t *state, const UserPerm &perms,
 }
 
 int Client::readdir_snapdiff(dir_result_t* d1, snapid_t snap2,
+                             unsigned diff_mask,
                              struct dirent* out_de,
                              snapid_t* out_snap)
 {
@@ -10514,6 +10561,7 @@ int Client::readdir_snapdiff(dir_result_t* d1, snapid_t snap2,
       } else if (dirp->hash_order()) {
 	req->head.args.snapdiff.offset_hash = dirp->offset_high();
       }
+      req->head.args.snapdiff.mask = diff_mask;
       req->dirp = dirp;
   };
 

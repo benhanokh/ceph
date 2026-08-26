@@ -15,6 +15,7 @@ from ceph.deployment.service_spec import (
     IngressSpec,
     IscsiServiceSpec,
     NFSServiceSpec,
+    NodeProxySpec,
     OAuth2ProxySpec,
     PlacementSpec,
     PrometheusSpec,
@@ -337,6 +338,18 @@ def test_osd_unmanaged():
     assert dg_spec.unmanaged == True
 
 
+def test_node_proxy_unmanaged():
+    node_proxy_spec = {"placement": {"host_pattern": "*"},
+                       "service_name": "node-proxy",
+                       "service_type": "node-proxy",
+                       "unmanaged": True}
+
+    spec = ServiceSpec.from_json(node_proxy_spec)
+    assert isinstance(spec, NodeProxySpec)
+    assert spec.unmanaged is True
+    ServiceSpec.from_json(spec.to_json())
+
+
 @pytest.mark.parametrize("y",
 """service_type: crash
 service_name: crash
@@ -636,6 +649,110 @@ def test_nfs_spec_from_json_rdma():
     out = spec.to_json()
     assert out.get('spec', {}).get('enable_rdma') is True
     assert out.get('spec', {}).get('rdma_port') == 1234
+
+
+def test_nfs_spec_client_object_cache_from_json_roundtrip():
+    """Object-cache fields roundtrip via from_json/to_json, preserving size strings."""
+    data = {
+        'service_id': 'mynfs',
+        'service_type': 'nfs',
+        'placement': {'count': 1},
+        'spec': {
+            'enable_client_object_cache': True,
+            'client_object_cache_size': '1MiB',
+            'client_object_cache_max_dirty': '512KiB',
+        },
+    }
+    spec = NFSServiceSpec.from_json(data)
+    assert spec.enable_client_object_cache is True
+    assert spec.client_object_cache_size == '1MiB'
+    assert spec.client_object_cache_max_dirty == '512KiB'
+    out = spec.to_json()
+    assert out.get('spec', {}).get('enable_client_object_cache') is True
+    assert out.get('spec', {}).get('client_object_cache_size') == '1MiB'
+    assert out.get('spec', {}).get('client_object_cache_max_dirty') == '512KiB'
+
+
+def test_nfs_spec_client_object_cache_size_units():
+    """Size fields accept KiB/MB/GiB strings and remain unchanged after validate."""
+    spec = NFSServiceSpec(
+        service_id='mynfs',
+        placement=PlacementSpec(count=1),
+        enable_client_object_cache=True,
+        client_object_cache_size='1MiB',
+        client_object_cache_max_dirty='512KiB',
+    )
+    spec.validate()
+    assert spec.client_object_cache_size == '1MiB'
+    assert spec.client_object_cache_max_dirty == '512KiB'
+
+    data = {
+        'service_id': 'mynfs',
+        'service_type': 'nfs',
+        'placement': {'count': 1},
+        'spec': {
+            'enable_client_object_cache': True,
+            'client_object_cache_size': '100MB',
+            'client_object_cache_max_dirty': '0',
+        },
+    }
+    spec = NFSServiceSpec.from_json(data)
+    assert spec.client_object_cache_size == '100MB'
+    assert spec.client_object_cache_max_dirty == '0'
+
+
+def test_nfs_spec_client_object_cache_validation():
+    """client_object_cache_size/max_dirty must be valid and size > max_dirty."""
+    with pytest.raises(SpecValidationError, match="client_object_cache_size"):
+        NFSServiceSpec(
+            service_id='mynfs',
+            placement=PlacementSpec(count=1),
+            enable_client_object_cache=True,
+            client_object_cache_size=-1,
+        ).validate()
+
+    with pytest.raises(SpecValidationError, match="client_object_cache_max_dirty"):
+        NFSServiceSpec(
+            service_id='mynfs',
+            placement=PlacementSpec(count=1),
+            enable_client_object_cache=True,
+            client_object_cache_max_dirty=-5,
+        ).validate()
+
+    with pytest.raises(SpecValidationError, match="client_object_cache_size"):
+        NFSServiceSpec(
+            service_id='mynfs',
+            placement=PlacementSpec(count=1),
+            enable_client_object_cache=True,
+            client_object_cache_size='not-a-size',
+        ).validate()
+
+    with pytest.raises(SpecValidationError, match="must be greater than"):
+        NFSServiceSpec(
+            service_id='mynfs',
+            placement=PlacementSpec(count=1),
+            enable_client_object_cache=True,
+            client_object_cache_size='1MiB',
+            client_object_cache_max_dirty='2MiB',
+        ).validate()
+
+    with pytest.raises(SpecValidationError, match="must be greater than"):
+        NFSServiceSpec(
+            service_id='mynfs',
+            placement=PlacementSpec(count=1),
+            enable_client_object_cache=True,
+            client_object_cache_size='1MiB',
+            client_object_cache_max_dirty='1MiB',
+        ).validate()
+
+    # Valid: size greater than max_dirty
+    NFSServiceSpec(
+        service_id='mynfs',
+        placement=PlacementSpec(count=1),
+        enable_client_object_cache=True,
+        client_object_cache_size='1MiB',
+        client_object_cache_max_dirty='512KiB',
+    ).validate()
 
 
 def test_repr():

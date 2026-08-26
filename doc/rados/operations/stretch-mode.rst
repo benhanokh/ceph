@@ -71,7 +71,7 @@ will occur despite the fact that the primary PG is unable to replicate data (a
 situation that, under normal non-netsplit circumstances, would result in the
 marking of affected OSDs as ``down`` and their removal from the PG). When this
 happens, Ceph will be unable to satisfy durability guarantees and
-consequently IO will not be permitted.
+consequently I/O will not be permitted.
 
 The second category of failures that we will discuss are those in
 which the constraints are not sufficient to guarantee the replication of data
@@ -117,7 +117,12 @@ cascading failures and an impactful thundering herd of data movement. This can
 cause substantial client impact and long recovery times when OSDs return to
 service. If Ceph stops marking OSDs ``out``, some PGs may fail to
 rebalance to surviving OSDs, potentially leading to ``inactive`` PGs.
-See https://tracker.ceph.com/issues/68338 for more information.
+This is particularly relevant for three-availability-zone clusters,
+which are designed to survive the loss of a full zone (a third of the
+hosts): with the default ``mon_osd_min_in_ratio``, the down OSDs are
+never marked ``out``, so PGs stay ``peered`` and I/O stops even though
+the surviving zones have enough capacity to recover. Marking the down
+OSDs ``out`` manually restores service in that situation.
 
 .. _stretch_mode1:
 
@@ -151,6 +156,8 @@ contains only replicas from a single data center. This safeguard is crucial for 
 loss during zone failures because if a PG were allowed to go ``active`` with replicas only at a single zone,
 writes could be acknowledged despite a lack of redundancy. In the event of a zone failure, all data in the
 affected PG would be lost.
+
+.. _entering_stretch_mode:
 
 Entering Stretch Mode
 ---------------------
@@ -226,8 +233,6 @@ with the CRUSH topology.
       The recommended approach is to use the ``stretch_replicated_rule`` definition shown
       above (with ``take default`` and ``choose firstn 0 type datacenter``), which correctly
       reports ``MAX AVAIL``.
-
-      See https://tracker.ceph.com/issues/56650 for more detail on this workaround.
 
    *The above procedure was developed in May and June of 2024 by Prashant Dhange.*
 
@@ -353,17 +358,49 @@ SSDs. Hybrid HDD+SSD or HDD-only OSDs are not recommended
 due to the long time it takes for them to recover after connectivity between
 data centers has been restored. This reduces the potential for data loss.
 
-.. warning:: CRUSH rules that specify a device class are not supported in stretch mode.
-   For example, the following rule specifying the ``ssd`` device class will not work::
+.. warning:: Do not specify a device class in the CRUSH rule used for stretch
+   mode. Ceph accepts such a rule and reports healthy stretch mode, but the PGs
+   will fail to peer if a data center is later lost.
+
+   A device class makes CRUSH select OSDs from a shadow tree, in which
+   ``zone1`` is a separate bucket named ``zone1~ssd``::
 
       rule stretch_replicated_rule {
                  id 1
-                 type replicated class ssd
-                 step take default
+                 type replicated
+                 step take default class ssd
                  step choose firstn 0 type datacenter
                  step chooseleaf firstn 2 type host
                  step emit
       }
+
+   The class is honored and the placement is correct: OSDs of that class are
+   chosen from both data centers, as asked. The problem is in the peering
+   check. Stretch mode resolves each OSD to its ``datacenter`` through the
+   pool's CRUSH rule, so with the rule above it sees ``zone1~ssd`` rather than
+   ``zone1``. You will not notice this while both data centers are up, because
+   peering only counts how many distinct buckets the acting set spans, and two
+   shadow buckets count as two.
+
+   The mismatch matters once a data center is lost. When the cluster enters
+   degraded stretch mode, the Monitors record the surviving data center by its
+   real bucket, ``zone1``, and require every PG to include it. That never
+   matches the ``zone1~ssd`` the rule reports, so every PG of every pool using
+   that rule goes inactive and its data is unavailable.
+
+   Restoring the lost data center does not clear this. The cluster returns to
+   healthy stretch mode only once no PG is left degraded, inactive, or unknown,
+   and these PGs stay inactive for as long as that requirement stands, so
+   recovery never finishes on its own. Breaking the loop takes ``ceph osd
+   force_healthy_stretch_mode --yes-i-really-mean-it``, which drops the
+   requirement and lets the PGs peer.
+
+   Use a rule without a device class from the start, such as the one under
+   :ref:`entering_stretch_mode`. If a cluster is already in stretch mode, check
+   the rule that each of its pools uses and correct it while both data centers
+   are up. Switching a pool to another rule moves most of its data, because the
+   shadow tree and the real tree place data differently even when they hold the
+   same OSDs.
 
 In the future, stretch mode could support erasure-coded pools,
 enable deployments across more than two data centers,

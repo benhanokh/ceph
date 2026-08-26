@@ -2334,7 +2334,7 @@ void BlueStore::Blob::get_ref(
   // references.  Otherwise one is neither unable to determine required
   // amount of counters in case of per-au tracking nor obtain min_release_size
   // for single counter mode.
-  ceph_assert(get_blob().get_logical_length() != 0);
+  ceph_assert_decode(get_blob().get_logical_length() != 0);
   dout(20) << __func__ << " 0x" << std::hex << offset << "~" << length
            << std::dec << " " << *this << dendl;
 
@@ -4160,7 +4160,7 @@ unsigned BlueStore::ExtentMap::ExtentDecoder::decode_some(
   // Version 2 differs from v1 in blob's ref_map
   // serialization only. Hence there is no specific
   // handling at ExtentMap level below.
-  ceph_assert(struct_v == 1 || struct_v == 2);
+  ceph_assert_decode(struct_v == 1 || struct_v == 2);
   denc_varint(num, p);
 
   extent_pos = 0;
@@ -4169,7 +4169,7 @@ unsigned BlueStore::ExtentMap::ExtentDecoder::decode_some(
     decode_extent(le, struct_v, p, c);
     add_extent(le);
   }
-  ceph_assert(extent_pos == num);
+  ceph_assert_decode(extent_pos == num);
   return num;
 }
 
@@ -4181,7 +4181,7 @@ void BlueStore::ExtentMap::ExtentDecoder::decode_spanning_blobs(
   // Version 2 differs from v1 in blob's ref_map
   // serialization only. Hence there is no specific
   // handling at ExtentMap level.
-  ceph_assert(struct_v == 1 || struct_v == 2);
+  ceph_assert_decode(struct_v == 1 || struct_v == 2);
 
   unsigned n;
   denc_varint(n, p);
@@ -4215,7 +4215,7 @@ void BlueStore::ExtentMap::ExtentDecoderFull::consume_blobid(
   if (spanning) {
     le->assign_blob(extent_map.get_spanning_blob(blobid));
   } else {
-    ceph_assert(blobid < blobs.size());
+    ceph_assert_decode(blobid < blobs.size());
     le->assign_blob(blobs[blobid]);
     // we build ref_map dynamically for non-spanning blobs
     le->blob->get_ref(
@@ -4246,12 +4246,15 @@ void BlueStore::ExtentMap::ExtentDecoderFull::consume_spanning_blob(
 
 BlueStore::Extent* BlueStore::ExtentMap::ExtentDecoderFull::get_next_extent()
 {
-  return new Extent();
+  pending_extent = std::make_unique<Extent>();
+  return pending_extent.get();
 }
 
 void BlueStore::ExtentMap::ExtentDecoderFull::add_extent(BlueStore::Extent* le)
 {
+  ceph_assert(le == pending_extent.get());
   extent_map.extent_map.insert(*le);
+  pending_extent.release();     // ownership now with the intrusive set
 }
 
 unsigned BlueStore::ExtentMap::decode_some(bufferlist& bl)
@@ -4959,11 +4962,12 @@ BlueStore::Onode* BlueStore::Onode::create_decode(
   bool use_onode_segmentation)
 {
   ceph_assert(v.length() || allow_empty);
-  Onode* on = new Onode(c.get(), oid, (const mempool::bluestore_cache_meta::string)(key));
+  auto on = std::unique_ptr<Onode>(
+    new Onode(c.get(), oid, (const mempool::bluestore_cache_meta::string)(key)));
 
   if (v.length()) {
     ExtentMap::ExtentDecoderFull edecoder(on->extent_map);
-    decode_raw(on, v, edecoder, use_onode_segmentation);
+    decode_raw(on.get(), v, edecoder, use_onode_segmentation);
 
     for (auto& i : on->onode.attrs) {
       i.second.reassign_to_mempool(mempool::mempool_bluestore_cache_meta);
@@ -4986,7 +4990,7 @@ BlueStore::Onode* BlueStore::Onode::create_decode(
     }
     on->onode.segment_size = segment_size;
   }
-  return on;
+  return on.release();
 }
 
 void BlueStore::Onode::flush()
@@ -7534,6 +7538,18 @@ int BlueStore::_init_alloc()
     }
     if (restore_allocator(alloc, &num, &bytes) == 0) {
       dout(5) << __func__ << "::NCB::restore_allocator() completed successfully alloc=" << alloc << dendl;
+
+      if (before_expansion_bdev_size > 0 &&
+          before_expansion_bdev_size < bdev_label.size) {
+        // we grow the allocation range, must reflect it in the allocation file
+        size_t delta = bdev_label.size - before_expansion_bdev_size;
+        dout(10) << __func__ << " expanding allocator with 0x" << std::hex
+                 << before_expansion_bdev_size << "~" << delta
+                 << std::dec << dendl;
+        alloc->init_add_free(before_expansion_bdev_size,
+                             delta);
+        need_to_destage_allocation_file = true;
+      }
     } else {
       // This must mean that we had an unplanned shutdown and didn't manage to destage the allocator
       dout(0) << __func__ << "::NCB::restore_allocator() failed! Run Full Recovery from ONodes (might take a while) ..." << dendl;
@@ -7544,13 +7560,6 @@ int BlueStore::_init_alloc()
 	derr << __func__ << "::NCB::If no HW fault is found, please report failure and consider redeploying OSD" << dendl;
 	return -ENOTRECOVERABLE;
       }
-    }
-    if (before_expansion_bdev_size > 0 &&
-        before_expansion_bdev_size < bdev_label.size) {
-      // we grow the allocation range, must reflect it in the allocation file
-      alloc->init_add_free(before_expansion_bdev_size,
-                           bdev_label.size - before_expansion_bdev_size);
-      need_to_destage_allocation_file = true;    
     }
   }
   before_expansion_bdev_size = 0;
@@ -7681,12 +7690,13 @@ int BlueStore::_lock_fsid()
   return 0;
 }
 
-bool BlueStore::is_rotational()
+bool BlueStore::_is_main_rotational()
 {
   if (bdev) {
     return bdev->is_rotational();
   }
 
+  // Do open main devicet if not yet opened.
   bool rotational = true;
   int r = _open_path();
   if (r < 0)
@@ -7713,43 +7723,77 @@ bool BlueStore::is_rotational()
   return rotational;
 }
 
+bool BlueStore::is_rotational()
+{
+  return _use_rotational_settings();
+}
+
 bool BlueStore::is_journal_rotational()
 {
   if (!bluefs) {
-    dout(5) << __func__ << " bluefs disabled, default to store media type"
+    dout(5) << __func__ << " bluefs disabled, default to main device type"
             << dendl;
-    return is_rotational();
+    return _use_rotational_settings();
   }
-  dout(10) << __func__ << " " << (int)bluefs->wal_is_rotational() << dendl;
-  return bluefs->wal_is_rotational();
+  if (cct->_conf->bluestore_debug_enforce_settings == "ssd" ||
+             cct->_conf->bluestore_debug_enforce_settings == "hybrid") {
+    dout(10) << __func__ << " overriden to ssd mode." << dendl;
+    return false;
+  }
+  bool r = bluefs->wal_is_rotational();
+  dout(10) << __func__ << " " << (int)r << dendl;
+  return r;
 }
 
 bool BlueStore::is_db_rotational()
 {
   if (!bluefs) {
-    dout(5) << __func__ << " bluefs disabled, default to store media type"
+    dout(5) << __func__ << " bluefs disabled, default to main device type"
             << dendl;
-    return is_rotational();
+    return _use_rotational_settings();
   }
-  dout(10) << __func__ << " " << (int)bluefs->db_is_rotational() << dendl;
-  return bluefs->db_is_rotational();
+  if (cct->_conf->bluestore_debug_enforce_settings == "ssd" ||
+             cct->_conf->bluestore_debug_enforce_settings == "hybrid") {
+    dout(10) << __func__ << " overriden to ssd mode." << dendl;
+    return false;
+  }
+  bool r = bluefs->db_is_rotational();
+  dout(10) << __func__ << " " << (int)r << dendl;
+  return r;
 }
 
 bool BlueStore::_use_rotational_settings()
 {
-  if (cct->_conf->bluestore_debug_enforce_settings == "hdd") {
-    return true;
-  }
   if (cct->_conf->bluestore_debug_enforce_settings == "ssd") {
+    dout(10) << __func__ << " overriden to ssd." << dendl;
     return false;
   }
-  return bdev->is_rotational();
+  if (cct->_conf->bluestore_debug_enforce_settings == "hybrid") {
+    dout(10) << __func__ << " overriden to hdd." << dendl;
+    return true;
+  }
+  bool r = _is_main_rotational();
+  dout(0) << __func__ << " returns " << r << dendl;
+  return r;
 }
 
 bool BlueStore::is_statfs_recoverable() const
 {
   // abuse fm for now
   return has_null_manager();
+}
+
+bool BlueStore::_alloc_recovery_tolerates_corruption() const
+{
+  auto level = cct->_conf.get_val<std::string>(
+    "bluestore_accept_corrupted_onode_recovery");
+  if (level == "never") {
+    return false;
+  }
+  // "read-only": only the fsck analysis path may skip undecodable onodes.
+  // Its recovered allocation is never destaged, so a skipped onode cannot
+  // wrongly free its blocks.
+  return alloc_recovery_policy == alloc_recovery_policy_t::tolerate_corrupt_onodes;
 }
 
 bool BlueStore::test_mount_in_use()
@@ -7967,8 +8011,12 @@ int BlueStore::_is_bluefs(bool create, bool* ret)
 * opens both DB and dependant super_meta, FreelistManager and allocator
 * in the proper order
 */
-int BlueStore::_open_db_and_around(bool read_only, bool to_repair)
+int BlueStore::_open_db_and_around(bool read_only, bool to_repair,
+                                   alloc_recovery_policy_t policy)
 {
+  alloc_recovery_policy = policy;
+  alloc_recovery_skipped_onodes = 0;
+
   dout(5) << __func__ << "::NCB::read_only=" << read_only << ", to_repair=" << to_repair << dendl;
   {
     string type;
@@ -9972,8 +10020,15 @@ void BlueStore::_fsck_foreach_shared_blob(
 	       << dendl;
 
       OnodeRef o;
-      o.reset(Onode::create_decode(c, oid, it->key(), it->value(), false, segment_size != 0));
-      o->extent_map.fault_range(db, 0, OBJECT_MAX_SIZE);
+      try {
+        bluestore_decode::throwing_guard g;
+        o.reset(Onode::create_decode(c, oid, it->key(), it->value(), false, segment_size != 0));
+        o->extent_map.fault_range(db, 0, OBJECT_MAX_SIZE);
+      } catch (const ceph::buffer::error& e) {
+        derr << "fsck error: " << oid << " corrupted onode encoding: "
+             << e.what() << dendl;
+        continue;     // already reported by the shallow pass; skip here
+      }
 
       _dump_onode<30>(cct, *o);
 
@@ -10128,13 +10183,25 @@ BlueStore::OnodeRef BlueStore::fsck_check_objects_shallow(
 
   dout(10) << __func__ << "  " << oid << dendl;
   OnodeRef o;
-  o.reset(Onode::create_decode(c, oid, key, value, false, segment_size != 0));
+  try {
+    bluestore_decode::throwing_guard g;
+    o.reset(Onode::create_decode(c, oid, key, value, false, segment_size != 0));
+    o->extent_map.fault_range(db, 0, OBJECT_MAX_SIZE);
+  } catch (const ceph::buffer::error& e) {
+    derr << "fsck error: " << oid << " corrupted onode encoding: "
+         << e.what() << dendl;
+    ++errors;
+    // NOTE(https://tracker.ceph.com/issues/77325): report-only. Physically
+    // removing the onode key would orphan its blocks — the extent map is
+    // undecodable, so fsck can't reclaim them (leaked extents + statfs drift).
+    // Removal/logical -EIO reclamation is the follow-up.
+    return OnodeRef();
+  }
   ++num_objects;
   ++pool_fsck_stat->num_objects;
   num_spanning_blobs += o->extent_map.spanning_blob_map.size();
-
-  o->extent_map.fault_range(db, 0, OBJECT_MAX_SIZE);
   _dump_onode<30>(cct, *o);
+
   // shards
   if (!o->extent_map.shards.empty()) {
     ++num_sharded_objects;
@@ -10895,7 +10962,10 @@ void BlueStore::_fsck_check_objects(
       }
 
       if (depth != FSCK_SHALLOW) {
-        ceph_assert(o != nullptr);
+        if (!o) {
+          // corrupted onode encoding: reported and skipped by the shallow check
+          continue;
+        }
         if (o->onode.nid) {
           if (o->onode.nid > nid_max) {
             derr << "fsck error: " << oid << " nid " << o->onode.nid
@@ -11048,7 +11118,10 @@ int BlueStore::_fsck(BlueStore::FSCKDepth depth, bool repair, bluestore_stats_t 
 
   // in deep mode we need R/W write access to be able to replay deferred ops
   const bool read_only = !(repair || depth == FSCK_DEEP);
-  int r = _open_db_and_around(read_only);
+  int r = _open_db_and_around(read_only, false,
+    read_only ? alloc_recovery_policy_t::tolerate_corrupt_onodes
+              : alloc_recovery_policy_t::strict);
+
   if (r < 0) {
     return r;
   }
@@ -11115,6 +11188,11 @@ int BlueStore::_fsck_on_open(BlueStore::FSCKDepth depth, bool repair, bluestore_
           << " start sb_tracker_hash_size:" << sb_hash_size
           << dendl;
   int64_t errors = 0;
+  if (uint64_t skipped = alloc_recovery_skipped_onodes.load(); skipped > 0) {
+    derr << __func__ << " " << skipped
+         << " onode(s) skipped during allocation recovery" << dendl;
+    errors += skipped;
+  }
   int64_t warnings = 0;
   unsigned repaired = 0;
 
@@ -11529,9 +11607,15 @@ int BlueStore::_fsck_on_open(BlueStore::FSCKDepth depth, bool repair, bluestore_
 	dout(20) << __func__ << " check misreference for col:" << c->cid
 		  << " obj:" << oid << dendl;
 
-        OnodeRef o;
-        o.reset(Onode::create_decode(c, oid, it->key(), it->value(), false, segment_size != 0));
-	o->extent_map.fault_range(db, 0, OBJECT_MAX_SIZE);
+  OnodeRef o;
+  try {
+    bluestore_decode::throwing_guard g;
+    o.reset(Onode::create_decode(c, oid, it->key(), it->value(), false, segment_size != 0));
+    o->extent_map.fault_range(db, 0, OBJECT_MAX_SIZE);
+  } catch (const ceph::buffer::error& e) {
+    derr << "fsck error: " << oid << " corrupted onode encoding: " << e.what() << dendl;
+    continue;
+  }
 	mempool::bluestore_fsck::set<BlobRef> blobs;
 
 	for (auto& e : o->extent_map.extent_map) {
@@ -15014,11 +15098,13 @@ void BlueStore::_txc_committed_kv(TransContext *txc)
     mono_clock::now() - txc->start,
     cct->_conf->bluestore_log_op_age,
     [&](auto lat) {
+      bool v = cct->_conf->bluestore_log_op_verbose_kv_txc;
       return ", txc = " + stringify(txc) +
              ", txc bytes = " + stringify(txc->bytes) +
              ", txc ios = " + stringify(txc->ios) +
              ", txc cost = " + stringify(txc->cost) +
              ", txc onodes = " + stringify(txc->onodes.size()) +
+             ", DB ops = '" + stringify(txc->t->get_summary_string(v)) + "'"
              ", DB updates = " + stringify(txc->t->get_count()) +
              ", DB bytes = " + stringify(txc->t->get_size_bytes()) +
              ", cost max = " + stringify(throttle.bytes_observed_max) +
@@ -18325,10 +18411,18 @@ int BlueStore::_do_remove(
     nogen.hobj.snap = CEPH_NOSNAP;
   OnodeRef h = c->get_onode(nogen, false);
 
-  if (!h || !h->exists) {
-    return 0;
+  if (h && h->exists) {
+    return _maybe_unshare_on_remove(txc, c, h, std::move(maybe_unshared_blobs));
   }
+  return 0;
+}
 
+int BlueStore::_maybe_unshare_on_remove(
+  TransContext *txc,
+  CollectionRef& c,
+  OnodeRef& h,
+  std::set<SharedBlob*>&& maybe_unshared_blobs)
+{
   //Populate the extent map structure from DB; required for shared blob processing below.
   h->extent_map.fault_range(db, 0, h->onode.size);
   // Set maybe_unshared_blobs contains those shared blobs that have all nref=1.
@@ -18341,33 +18435,29 @@ int BlueStore::_do_remove(
   // that is not yet loaded! We must have had inspected it to even check nrefs.
   dout(20) << __func__ << " checking for unshareable blobs on " << h
 	   << " " << h->oid << dendl;
-  map<SharedBlob*,bluestore_extent_ref_map_t> expect;
+  map<const Blob*, bluestore_extent_ref_map_t> expect;
   for (auto& e : h->extent_map.extent_map) {
-    const bluestore_blob_t& b = e.blob->get_blob();
-    SharedBlob *sb = e.blob->get_shared_blob().get();
-    if (b.is_shared() &&
-	sb->loaded &&
-	maybe_unshared_blobs.count(sb)) {
-      if (b.is_compressed()) {
-	expect[sb].get(0, b.get_ondisk_size());
-      } else {
-	// todo: it seems to be an overkill to go through map()
-	b.map(e.blob_offset, e.length, [&](uint64_t off, uint64_t len) {
-	    expect[sb].get(off, len);
-	    return 0;
-	  });
+    const Blob* B = e.blob.get();
+    const bluestore_blob_t& b = B->get_blob();
+    SharedBlob *sb = B->get_shared_blob().get();
+    if (b.is_shared() && sb->loaded && maybe_unshared_blobs.count(sb)) {
+      for (const auto& e: b.get_extents()) {
+        if (e.is_valid()) {
+          expect[B].get(e.offset, e.length);
+        }
       }
+      maybe_unshared_blobs.erase(sb);
     }
   }
 
   // expect has now refs set exactly as .head is using it
   vector<SharedBlob*> unshared_blobs;
-  unshared_blobs.reserve(maybe_unshared_blobs.size());
-  for (auto& p : expect) {
-    dout(20) << " ? " << *p.first << " vs " << p.second << dendl;
-    if (p.first->persistent->ref_map == p.second) {
+  unshared_blobs.reserve(expect.size());
+  for (const auto& [B, expect_refs] : expect) {
+    SharedBlob* sb = B->get_shared_blob().get();
+    dout(20) << __func__ << " ? " << *sb << " vs " << expect_refs << dendl;
+    if (sb->persistent->ref_map == expect_refs) {
       // yup, .head is only one that is using the shared blob now
-      SharedBlob *sb = p.first;
       dout(20) << __func__ << "  unsharing " << *sb << dendl;
       unshared_blobs.push_back(sb);
       txc->unshare_blob(sb);
@@ -20786,7 +20876,7 @@ void BlueStore::ExtentDecoderPartial::_consume_new_blob(bool spanning,
   auto &blob = b->get_blob();
   if(spanning) {
     dout(20) << __func__ << " " << spanning << " " << b->id << dendl;
-    ceph_assert(b->id >= 0);
+    ceph_assert_decode(b->id >= 0);
     spanning_blobs[b->id] = b;
     ++stats.spanning_blob_count;
   } else {
@@ -20855,7 +20945,7 @@ void BlueStore::ExtentDecoderPartial::consume_blobid(Extent* le,
   dout(20) << __func__ << " " << spanning << " " << blobid << dendl;
   auto &map = spanning ? spanning_blobs : blobs;
   auto it = map.find(blobid);
-  ceph_assert(it != map.end());
+  ceph_assert_decode(it != map.end());
   per_pool_statfs->stored() += le->length;
   if (it->second->get_blob().is_compressed()) {
     per_pool_statfs->compressed_original() += le->length;
@@ -20893,6 +20983,8 @@ void BlueStore::ExtentDecoderPartial::reset(const ghobject_t _oid,
 
 int BlueStore::read_allocation_from_onodes(SimpleBitmap *sbmap, read_alloc_stats_t& stats)
 {
+  const bool tolerate = _alloc_recovery_tolerates_corruption();
+
   sb_info_space_efficient_map_t sb_info;
   // iterate over all shared blobs
   auto it = db->get_iterator(PREFIX_SHARED_BLOB, KeyValueDB::ITERATOR_NOCACHE);
@@ -20948,6 +21040,11 @@ int BlueStore::read_allocation_from_onodes(SimpleBitmap *sbmap, read_alloc_stats
                                 sb_info,
                                 min_alloc_size_order);
 
+  // Tolerate undecodable onodes only when the caller opted in; only read-only
+  // fsck does, since its recovered allocation is never destaged. Every other
+  // caller aborts as before.
+  bool current_onode_valid = false;
+
   // iterate over all ONodes stored in RocksDB
   for (it->lower_bound(string()); it->valid(); it->next(), kv_count++) {
     // trace an even after every million processed objects (typically every 5-10 seconds)
@@ -20968,12 +21065,23 @@ int BlueStore::read_allocation_from_onodes(SimpleBitmap *sbmap, read_alloc_stats
       }
       edecoder.reset(oid,
         &stats.actual_pool_vstatfs[oid.hobj.get_logical_pool()]);
-      Onode dummy_on(cct);
-      Onode::decode_raw(&dummy_on,
-        it->value(),
-        edecoder,
-        segment_size != 0);
-      ++stats.onode_count;
+      current_onode_valid = false;
+      try {
+        bluestore_decode::throwing_guard g(tolerate);
+        Onode dummy_on(cct);
+        Onode::decode_raw(&dummy_on,
+          it->value(),
+          edecoder,
+          segment_size != 0);
+        current_onode_valid = true;
+        ++stats.onode_count;
+      } catch (const ceph::buffer::error& e) {
+        if (!tolerate) { throw; }
+        ++alloc_recovery_skipped_onodes;
+        derr << __func__ << " skipping undecodable onode "
+             << pretty_binary_string(key) << ": " << e.what() << dendl;
+        continue;
+      }
     } else {
       uint32_t offset;
       int r = get_key_extent_shard(key, &okey, &offset);
@@ -20990,14 +21098,22 @@ int BlueStore::read_allocation_from_onodes(SimpleBitmap *sbmap, read_alloc_stats
              << dendl;
         return -EIO;
       }
-      if (oid != edecoder.get_oid()) {
+      if (!current_onode_valid || oid != edecoder.get_oid()) {
         derr << __func__ << " shard " << pretty_binary_string(okey)
              << " oid: " << oid
-             << " not from current oid: " << edecoder.get_oid() << dendl;
+             << " without a valid current onode" << dendl;
         continue;
       }
-      edecoder.decode_some(it->value(), nullptr);
-      ++stats.shard_count;
+      try {
+        bluestore_decode::throwing_guard g(tolerate);
+        edecoder.decode_some(it->value(), nullptr);
+        ++stats.shard_count;
+      } catch (const ceph::buffer::error& e) {
+        if (!tolerate) { throw; }
+        derr << __func__ << " skipping undecodable extent shard "
+             << pretty_binary_string(key) << ": " << e.what() << dendl;
+        continue;
+      }
     }
   }
   return 0;
