@@ -12,6 +12,7 @@
  *
  */
 
+#include "attr_frame.hpp"
 #include "id_meta.hpp"
 #include "id_tag.hpp"
 #include "object_value.hpp"
@@ -166,6 +167,37 @@ void test_is_delete_marker_flag()
   assert(value.has_extended_attrs());
 }
 
+void test_has_child_keys_covers_every_child_type()
+{
+  kvrgw::ObjectValue value;
+  assert(!value.has_child_keys());
+  for (uint8_t flag : {kvrgw::ObjectValue::kFlagExtendedAttrs,
+                       kvrgw::ObjectValue::kFlagExternalTags,
+                       kvrgw::ObjectValue::kFlagExternalAnnotations}) {
+    value.hdr.flags = flag;
+    assert(value.has_child_keys());
+  }
+  value.hdr.flags =
+      kvrgw::ObjectValue::kFlagFenced | kvrgw::ObjectValue::kFlagSharedData;
+  assert(!value.has_child_keys());
+}
+
+void test_gc_header_for_copies_flags()
+{
+  kvrgw::ObjectValue value;
+  value.hdr.chunk.type = kvrgw::CHUNK_STORAGE;
+  value.hdr.flags = kvrgw::ObjectValue::kFlagExternalTags |
+                    kvrgw::ObjectValue::kFlagSharedData;
+  value.hdr.size = 4096;
+  value.hdr.last_modified_sec = 1700000000;
+
+  const auto gc = kvrgw::gc_header_for(value);
+  assert(gc.chunk.type == kvrgw::CHUNK_STORAGE);
+  assert(gc.flags == value.hdr.flags);
+  assert(gc.object_size == 4096);
+  assert(gc.mtime == 1700000000);
+}
+
 void test_child_value_header_layout()
 {
   kvrgw::ChildValueHeader hdr{};
@@ -254,6 +286,86 @@ void test_inline_metadata_frame_roundtrip()
   assert(meta[0].second == "blue");
 }
 
+void test_write_object_value_roundtrip_and_overflow()
+{
+  kvrgw::ObjectValue value;
+  std::memset(value.hdr.ref_tag, 0x11, 12);
+  value.hdr.size = 7;
+  value.hdr.chunk.type = kvrgw::CHUNK_INLINE;
+  value.inline_data.assign(7, 0x42);
+  value.content_type = "application/octet-stream";
+
+  kvrgw::OValueBuf buf;
+  assert(kvrgw::write_object_value(buf, value));
+  assert(buf.len == sizeof(kvrgw::ObjectValueHeader) +
+                        value.content_type.size() + 7);
+  const auto parsed = kvrgw::parse_object_value(buf.view());
+  assert(parsed);
+  assert(parsed->inline_data == value.inline_data);
+  assert(parsed->content_type == value.content_type);
+
+  // A metadata count without a frame is a caller bug, not a valid value.
+  value.hdr.metadata_count = 1;
+  kvrgw::OValueBuf no_frame;
+  assert(!kvrgw::write_object_value(no_frame, value));
+
+  // Anything past the 1024 B record cap is rejected, never truncated.
+  value.hdr.metadata_count = 0;
+  value.inline_data.assign(kvrgw::kMaxOValueBytes, 0x42);
+  value.hdr.size = value.inline_data.size();
+  kvrgw::OValueBuf too_big;
+  assert(!kvrgw::write_object_value(too_big, value));
+}
+
+void test_inline_attr_frame_after_metadata()
+{
+  std::array<uint8_t, kvrgw::MAX_META_FRAME_BYTES> meta{};
+  size_t meta_size = 0;
+  const kvrgw::MetaPair mp{"color", "blue"};
+  assert(kvrgw::encode_metadata(std::span<const kvrgw::MetaPair>(&mp, 1),
+                                meta, meta_size));
+  const kvrgw::AttrPair attrs[] = {{"manifest", std::string(200, 'm')}};
+  std::vector<uint8_t> frame;
+  assert(kvrgw::encode_attr_frame(attrs, frame));
+
+  kvrgw::ObjectValue value;
+  value.hdr.chunk.type = kvrgw::CHUNK_STORAGE;
+  value.hdr.metadata_count = 1;
+  value.metadata_frame.assign(meta.data(), meta.data() + meta_size);
+  value.hdr.flags = kvrgw::ObjectValue::kFlagInlineAttrs;
+  value.attr_frame = frame;
+
+  kvrgw::OValueBuf buf;
+  assert(kvrgw::write_object_value(buf, value));
+  const auto parsed = kvrgw::parse_object_value(buf.view());
+  assert(parsed);
+  assert(parsed->has_inline_attrs());
+  assert(!parsed->has_extended_attrs());
+  assert(parsed->metadata_frame == value.metadata_frame);
+  assert(parsed->attr_frame == frame);
+  // The metadata view is unaffected by the frame that follows it.
+  assert(kvrgw::object_inline_metadata_bytes(buf.view()).size() == meta_size);
+
+  // Both placement bits at once is corrupt, on write and on read.
+  value.hdr.flags |= kvrgw::ObjectValue::kFlagExtendedAttrs;
+  kvrgw::OValueBuf both;
+  assert(!kvrgw::write_object_value(both, value));
+  std::string raw(buf.view());
+  raw[49] = static_cast<char>(kvrgw::ObjectValue::kFlagInlineAttrs |
+                              kvrgw::ObjectValue::kFlagExtendedAttrs);
+  assert(!kvrgw::parse_object_value(raw));
+
+  // Extended placement keeps the record free of the frame.
+  value.hdr.flags = kvrgw::ObjectValue::kFlagExtendedAttrs;
+  kvrgw::OValueBuf ext;
+  assert(kvrgw::write_object_value(ext, value));
+  assert(ext.len == buf.len - frame.size());
+  const auto parsed_ext = kvrgw::parse_object_value(ext.view());
+  assert(parsed_ext);
+  assert(parsed_ext->has_extended_attrs());
+  assert(parsed_ext->attr_frame.empty());
+}
+
 void test_child_d_header_then_data()
 {
   const std::string data(32, 'x');
@@ -284,9 +396,13 @@ int main()
   test_bucket_value_versioning_state();
   test_object_value_header_version_fields();
   test_is_delete_marker_flag();
+  test_has_child_keys_covers_every_child_type();
+  test_gc_header_for_copies_flags();
   test_child_value_header_layout();
   test_tag_encode_exact_size();
   test_inline_metadata_frame_roundtrip();
+  test_write_object_value_roundtrip_and_overflow();
+  test_inline_attr_frame_after_metadata();
   test_child_d_header_then_data();
   std::cout << "object_value_test passed\n";
   return 0;

@@ -150,14 +150,25 @@ struct ObjectValue {
   std::string content_type;
   std::vector<uint8_t> inline_data;
   std::vector<uint8_t> metadata_frame;
+  // Internal attrs (attr_frame.hpp). Follows the metadata frame in the
+  // record when kFlagInlineAttrs is set; lives in C:<ref_tag>E child
+  // keys when kFlagExtendedAttrs is set. Never both.
+  std::vector<uint8_t> attr_frame;
 
   static constexpr uint8_t kFlagExtendedAttrs        = 0x01;
   static constexpr uint8_t kFlagFenced               = 0x02;
   static constexpr uint8_t kFlagSharedData           = 0x04;
   static constexpr uint8_t kFlagExternalTags         = 0x08;
   static constexpr uint8_t kFlagExternalAnnotations  = 0x10;
+  static constexpr uint8_t kFlagInlineAttrs          = 0x20;
+
+  // Flags that mean the object owns keys under C:<ref_tag>.
+  static constexpr uint8_t kFlagChildKeys =
+      kFlagExtendedAttrs | kFlagExternalTags | kFlagExternalAnnotations;
 
   bool has_extended_attrs() const { return (hdr.flags & kFlagExtendedAttrs) != 0; }
+  bool has_inline_attrs() const { return (hdr.flags & kFlagInlineAttrs) != 0; }
+  bool has_child_keys() const { return (hdr.flags & kFlagChildKeys) != 0; }
   bool has_annotations() const { return hdr.annotations_count > 0; }
   bool has_external_annotations() const { return (hdr.flags & kFlagExternalAnnotations) && hdr.annotations_count > 0; }
   bool has_metadata() const { return hdr.metadata_count > 0; }
@@ -187,6 +198,17 @@ struct ObjectValue {
   uint8_t chunk_data_ref_tag[kRefTagSize]{};
 };
 
+// GC entries carry the object flags so the worker knows which child keys
+// and shared data the object owned.
+inline GcValueHeader gc_header_for(const ObjectValue& value) {
+  GcValueHeader hdr{};
+  hdr.chunk = value.hdr.chunk;
+  hdr.flags = value.hdr.flags;
+  hdr.object_size = value.hdr.size;
+  hdr.mtime = value.hdr.last_modified_sec;
+  return hdr;
+}
+
 struct BucketValue {
   bucket_id_t bucket_id{};
   int64_t created_at_unix{};
@@ -196,6 +218,7 @@ struct BucketValue {
 };
 
 std::optional<ObjectValue> parse_object_value(std::string_view data);
+bool write_object_value(OValueBuf& buf, const ObjectValue& value);
 std::span<const uint8_t> object_inline_metadata_bytes(std::string_view data);
 
 void child_hdr_to_be(ChildValueHeader& hdr);
@@ -208,6 +231,8 @@ std::string_view child_value_payload(std::string_view data, uint64_t payload_siz
 class KvTransaction;
 void decrement_or_del_child_d(KvTransaction& tr, std::string_view d_key,
                               uint64_t object_size, bool shared);
+void clear_child_keys(KvTransaction& tr, bucket_id_t bucket_id,
+                      std::string_view ref_tag);
 
 std::string make_bucket_value(bucket_id_t bucket_id, int64_t created_at_unix,
                               uint8_t access_flags = 0, VersioningState versioning_state = VERSIONING_DISABLED,

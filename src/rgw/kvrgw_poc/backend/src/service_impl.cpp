@@ -19,6 +19,7 @@
 #include "byte_range.hpp"
 #include "constants.hpp"
 #include "error_codes.hpp"
+#include "extended_attrs.hpp"
 #include "gc_value.hpp"
 #include "keys.hpp"
 #include "object_value.hpp"
@@ -174,47 +175,6 @@ bool is_valid_bucket_name(std::string_view name)
 }
 
 } // namespace
-
-bool write_object_value(OValueBuf &buf, const ObjectValue &value)
-{
-  ObjectValueHeader wire = value.hdr;
-  wire.content_type_len = static_cast<uint8_t>(value.content_type.size());
-  hdr_to_be(wire);
-  if (!buf.set_header(wire)) {
-    return false;
-  }
-  if (!buf.append(value.content_type.data(), value.content_type.size())) {
-    return false;
-  }
-  if (value.hdr.chunk.type == CHUNK_INLINE && !value.inline_data.empty()) {
-    if (!buf.append(value.inline_data.data(), value.inline_data.size())) {
-      return false;
-    }
-  }
-  if (value.hdr.chunk.type == CHUNK_CHILD_D_REF) {
-    uint64_t bid_be = htobe64(value.chunk_data_bucket_id);
-    if (!buf.append(&bid_be, 8)) {
-      return false;
-    }
-    if (!buf.append(value.chunk_data_ref_tag, kRefTagSize)) {
-      return false;
-    }
-  }
-  else if (value.hdr.chunk.type == CHUNK_STORAGE_REF) {
-    if (!buf.append(value.chunk_data_ref_tag, kRefTagSize)) {
-      return false;
-    }
-  }
-  if (value.hdr.metadata_count > 0) {
-    if (value.metadata_frame.empty()) {
-      return false;
-    }
-    if (!buf.append(value.metadata_frame.data(), value.metadata_frame.size())) {
-      return false;
-    }
-  }
-  return true;
-}
 
 // --- BatchCommitQueue ---
 
@@ -1409,19 +1369,19 @@ KvRgwServiceImpl::load_object(bucket_id_t bucket_id,
   return parse_object_value(**value);
 }
 
-std::expected<std::optional<KvRgwServiceImpl::LoadResult>, fdb_error_t>
+std::expected<std::optional<KvRgwServiceImpl::LoadResult>, KvrgwErrorCode>
 KvRgwServiceImpl::load_object_with_data(bucket_id_t bucket_id,
                                         const std::string &object_name)
 {
   auto tr_result = store_.begin_transaction();
   if (!tr_result) {
-    return std::unexpected(tr_result.error());
+    return std::unexpected(fdb_to_error(tr_result.error()));
   }
   auto &tr = *tr_result;
   const auto key = make_object_key(bucket_id, object_name);
   auto raw = tr->kv_get(key.view());
   if (!raw) {
-    return std::unexpected(raw.error());
+    return std::unexpected(fdb_to_error(raw.error()));
   }
   if (!*raw) {
     return std::nullopt;
@@ -1433,6 +1393,21 @@ KvRgwServiceImpl::load_object_with_data(bucket_id_t bucket_id,
 
   LoadResult result;
   result.value = std::move(*obj);
+
+  if (result.value.has_extended_attrs()) {
+    const std::string_view ref_sv(
+        reinterpret_cast<const char *>(result.value.hdr.ref_tag), kRefTagSize);
+    auto frame = read_extended_attrs(*tr, bucket_id, ref_sv);
+    if (!frame) {
+      return std::unexpected(fdb_to_error(frame.error()));
+    }
+    if (!*frame) {
+      // The chunks commit with the record, so a torn set is corruption,
+      // not a missing object.
+      return std::unexpected(KVRGW_ERR_CORRUPT_VALUE);
+    }
+    result.value.attr_frame = std::move(**frame);
+  }
 
   if (result.value.hdr.chunk.type == CHUNK_INLINE) {
     result.data.assign(result.value.inline_data.begin(),
@@ -1456,7 +1431,7 @@ KvRgwServiceImpl::load_object_with_data(bucket_id_t bucket_id,
     const auto d_key = make_d_key(d_bucket, st, ref_sv, mtime);
     auto d_val = tr->kv_get(d_key.view());
     if (!d_val) {
-      return std::unexpected(d_val.error());
+      return std::unexpected(fdb_to_error(d_val.error()));
     }
     if (!*d_val) {
       return std::nullopt;
@@ -1493,12 +1468,7 @@ bool KvRgwServiceImpl::move_object_to_g(KvTransaction &tr,
 
   if (must_defer_to_gc) {
     const auto go_key = make_go_key(*parts, ref_tag_sv, value.hdr.size);
-    GcValueHeader gc_hdr{};
-    gc_hdr.chunk = value.hdr.chunk;
-    gc_hdr.flags = value.hdr.flags;
-    gc_hdr.object_size = value.hdr.size;
-    gc_hdr.mtime = value.hdr.last_modified_sec;
-    tr.kv_put(go_key.view(), make_gc_value(gc_hdr));
+    tr.kv_put(go_key.view(), make_gc_value(gc_header_for(value)));
     tr.kv_del(object_key);
   }
   else {
@@ -1520,14 +1490,8 @@ bool KvRgwServiceImpl::move_object_to_g(KvTransaction &tr,
                                value.has_shared_data());
     }
 
-    if (value.has_external_tags()) {
-      const auto ct_key = make_ct_key(parts->bucket_id, ref_tag_sv);
-      tr.kv_del(ct_key.view());
-    }
-    if (value.has_extended_attrs()) {
-      const auto ce_key = make_c_prefix(parts->bucket_id, ref_tag_sv);
-      const auto ce_end = std::string(ce_key.view()) + "\xFF";
-      tr.kv_range_clear(ce_key.view(), ce_end);
+    if (value.has_child_keys()) {
+      clear_child_keys(tr, parts->bucket_id, ref_tag_sv);
     }
 
     tr.kv_del(object_key);
@@ -1556,37 +1520,40 @@ KvRgwServiceImpl::compute_new_version(VersioningState versioning_state,
   }
 }
 
-void KvRgwServiceImpl::displace_old_object(KvTransaction &tr,
-                                           VersioningState versioning_state,
-                                           std::string_view object_key,
-                                           const ObjectValue &old_o)
+KvrgwErrorCode
+KvRgwServiceImpl::displace_old_object(KvTransaction &tr,
+                                      VersioningState versioning_state,
+                                      std::string_view object_key,
+                                      const ObjectValue &old_o)
 {
   if (versioning_state == VERSIONING_ENABLED) {
     const auto parts = parse_object_key(object_key);
     if (!parts) {
       move_object_to_g(tr, object_key, old_o);
-      return;
+      return KVRGW_ERR_OK;
     }
     const auto v_key =
         make_v_key(parts->bucket_id, parts->object_name, old_o.hdr.version_id);
     OValueBuf vbuf;
-    if (write_object_value(vbuf, old_o)) {
-      tr.kv_put(v_key.view(), vbuf.view());
+    if (!write_object_value(vbuf, old_o)) {
+      return KVRGW_ERR_VALUE_TOO_LARGE;
     }
+    tr.kv_put(v_key.view(), vbuf.view());
   }
   else if (versioning_state == VERSIONING_SUSPENDED) {
     const auto parts = parse_object_key(object_key);
     if (!parts) {
       move_object_to_g(tr, object_key, old_o);
-      return;
+      return KVRGW_ERR_OK;
     }
     if (old_o.hdr.version_id != kNullVersion) {
       const auto v_key = make_v_key(parts->bucket_id, parts->object_name,
                                     old_o.hdr.version_id);
       OValueBuf vbuf;
-      if (write_object_value(vbuf, old_o)) {
-        tr.kv_put(v_key.view(), vbuf.view());
+      if (!write_object_value(vbuf, old_o)) {
+        return KVRGW_ERR_VALUE_TOO_LARGE;
       }
+      tr.kv_put(v_key.view(), vbuf.view());
     }
     else {
       move_object_to_g(tr, object_key, old_o);
@@ -1608,12 +1575,7 @@ void KvRgwServiceImpl::displace_old_object(KvTransaction &tr,
 
         if (must_defer) {
           const auto go_key = make_go_key(*parts, ref_sv, null_obj->hdr.size);
-          GcValueHeader gc_hdr{};
-          gc_hdr.chunk = null_obj->hdr.chunk;
-          gc_hdr.flags = null_obj->hdr.flags;
-          gc_hdr.object_size = null_obj->hdr.size;
-          gc_hdr.mtime = null_obj->hdr.last_modified_sec;
-          tr.kv_put(go_key.view(), make_gc_value(gc_hdr));
+          tr.kv_put(go_key.view(), make_gc_value(gc_header_for(*null_obj)));
         }
         else {
           const uint8_t st = d_size_tier_from_size(null_obj->hdr.size);
@@ -1635,14 +1597,8 @@ void KvRgwServiceImpl::displace_old_object(KvTransaction &tr,
                                      null_obj->has_shared_data());
           }
 
-          if (null_obj->has_external_tags()) {
-            const auto ct_key = make_ct_key(parts->bucket_id, ref_sv);
-            tr.kv_del(ct_key.view());
-          }
-          if (null_obj->has_extended_attrs()) {
-            const auto ce_key = make_c_prefix(parts->bucket_id, ref_sv);
-            const auto ce_end = std::string(ce_key.view()) + "\xFF";
-            tr.kv_range_clear(ce_key.view(), ce_end);
+          if (null_obj->has_child_keys()) {
+            clear_child_keys(tr, parts->bucket_id, ref_sv);
           }
         }
       }
@@ -1652,6 +1608,7 @@ void KvRgwServiceImpl::displace_old_object(KvTransaction &tr,
   else {
     move_object_to_g(tr, object_key, old_o);
   }
+  return KVRGW_ERR_OK;
 }
 
 std::expected<KvRgwServiceImpl::DeleteContext, KvrgwErrorCode>
@@ -1768,14 +1725,21 @@ KvRgwServiceImpl::delete_apply(KvTransaction &tr, DeleteContext &ctx,
     if (!old_parsed) {
       return result;
     }
-    displace_old_object(tr, VERSIONING_DISABLED, ctx.object_key, *old_parsed);
+    if (auto ec = displace_old_object(tr, VERSIONING_DISABLED, ctx.object_key,
+                                      *old_parsed);
+        ec != KVRGW_ERR_OK) {
+      return std::unexpected(ec);
+    }
     return result;
 
   case VERSIONING_ENABLED:
   case VERSIONING_SUSPENDED: {
     if (old_parsed) {
-      displace_old_object(tr, bucket_state.versioning_state, ctx.object_key,
-                          *old_parsed);
+      if (auto ec = displace_old_object(tr, bucket_state.versioning_state,
+                                        ctx.object_key, *old_parsed);
+          ec != KVRGW_ERR_OK) {
+        return std::unexpected(ec);
+      }
     }
     auto ids = compute_new_version(bucket_state.versioning_state,
                                    old_parsed ? &*old_parsed : nullptr);
@@ -2216,7 +2180,10 @@ KvRgwServiceImpl::put_finalize(KvTransaction &tr, PutContext &ctx,
           return KVRGW_ERR_OK;
         }
         if (ev) {
-          displace_old_object(tr, vs, ctx.object_key.view(), *ev);
+          if (auto ec = displace_old_object(tr, vs, ctx.object_key.view(), *ev);
+              ec != KVRGW_ERR_OK) {
+            return ec;
+          }
         }
       }
     }
@@ -2230,7 +2197,10 @@ KvRgwServiceImpl::put_finalize(KvTransaction &tr, PutContext &ctx,
           return KVRGW_ERR_OK;
         }
         if (ev) {
-          displace_old_object(tr, vs, ctx.object_key.view(), *ev);
+          if (auto ec = displace_old_object(tr, vs, ctx.object_key.view(), *ev);
+              ec != KVRGW_ERR_OK) {
+            return ec;
+          }
         }
       }
     }
@@ -2256,6 +2226,12 @@ KvRgwServiceImpl::put_finalize(KvTransaction &tr, PutContext &ctx,
     if (!params.tags.empty()) {
       apply_tags_to_value(params.value, params.tags, tr, params.bucket_id,
                           ref_tag_view(params.ref_tag));
+    }
+
+    if (auto ec = place_attr_frame(params.value, tr, params.bucket_id,
+                                   ref_tag_view(params.ref_tag));
+        ec != KVRGW_ERR_OK) {
+      return ec;
     }
 
     OValueBuf vbuf;
@@ -2312,7 +2288,11 @@ KvRgwServiceImpl::put_finalize(KvTransaction &tr, PutContext &ctx,
   }
 
   if (old_parsed) {
-    displace_old_object(tr, vs, ctx.object_key.view(), *old_parsed);
+    if (auto ec =
+            displace_old_object(tr, vs, ctx.object_key.view(), *old_parsed);
+        ec != KVRGW_ERR_OK) {
+      return ec;
+    }
   }
 
   auto ids = compute_new_version(vs, old_parsed ? &*old_parsed : nullptr);
@@ -2330,6 +2310,12 @@ KvRgwServiceImpl::put_finalize(KvTransaction &tr, PutContext &ctx,
   if (!params.tags.empty()) {
     apply_tags_to_value(params.value, params.tags, tr, params.bucket_id,
                         ref_tag_view(params.ref_tag));
+  }
+
+  if (auto ec = place_attr_frame(params.value, tr, params.bucket_id,
+                                 ref_tag_view(params.ref_tag));
+      ec != KVRGW_ERR_OK) {
+    return ec;
   }
 
   OValueBuf vbuf;
@@ -2926,41 +2912,22 @@ KvrgwErrorCode KvRgwServiceImpl::delete_object_version(
         return ec;
       }
 
+      // Frees data and child keys and deletes O:; the promote below
+      // rewrites O: in the same transaction when a version remains.
+      if (!move_object_to_g(*tr, object_key.view(), *current)) {
+        return KVRGW_ERR_CORRUPT_VALUE;
+      }
+
       if (!v_scan->empty()) {
         auto promoted = parse_object_value(v_scan->front().value);
         if (promoted) {
           promoted->hdr.next_vid = current->hdr.next_vid;
           OValueBuf pbuf;
-          if (write_object_value(pbuf, *promoted)) {
-            tr->kv_put(object_key.view(), pbuf.view());
+          if (!write_object_value(pbuf, *promoted)) {
+            return KVRGW_ERR_VALUE_TOO_LARGE;
           }
+          tr->kv_put(object_key.view(), pbuf.view());
           tr->kv_del(std::string_view(v_scan->front().key));
-        }
-      }
-      else {
-        tr->kv_del(object_key.view());
-      }
-
-      if (current->has_data()) {
-        const auto parts = parse_object_key(object_key.view());
-        if (parts) {
-          const std::string_view ref_sv(
-              reinterpret_cast<const char *>(current->hdr.ref_tag), 12);
-          if (current->hdr.chunk.type == CHUNK_CHILD_D) {
-            const uint8_t st = d_size_tier_from_size(current->hdr.size);
-            const uint32_t mtime =
-                static_cast<uint32_t>(current->hdr.last_modified_sec);
-            const auto d_key = make_d_key(parts->bucket_id, st, ref_sv, mtime);
-            tr->kv_del(d_key.view());
-          }
-          else if (current->hdr.chunk.type == CHUNK_STORAGE) {
-            const auto go_key = make_go_key(*parts, ref_sv, current->hdr.size);
-            GcValueHeader gc_hdr{};
-            gc_hdr.chunk = current->hdr.chunk;
-            gc_hdr.object_size = current->hdr.size;
-            gc_hdr.mtime = current->hdr.last_modified_sec;
-            tr->kv_put(go_key.view(), make_gc_value(gc_hdr));
-          }
         }
       }
     }
@@ -3000,17 +2967,13 @@ KvrgwErrorCode KvRgwServiceImpl::delete_object_version(
           return KVRGW_ERR_PRECONDITION_FAILED;
         }
       }
-      if (v_entry && v_entry->has_data()) {
+      if (v_entry && (v_entry->has_data() || v_entry->has_child_keys())) {
         const auto parts = parse_object_key(object_key.view());
         if (parts) {
           const std::string_view ref_sv(
               reinterpret_cast<const char *>(v_entry->hdr.ref_tag), 12);
           const auto go_key = make_go_key(*parts, ref_sv, v_entry->hdr.size);
-          GcValueHeader gc_hdr{};
-          gc_hdr.chunk = v_entry->hdr.chunk;
-          gc_hdr.object_size = v_entry->hdr.size;
-          gc_hdr.mtime = v_entry->hdr.last_modified_sec;
-          tr->kv_put(go_key.view(), make_gc_value(gc_hdr));
+          tr->kv_put(go_key.view(), make_gc_value(gc_header_for(*v_entry)));
         }
       }
       tr->kv_del(v_key.view());
@@ -3659,6 +3622,16 @@ KvrgwErrorCode KvRgwServiceImpl::copy_object(const CopyObjectRequest &req,
               reinterpret_cast<const char *>(src.hdr.ref_tag), kRefTagSize);
           apply_tags_to_value(src, req.tags, *tr, dst_bucket_id, src_ref_sv);
         }
+        // Inline attrs are in memory and may no longer fit next to the
+        // new metadata. Extended attrs stay where they are.
+        if (src.has_inline_attrs()) {
+          const std::string_view attr_ref_sv(
+              reinterpret_cast<const char *>(src.hdr.ref_tag), kRefTagSize);
+          if (auto ec = place_attr_frame(src, *tr, dst_bucket_id, attr_ref_sv);
+              ec != KVRGW_ERR_OK) {
+            return ec;
+          }
+        }
         OValueBuf buf;
         if (!write_object_value(buf, src)) {
           return KVRGW_ERR_INTERNAL;
@@ -3709,6 +3682,27 @@ KvrgwErrorCode KvRgwServiceImpl::copy_object(const CopyObjectRequest &req,
     else {
       new_value.hdr.metadata_count = src.hdr.metadata_count;
       new_value.metadata_frame = src.metadata_frame;
+    }
+
+    // Internal attrs always travel with the copy.
+    new_value.attr_frame = src.attr_frame;
+    if (src.has_extended_attrs()) {
+      const std::string_view attr_ref_sv(
+          reinterpret_cast<const char *>(src.hdr.ref_tag), kRefTagSize);
+      auto frame = read_extended_attrs(*tr, src_bucket_id, attr_ref_sv);
+      if (!frame) {
+        auto ec = fdb_to_error(frame.error());
+        if (is_retriable(ec)) {
+          std::this_thread::sleep_for(
+              std::chrono::milliseconds(10 * (attempt + 1)));
+          continue;
+        }
+        return ec;
+      }
+      if (!*frame) {
+        return KVRGW_ERR_CORRUPT_VALUE;
+      }
+      new_value.attr_frame = std::move(**frame);
     }
 
     // --- Data sharing by tier ---
@@ -3763,9 +3757,10 @@ KvrgwErrorCode KvRgwServiceImpl::copy_object(const CopyObjectRequest &req,
       if (!src.has_shared_data()) {
         src.hdr.flags |= ObjectValue::kFlagSharedData;
         OValueBuf src_buf;
-        if (write_object_value(src_buf, src)) {
-          tr->kv_put(src_entry_key, src_buf.view());
+        if (!write_object_value(src_buf, src)) {
+          return KVRGW_ERR_VALUE_TOO_LARGE;
         }
+        tr->kv_put(src_entry_key, src_buf.view());
       }
 
       new_value.hdr.chunk.type = CHUNK_CHILD_D_REF;
@@ -3814,9 +3809,10 @@ KvrgwErrorCode KvRgwServiceImpl::copy_object(const CopyObjectRequest &req,
 
         src.hdr.flags |= ObjectValue::kFlagSharedData;
         OValueBuf src_buf;
-        if (write_object_value(src_buf, src)) {
-          tr->kv_put(src_entry_key, src_buf.view());
+        if (!write_object_value(src_buf, src)) {
+          return KVRGW_ERR_VALUE_TOO_LARGE;
         }
+        tr->kv_put(src_entry_key, src_buf.view());
       }
 
       new_value.hdr.chunk.type = CHUNK_STORAGE_REF;
@@ -3862,13 +3858,25 @@ KvrgwErrorCode KvRgwServiceImpl::copy_object(const CopyObjectRequest &req,
 
     // --- Displace destination + versioning ---
     if (dst_parsed) {
-      displace_old_object(*tr, vb->versioning_state, dst_o_key.view(),
-                          *dst_parsed);
+      if (auto ec = displace_old_object(*tr, vb->versioning_state,
+                                        dst_o_key.view(), *dst_parsed);
+          ec != KVRGW_ERR_OK) {
+        return ec;
+      }
     }
     auto ids = compute_new_version(vb->versioning_state,
                                    dst_parsed ? &*dst_parsed : nullptr);
     new_value.hdr.version_id = ids.version_id;
     new_value.hdr.next_vid = ids.next_vid;
+
+    {
+      const std::string_view dst_ref_sv(
+          reinterpret_cast<const char *>(new_value.hdr.ref_tag), kRefTagSize);
+      if (auto ec = place_attr_frame(new_value, *tr, dst_bucket_id, dst_ref_sv);
+          ec != KVRGW_ERR_OK) {
+        return ec;
+      }
+    }
 
     // --- Write destination O: ---
     OValueBuf dst_buf;
@@ -3948,7 +3956,7 @@ KvrgwErrorCode KvRgwServiceImpl::load_object_for_read(
     if (load_kv_data) {
       auto current_res = load_object_with_data(bucket_id, object_name);
       if (!current_res) {
-        return fdb_to_error(current_res.error());
+        return current_res.error();
       }
       if (*current_res && (*current_res)->value.hdr.version_id == target_vid) {
         return accept(std::move((*current_res)->value),
@@ -3981,6 +3989,18 @@ KvrgwErrorCode KvRgwServiceImpl::load_object_for_read(
     auto v_obj = parse_object_value(**v_raw);
     if (!v_obj) {
       return KVRGW_ERR_CORRUPT_VALUE;
+    }
+    if (load_kv_data && v_obj->has_extended_attrs()) {
+      const std::string_view ref_sv(
+          reinterpret_cast<const char *>(v_obj->hdr.ref_tag), kRefTagSize);
+      auto frame = read_extended_attrs(*tr, bucket_id, ref_sv);
+      if (!frame) {
+        return fdb_to_error(frame.error());
+      }
+      if (!*frame) {
+        return KVRGW_ERR_CORRUPT_VALUE;
+      }
+      v_obj->attr_frame = std::move(**frame);
     }
 
     std::string data;
@@ -4024,7 +4044,7 @@ KvrgwErrorCode KvRgwServiceImpl::load_object_for_read(
   if (load_kv_data) {
     auto result_res = load_object_with_data(bucket_id, object_name);
     if (!result_res) {
-      return fdb_to_error(result_res.error());
+      return result_res.error();
     }
     if (!*result_res) {
       return KVRGW_ERR_NO_SUCH_KEY;

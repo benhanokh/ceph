@@ -185,7 +185,6 @@ class TierConfigState;
 
 class KvRgwGrpcService;
 
-bool write_object_value(OValueBuf& buf, const ObjectValue& value);
 void apply_tags_to_value(ObjectValue& obj, std::span<const uint8_t> encoded,
                          KvTransaction& tr, bucket_id_t bucket_id,
                          std::string_view ref_tag);
@@ -523,7 +522,7 @@ class KvRgwServiceImpl final {
   std::expected<std::optional<ObjectValue>, fdb_error_t>
   load_object(bucket_id_t bucket_id, const std::string& object_name);
 
-  std::expected<std::optional<LoadResult>, fdb_error_t>
+  std::expected<std::optional<LoadResult>, KvrgwErrorCode>
   load_object_with_data(bucket_id_t bucket_id, const std::string& object_name);
 
   KvrgwErrorCode load_object_for_read(
@@ -545,7 +544,7 @@ class KvRgwServiceImpl final {
 
   NewVersionIds compute_new_version(VersioningState versioning_state, const ObjectValue* old_o);
 
-  void displace_old_object(
+  KvrgwErrorCode displace_old_object(
       KvTransaction& tr,
       VersioningState versioning_state,
       std::string_view object_key,
