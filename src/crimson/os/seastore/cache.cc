@@ -3,6 +3,7 @@
 
 #include "crimson/os/seastore/cache.h"
 
+#include <cstdint>
 #include <sstream>
 #include <string_view>
 
@@ -37,7 +38,9 @@ Cache::Cache(
       crimson::common::get_conf<Option::size_t>(
         "seastore_data_delta_based_overwrite") > 0),
     force_backref(crimson::common::get_conf<bool>(
-        "seastore_logical_bucket_cache_test_stress")),
+        "seastore_lbc_test_stress")),
+    laddr_index(laddr_extent_index_t::bucket_traits(
+        laddr_index_buckets, LADDR_INDEX_BUCKETS)),
     pinboard(create_extent_pinboard(
       crimson::common::get_conf<Option::size_t>(
        "seastore_cachepin_size_pershard"),
@@ -78,7 +81,7 @@ CachedExtentRef Cache::retire_absent_extent_addr_by_type(
     return retire_absent_extent_addr<omap_manager::OMapLeafNode>(
       t, laddr, addr, length, std::move(extent_init_func));
   case extent_types_t::COLL_BLOCK:
-    return retire_absent_extent_addr<collection_manager::CollectionNode>(
+    return retire_absent_extent_addr<collection_manager::FlatCollectionNode>(
       t, laddr, addr, length, std::move(extent_init_func));
   case extent_types_t::TEST_BLOCK_PHYSICAL:
     return retire_absent_extent_addr<TestBlockPhysical>(
@@ -187,6 +190,41 @@ void Cache::register_metrics(store_index_t store_index)
   }
 
   /*
+   * laddr_lookups: logical extents read by laddr
+   * laddr_index_hits: of those, found in the laddr index without an LBA walk
+   */
+  for (auto& [src, src_label] : labels_by_src) {
+    auto& lookups_by_ext = get_by_src(stats.laddr_lookups_by_src_ext, src);
+    auto& hits_by_ext = get_by_src(stats.laddr_index_hits_by_src_ext, src);
+    for (auto& [ext, ext_label] : labels_by_ext) {
+      if (!is_logical_type(ext)) {
+        continue;
+      }
+      std::vector<sm::label_instance> merged_labels = src_label;
+      merged_labels.insert(merged_labels.end(), ext_label.begin(), ext_label.end());
+      metrics.add_group(
+        "cache",
+        {
+          sm::make_counter(
+            "laddr_lookups",
+            get_by_ext(lookups_by_ext, ext),
+            sm::description("total number of logical extents read by laddr, "
+                            "including retried attempts"),
+            merged_labels
+          ),
+          sm::make_counter(
+            "laddr_index_hits",
+            get_by_ext(hits_by_ext, ext),
+            sm::description("total number of laddr lookups served by the "
+                            "laddr index without an lba walk"),
+            merged_labels
+          ),
+        }
+      );
+    }
+  }
+
+  /*
    * cache_query: cache_access and cache_hit
    */
   metrics.add_group(
@@ -256,6 +294,28 @@ void Cache::register_metrics(store_index_t store_index)
       stats.read_hit_cold,
       sm::description("the number of the lbc misses of data reads"),
       {sm::label_instance("shard_store_index", std::to_string(store_index))}),
+  #ifdef CRIMSON_DETAILED_SAMPLING
+    sm::make_counter(
+      "remap_bptr_copy",
+      stats.remap_bptr_copy,
+      sm::description("remap leftover buffer deep-copied to page-aligned ptr"),
+      {sm::label_instance("shard_store_index", std::to_string(store_index))}),
+    sm::make_counter(
+      "remap_bptr_skip",
+      stats.remap_bptr_skip,
+      sm::description("remap leftover buffer already page-aligned, copy skipped"),
+      {sm::label_instance("shard_store_index", std::to_string(store_index))}),
+    sm::make_counter(
+      "exist_mutate_bptr_copy",
+      stats.exist_mutate_bptr_copy,
+      sm::description("EXIST_CLEAN mutate buffer deep-copied to page-aligned ptr"),
+      {sm::label_instance("shard_store_index", std::to_string(store_index))}),
+    sm::make_counter(
+      "exist_mutate_bptr_skip",
+      stats.exist_mutate_bptr_skip,
+      sm::description("EXIST_CLEAN mutate buffer already unique+aligned, copy skipped"),
+      {sm::label_instance("shard_store_index", std::to_string(store_index))}),
+  #endif
   });
 
   {
@@ -977,6 +1037,7 @@ void Cache::commit_retire_extent(
   remove_extent(ref, &t_src);
 
   ref->dirty_from = JOURNAL_SEQ_NULL;
+  laddr_index_erase(ref);
   invalidate_extent(t, *ref);
 }
 
@@ -1043,6 +1104,7 @@ void Cache::commit_replace_extent(
     add_to_dirty(next, &t_src);
   }
 
+  laddr_index_replace(next, prev);
   invalidate_extent(t, *prev);
 
 }
@@ -1127,8 +1189,21 @@ void Cache::mark_transaction_conflicted(
     }
     efforts.mutate_delta_bytes += delta_stat.bytes;
 
-    if (t.get_pending_ool()) {
-      t.get_pending_ool()->is_conflicted = true;
+    if (auto pending = t.get_pending_ool(); pending) {
+      // Extents of the in-flight write are freed in do_write().finally() on
+      // completion; the rest (other tiers, or already written) are not under
+      // I/O and are freed now.
+      pending->is_conflicted = true;
+      for (auto &e : t.pre_alloc_list) {
+        if (std::find(pending->pending_extents.begin(),
+                      pending->pending_extents.end(),
+                      e) != pending->pending_extents.end()) {
+          pending->deferred_frees.push_back(e);
+          epm.account_conflict_pending_free(e->get_paddr(), e->get_length());
+        } else {
+          epm.mark_space_free(e->get_paddr(), e->get_length());
+        }
+      }
     } else {
       for (auto &i: t.pre_alloc_list) {
 	epm.mark_space_free(i->get_paddr(), i->get_length());
@@ -1248,7 +1323,7 @@ CachedExtentRef Cache::alloc_remapped_extent_by_type(
     return alloc_remapped_extent<onode::SeastoreNodeExtent>(
       t, remap_laddr, remap_paddr, remap_offset, remap_length, original_bptr);
   case extent_types_t::COLL_BLOCK:
-    return alloc_remapped_extent<collection_manager::CollectionNode>(
+    return alloc_remapped_extent<collection_manager::FlatCollectionNode>(
       t, remap_laddr, remap_paddr, remap_offset, remap_length, original_bptr);
   case extent_types_t::OBJECT_DATA_BLOCK:
     return alloc_remapped_extent<ObjectDataBlock>(
@@ -1302,7 +1377,7 @@ CachedExtentRef Cache::alloc_new_non_data_extent_by_type(
     return alloc_new_non_data_extent<omap_manager::OMapLeafNode>(
       t, length, opt);
   case extent_types_t::COLL_BLOCK:
-    return alloc_new_non_data_extent<collection_manager::CollectionNode>(
+    return alloc_new_non_data_extent<collection_manager::FlatCollectionNode>(
       t, length, opt);
   case extent_types_t::TEST_BLOCK_PHYSICAL:
     return alloc_new_non_data_extent<TestBlockPhysical>(t, length, opt);
@@ -1352,6 +1427,59 @@ std::vector<CachedExtentRef> Cache::alloc_new_data_extents_by_type(
   }
 }
 
+ceph::bufferptr Cache::maybe_page_aligned_bptr(
+  const ceph::bufferptr &src,
+  extent_len_t offset,
+  extent_len_t length,
+  bool share_ok
+#ifdef CRIMSON_DETAILED_SAMPLING
+  , uint64_t &copy_counter
+  , uint64_t &skip_counter
+#endif
+  )
+{
+  LOG_PREFIX(Cache::maybe_page_aligned_bptr);
+  ceph_assert(offset + length <= src.length());
+
+  const auto block_size = get_block_size();
+  const auto page_size = CEPH_PAGE_SIZE;
+  auto *ptr = src.c_str() + offset;
+  const auto ptr_addr = reinterpret_cast<uintptr_t>(ptr);
+
+  // Sample nref before the slice: ptr(src, offset, length) shares the same
+  // raw and bumps the ref
+  const unsigned nref = src.raw_nref();
+  const bool unique = nref == 1;
+  ceph::bufferptr slice(src, offset, length);
+  const bool page_aligned =
+    slice.is_page_aligned() && slice.is_n_page_sized();
+  const bool skip = page_aligned && (share_ok || unique);
+
+  DEBUG("block_size=0x{:x} page_size=0x{:x} "
+        "src_ptr=0x{:x} ptr%block=0x{:x} ptr%page=0x{:x} "
+        "offset=0x{:x} len=0x{:x} nref={} share_ok={} "
+        "page_aligned={} skip={}",
+        block_size, page_size,
+        ptr_addr,
+        ptr_addr % block_size,
+        ptr_addr % page_size,
+        offset, length, nref, share_ok,
+        page_aligned, skip);
+
+  if (skip) {
+  #ifdef CRIMSON_DETAILED_SAMPLING
+    ++skip_counter;
+  #endif
+    return slice;
+  }
+#ifdef CRIMSON_DETAILED_SAMPLING
+  ++copy_counter;
+#endif
+  auto nbp = create_extent_ptr_rand(length);
+  src.copy_out(offset, length, nbp.c_str());
+  return nbp;
+}
+
 CachedExtentRef Cache::duplicate_for_write(
   Transaction &t,
   CachedExtentRef i) {
@@ -1375,14 +1503,20 @@ CachedExtentRef Cache::duplicate_for_write(
     i->version++;
     i->state = CachedExtent::extent_state_t::EXIST_MUTATION_PENDING;
     i->last_committed_crc = i->calc_crc32c();
-    if (needs_deepcopy_on_mutate_exist(i->get_type())) {
-      // deepcopy the buffer of exist clean extent beacuse it shares
-      // buffer with original clean extent.
-      auto bp = i->get_bptr();
-      auto nbp = ceph::bufferptr(buffer::create_page_aligned(bp.length()));
-      bp.copy_out(0, bp.length(), nbp.c_str());
-      i->set_bptr(std::move(nbp));
-    }
+    // EXIST_CLEAN extents may share a parent raw (e.g. remapped leftovers).
+    // Copy before mutating unless this ptr is already unique and page-aligned.
+    auto &bp = i->get_bptr();
+    auto nbp = maybe_page_aligned_bptr(
+      bp,
+      0,
+      bp.length(),
+      false /* share_ok: must not mutate a shared raw */
+#ifdef CRIMSON_DETAILED_SAMPLING
+      , stats.exist_mutate_bptr_copy
+      , stats.exist_mutate_bptr_skip
+#endif
+      );
+    i->set_bptr(std::move(nbp));
 
     t.add_mutated_extent(i);
     DEBUGT("duplicate existing extent {}", t, *i);
@@ -2139,6 +2273,12 @@ void Cache::complete_commit(
       i->invalidate_hints();
       add_extent(i);
       touch_extent_fully(*i, &t_src, t.get_cache_hint());
+      // index newly created onode/coll/log nodes so the first read by
+      // laddr can skip the LBA walk
+      if (is_laddr_indexed(i->get_type())) {
+        laddr_index_insert(
+          i->cast<LogicalCachedExtent>()->get_laddr(), i);
+      }
     }
     i->reset_prior_instance();
     i->complete_io();
@@ -2296,6 +2436,7 @@ void Cache::init()
     remove_extent(root, nullptr);
     root = nullptr;
   }
+  laddr_index_clear();
   root = CachedExtent::make_cached_extent_ref<RootBlock>();
   // Make it simpler to keep root dirty
   root->init(CachedExtent::extent_state_t::DIRTY,
@@ -2339,6 +2480,7 @@ Cache::close_ertr::future<> Cache::close()
        extents_index.size(),
        extents_index.get_bytes());
   root.reset();
+  laddr_index_clear();
   clear_dirty();
   backref_extents.clear();
   backref_entryrefs_by_seq.clear();
@@ -2698,7 +2840,7 @@ Cache::_get_absent_extent_by_type(
     break;
   case extent_types_t::COLL_BLOCK:
     ret = CachedExtent::make_cached_extent_ref<
-      collection_manager::CollectionNode>(length);
+      collection_manager::FlatCollectionNode>(length);
     break;
   case extent_types_t::ONODE_BLOCK_STAGED:
     ret = CachedExtent::make_cached_extent_ref<
@@ -2808,7 +2950,7 @@ Cache::do_get_caching_extent_by_type(
       return CachedExtentRef(extent.detach(), false /* add_ref */);
     });
   case extent_types_t::COLL_BLOCK:
-    return do_get_caching_extent<collection_manager::CollectionNode>(
+    return do_get_caching_extent<collection_manager::FlatCollectionNode>(
       offset, length, std::move(extent_init_func), std::move(on_cache), p_src
     ).safe_then([](auto extent) {
       return CachedExtentRef(extent.detach(), false /* add_ref */);

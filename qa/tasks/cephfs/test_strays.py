@@ -892,6 +892,86 @@ touch pin/placeholder
 
         self.await_data_pool_empty()
 
+    def test_stale_snap_remote_dentry_purging_stray(self):
+        """
+        That a stale remote snap dentry is not loaded and linked to a stray
+        inode that is being purged.
+
+        Unlinking a multiversion inode (here: a directory) that is covered by
+        a snapshot leaves a remote snap dentry (<name>_<snapid>) in the parent
+        dirfrag pointing at the stray. Once the snapshot is removed, that
+        dentry is stale. A partial (keyed) dirfrag fetch used to advance
+        fnode.snap_purged_thru without examining the snap keys, so a later
+        complete fetch skipped the stale check, loaded the stale remote dentry
+        and linked it to the purging stray -- tripping the get_num_ref() == 0
+        assert in MDCache::remove_inode().
+
+        See: https://tracker.ceph.com/issues/80206
+        """
+        self.fs.set_allow_new_snaps(True)
+        # Named lookups do keyed (partial) dirfrag fetches only, so that
+        # nothing but the scrub below fetches p/d's dirfrag completely.
+        self.config_set('mds', 'mds_dir_prefetch', False)
+
+        self.mount_a.run_shell(["mkdir", "-p", "p/d"])
+        d_ino = self.mount_a.path_to_ino("p/d")
+
+        # Hold the directory open to keep its stray from being purged until
+        # the test lets go of it.
+        p = self.mount_a.open_dir_background("p/d/sub")
+        self.mount_a.run_shell(["mkdir", "p/.snap/s1"])
+        self.mount_a.run_shell(["rmdir", "p/d/sub"])
+
+        # Commit p/d's dirfrag (with the remote snap dentry) and the stray's
+        # backtrace.
+        self.fs.rank_tell(["flush", "journal"])
+        snap_keys = [k for k in self.fs.list_dirfrag(d_ino)
+                     if k.startswith("sub_") and k != "sub_head"]
+        log.info(f"remote snap dentry keys: {snap_keys}")
+        self.assertEqual(len(snap_keys), 1)
+
+        # Fresh MDS: the stray is reloaded (pinned by the client's caps), the
+        # remote snap dentry is not in cache.
+        self.fs.rank_fail()
+        self.fs.wait_for_daemons()
+        gid = self.fs.get_rank()['gid']
+
+        # Make the remote snap dentry stale.
+        self.mount_a.run_shell(["rmdir", "p/.snap/s1"])
+        self.fs.rank_tell(["flush", "journal"])
+        self.assertEqual(self.get_mdc_stat("strays_enqueued"), 0)
+
+        # Keep the stray in its purge window: _purge_stray_purged() runs once
+        # the purge queue persists the item, but the purge_stray EUpdate is
+        # held back by the paused MDLog.
+        self.fs.rank_asok(["config", "set", "mds_log_pause", "true"])
+        try:
+            self.mount_a.kill_background(p)
+            self._wait_for_counter("mds_cache", "strays_enqueued", 1)
+
+            # Keyed fetch of p/d's dirfrag: the lookup of a name that never
+            # existed fails with ENOENT...
+            try:
+                self.fs.run_scrub(["start", "/p/d/missing"])
+            except CommandFailedError:
+                pass
+            # ... followed by a complete fetch.
+            self.fs.run_scrub(["start", "/p/d"])
+            self.assertTrue(self.fs.wait_until_scrub_complete(sleep=5, timeout=60))
+        finally:
+            self.fs.rank_asok(["config", "set", "mds_log_pause", "false"])
+
+        self.wait_until_equal(
+            lambda: self.get_mdc_stat("num_strays"),
+            expect_val=0, timeout=60
+        )
+        self.assertEqual(self.fs.get_rank()['gid'], gid)
+
+        # The stale remote snap dentry must have been purged from disk.
+        self.fs.rank_tell(["flush", "journal"])
+        self.assertEqual(
+            [k for k in self.fs.list_dirfrag(d_ino) if k in snap_keys], [])
+
     def test_fancy_layout(self):
         """
         purge stray file with fancy layout
@@ -1051,3 +1131,283 @@ touch pin/placeholder
         self.wait_until_equal(
         lambda: len(self.fs.rank_tell(["dump", "stray"])),
         expect_val=NUM_DIRS, timeout=60, period=1)
+
+    def test_kill_after_unlink_finish(self):
+        """
+        That MDS recovery does not crash in _eval_stray_remote when a
+        stale dentry on disk points to a stray inode with nlink == 0.
+
+        The MDS is killed via mds_kill_after_unlink_finish right after
+        _unlink_local_finish commits nlink=0 and moves the inode to the
+        stray directory, but before CDir::commit writes the directory
+        omap to RADOS.  On recovery, journal replay restores nlink=0
+        and the stray location, but stale dentry entries persist on disk
+        (omap not yet updated).  When these stale entries are loaded
+        during dirfrag fetch, they trigger eval_remote / _eval_stray_remote
+        on an inode with nlink == 0, which previously asserted nlink >= 1.
+
+        Tracker: https://tracker.ceph.com/issues/62663
+        """
+
+        # Create test files
+        self.mount_a.run_shell(["mkdir", "kill_unlink_test"])
+        self.mount_a.write_n_mb("kill_unlink_test/file_a", 1)
+
+        # Flush journal to ensure everything is on disk
+        self.fs.mds_asok(["flush", "journal"])
+
+        # Get rank info for later core dump cleanup
+        status = self.fs.status()
+        rank0 = self.fs.get_rank(rank=0, status=status)
+
+        # Set runtime-only kill config (lost on MDS crash, so restart
+        # picks up the default false).
+        self.fs.mds_asok(['config', 'set',
+                          'mds_kill_after_unlink_finish', "true"])
+
+        # Unlink the file: nlink drops to 0, inode goes to stray,
+        # _unlink_local_finish commits and then ceph_abort_msg() fires.
+        # Use wait=False because the MDS will crash and the command
+        # won't complete.
+        self.mount_a.run_shell([
+            "rm", "-f", "kill_unlink_test/file_a"], wait=False)
+
+        # Wait for the MDS to finish crashing.  The coredump is fully
+        # written before the rank is marked failed, so this also makes
+        # the subsequent delete_mds_coredump() deterministic.
+        self.fs.wait_for_death()
+
+        # Clean up the core dump left by the crash
+        self.delete_mds_coredump(rank0['name'])
+
+        # Restart the MDS.  The runtime kill config was lost during the
+        # crash, so the MDS will boot normally.  During recovery:
+        #   1. Journal replay restores nlink=0, inode in stray
+        #   2. Dirfrag fetch loads stale dentry from RADOS omap
+        #   3. link_remote → eval_remote → _eval_stray_remote
+        #   4. Fixed code returns early on nlink==0 instead of crashing
+        self.fs.mds_restart()
+        time.sleep(5)
+        self.fs.wait_for_daemons()
+
+        # Verify the filesystem is functional after recovery:
+        # create new files and verify they exist
+        self.mount_a.run_shell(["mkdir", "kill_unlink_recovery"])
+        self.mount_a.write_n_mb("kill_unlink_recovery/recovery_test", 1)
+        ls_out = set(self.mount_a.ls("kill_unlink_recovery/"))
+        self.assertIn("recovery_test", ls_out)
+
+        # Verify stale strays are eventually purged
+        self.wait_until_equal(
+            lambda: self.get_mdc_stat("num_strays"),
+            expect_val=0,
+            timeout=60
+        )
+
+        # Cleanup
+        self.mount_a.run_shell(["rm", "-rf", "kill_unlink_test"])
+        self.mount_a.run_shell(["rm", "-rf", "kill_unlink_recovery"])
+
+    def test_kill_after_unlink_finish_hardlink(self):
+        """
+        That MDS recovery handles stale type-'L' remote dentries on disk
+        after a hardlinked file is unlinked and the MDS crashes.
+
+        Unlike the simple unlink case (which leaves a stale type-'I'
+        primary dentry that is gracefully skipped as a duplicate inode),
+        a hardlinked file leaves a stale type-'L' remote dentry which
+        directly triggers link_remote -> eval_remote -> _eval_stray_remote
+        during dirfrag fetch.
+
+        A single crash cannot produce both a stale type-'L' entry and
+        nlink == 0 (the kill point fires after each individual unlink),
+        so this test uses two crash cycles:
+
+        Cycle 1: unlink primary (nlink 2->1), crash -> recovery loads
+        type-'L' stale dentry, _eval_stray_remote(nlink=1) is called;
+        verify the MDS did not crash and FS is healthy.
+
+        Cycle 2: unlink the remaining link (nlink 1->0), crash ->
+        recovery purges the nlink=0 stray and verifies FS health.
+        """
+
+        # Create test file and hardlink
+        self.mount_a.run_shell(["mkdir", "kill_unlink_hl_test"])
+        self.mount_a.write_n_mb("kill_unlink_hl_test/file_a", 1)
+        self.mount_a.run_shell([
+            "ln", "kill_unlink_hl_test/file_a",
+            "kill_unlink_hl_test/file_a_link"])
+
+        # Flush journal to ensure everything is on disk
+        self.fs.mds_asok(["flush", "journal"])
+
+        # Get rank info for later core dump cleanup
+        status = self.fs.status()
+        rank0 = self.fs.get_rank(rank=0, status=status)
+
+        # == Cycle 1: unlink primary (nlink 2->1), crash ==
+        self.fs.mds_asok(['config', 'set',
+                          'mds_kill_after_unlink_finish', "true"])
+
+        self.mount_a.run_shell([
+            "rm", "-f", "kill_unlink_hl_test/file_a"], wait=False)
+
+        # Wait for the MDS to finish crashing.  The coredump is fully
+        # written before the rank is marked failed, so this also makes
+        # the subsequent delete_mds_coredump() deterministic.
+        self.fs.wait_for_death()
+
+        # Clean up the core dump left by the crash
+        self.delete_mds_coredump(rank0['name'])
+
+        # Restart the MDS.  During recovery:
+        #  1. Journal replay: nlink=1, inode in stray (file_a was primary)
+        #  2. Dirfrag fetch loads stale type-'L' dentry for file_a_link
+        #  3. link_remote -> eval_remote -> _eval_stray_remote(nlink=1)
+        #  4. MDS reintegrates: file_a_link becomes the new primary
+        self.fs.mds_restart()
+        time.sleep(5)
+        self.fs.wait_for_daemons()
+
+        # Verify FS is functional after cycle 1 recovery: the MDS did
+        # not crash when loading the stale type-'L' OMAP entry during
+        # dirfrag fetch, and the surviving hardlink is still accessible.
+        # (reintegration may not have completed yet in vstart_runner,
+        # but that's fine — the primary goal is verifying no crash in
+        # _eval_stray_remote during recovery.)
+        self.mount_a.run_shell(["mkdir", "kill_unlink_hl_verify"])
+        self.mount_a.write_n_mb("kill_unlink_hl_verify/verify_file", 1)
+        ls_out = set(self.mount_a.ls("kill_unlink_hl_verify/"))
+        self.assertIn("verify_file", ls_out)
+        self.mount_a.run_shell(["rm", "-rf", "kill_unlink_hl_verify"])
+        self.fs.mds_asok(["flush", "journal"])
+
+        # == Cycle 2: unlink remaining primary (nlink 1->0), crash ==
+        self.fs.mds_asok(['config', 'set',
+                          'mds_kill_after_unlink_finish', "true"])
+
+        self.mount_a.run_shell([
+            "rm", "-f", "kill_unlink_hl_test/file_a_link"], wait=False)
+
+        # Wait for the MDS to finish crashing.  The coredump is fully
+        # written before the rank is marked failed, so this also makes
+        # the subsequent delete_mds_coredump() deterministic.
+        self.fs.wait_for_death()
+
+        # Clean up the core dump left by the crash
+        self.delete_mds_coredump(rank0['name'])
+
+        # Restart the MDS.  During recovery:
+        #  1. Journal replay: nlink=0, inode in stray
+        #  2. Dirfrag fetch loads stale type-'I' dentry -> duplicate
+        #     inode, gracefully skipped
+        #  3. _eval_stray purge path cleans up the stray
+        self.fs.mds_restart()
+        time.sleep(5)
+        self.fs.wait_for_daemons()
+
+        # Verify the filesystem is functional after cycle 2 recovery
+        self.mount_a.run_shell(["mkdir", "kill_unlink_hl_recovery"])
+        self.mount_a.write_n_mb("kill_unlink_hl_recovery/recovery_test", 1)
+        ls_out = set(self.mount_a.ls("kill_unlink_hl_recovery/"))
+        self.assertIn("recovery_test", ls_out)
+
+        # Verify all strays are eventually purged
+        self.wait_until_equal(
+            lambda: self.get_mdc_stat("num_strays"),
+            expect_val=0,
+            timeout=60
+        )
+
+        # Cleanup
+        self.mount_a.run_shell(["rm", "-rf", "kill_unlink_hl_test"])
+        self.mount_a.run_shell(["rm", "-rf", "kill_unlink_hl_recovery"])
+
+
+class TestStrayRenameRace(CephFSTestCase):
+    CLIENTS_REQUIRED = 4
+    MDSS_REQUIRED = 3
+
+    def test_rename_onto_shared_names_with_fragmentation(self):
+        """
+        That an MDS survives many clients renaming files onto the same
+        few names in one directory while that directory keeps being
+        split and merged.
+
+        A rename that replaces an existing file prepares a stray dentry
+        for the victim and caches it in the request.  When the request
+        then has to drop all its locks and wait (e.g. to auth pin a
+        source inode whose dirfrag is being fragmented), concurrent
+        renames may replace the victim, and the retried request used to
+        trip over the stray dentry cached for the old victim.
+
+        See: https://tracker.ceph.com/issues/79321
+        """
+
+        duration = 300
+        names = 8
+        writers = 16  # per client
+        readers = 2   # per client
+
+        self.fs.set_max_mds(2)
+        self.fs.wait_for_daemons()
+
+        self.config_set('mds', 'mds_bal_split_size', '10')
+        self.config_set('mds', 'mds_bal_merge_size', '2')
+        self.config_set('mds', 'mds_bal_fragment_interval', '1')
+        # debug_mds 20 slows the MDS down too much to hit the race.
+        self.config_set('mds', 'debug_mds', '10')
+
+        self.mount_a.run_shell(["mkdir", "shared"])
+        self.mount_a.run_shell_payload(
+            f"for k in $(seq 0 {names - 1}); do echo 0 > shared/f$k; done")
+
+        def rank_gids():
+            return {r['rank']: r['gid'] for r in self.fs.get_ranks()}
+
+        gids = rank_gids()
+
+        writer = dedent(f"""
+            end=$((SECONDS + {duration}))
+            n=0
+            while [ $SECONDS -lt $end ]; do
+                k=$((RANDOM % {names}))
+                t=shared/f$k.tmp.$$.$n
+                echo $n > $t && mv -f $t shared/f$k || exit 1
+                n=$((n + 1))
+            done
+        """)
+        reader = dedent(f"""
+            end=$((SECONDS + {duration}))
+            while [ $SECONDS -lt $end ]; do
+                cat shared/f$((RANDOM % {names})) > /dev/null || exit 1
+            done
+        """)
+
+        procs = []
+        for m in self.mounts:
+            for _ in range(writers):
+                procs.append(m.run_shell_payload(writer, wait=False,
+                                                 timeout=duration + 300))
+            for _ in range(readers):
+                procs.append(m.run_shell_payload(reader, wait=False,
+                                                 timeout=duration + 300))
+
+        # Fail early if an MDS aborts and a standby takes over.
+        end = time.time() + duration
+        while time.time() < end:
+            self.assertEqual(rank_gids(), gids)
+            time.sleep(5)
+
+        for p in procs:
+            p.stdin.close()
+            p.wait()
+
+        self.assertEqual(rank_gids(), gids)
+
+        splits = sum(self.fs.rank_asok(['perf', 'dump', 'mds'], rank=r)
+                     ['mds']['dir_split'] for r in gids)
+        log.info(f"directory splits during the run: {splits}")
+        self.assertGreater(splits, 0)
+
+        self.mount_a.run_shell(["rm", "-rf", "shared"])

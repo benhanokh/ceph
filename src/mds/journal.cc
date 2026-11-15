@@ -40,6 +40,7 @@
 #include "events/ESegment.h"
 #include "events/ELid.h"
 
+
 #include "include/denc.h"
 #include "include/random.h" // for ceph::util::generate_random_number()
 #include "include/stringify.h"
@@ -48,6 +49,7 @@
 
 #include "LogSegment.h"
 
+#include "MDSContext.h" // for MDSIOContext
 #include "MDSRank.h"
 #include "MDLog.h"
 #include "MDCache.h"
@@ -1368,6 +1370,12 @@ void EMetaBlob::replay(MDSRank *mds, LogSegmentRef const& logseg, int type, MDPe
 	dout(10) << "EMetaBlob.replay for [" << fb.dnfirst << "," << fb.dnlast << "] had " << *dn << dendl;
 	dn->first = fb.dnfirst;
 	ceph_assert(dn->last == fb.dnlast);
+
+        // check to see if dn altname is not set yet and journal has value
+        // this will occur when a crash happens during setting xattr ceph.alternate_name
+        if (dn->get_alternate_name().empty() && !fb.alternate_name.empty()) {
+          dn->set_alternate_name(mempool::mds_co::string(fb.alternate_name));
+        }
       }
       ceph_assert(dn->get_alternate_name() == fb.alternate_name);
       if (lump.is_importing())
@@ -3512,3 +3520,4 @@ bool EMetaBlob::rewrite_truncate_finish(MDSRank const *mds,
 
   return modified;
 }
+

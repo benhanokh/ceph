@@ -265,6 +265,8 @@ protected:
         erasure_code_profile);
     p->erasure_code_profile =
         "default";
+    p->ec_data_shard_count = k;
+    p->ec_coding_shard_count = m;
     p->set_flag(pg_pool_t::FLAG_EC_OVERWRITES);
     if (fast_ec) {
       p->nonprimary_shards.clear();
@@ -301,12 +303,11 @@ protected:
     setup_up_acting();
   }
 
-#if POOL_MIGRATION
   // Create a 2nd pool as an EC pool and set up migration from the old pool
-  void migrate_to_ec_pool(int k = 2, int m = 2, bool fast_ec = true)
+  // Test cases run on the target pool
+  void migrate_to_ec_pool_target(int k = 2, int m = 2, bool fast_ec = true)
   {
     uint64_t old_pool_id = pool_id;
-    int old_pool_size = pool_size;
     create_ec_pool(k, m, fast_ec);
     OSDMap::Incremental pending_inc(osdmap->get_epoch() + 1);
     const pg_pool_t *sp = osdmap->get_pg_pool(old_pool_id);
@@ -320,12 +321,20 @@ protected:
     spi->migrating_pgs.emplace(pg_t(0, old_pool_id));
     spi->lowest_migrated_pg = 1;
     apply_incremental(pending_inc);
+    setup_up_acting();
+  }
+
+  // Create a 2nd pool as an EC pool and set up migration from the old pool
+  // Test cases run on the source pool
+  void migrate_to_ec_pool_source(int k = 2, int m = 2, bool fast_ec = true)
+  {
+    uint64_t old_pool_id = pool_id;
+    int old_pool_size = pool_size;
+    migrate_to_ec_pool_target(k, m, fast_ec);
     // Reset to the source pool
     pool_id = old_pool_id;
     pool_size = old_pool_size;
-    setup_up_acting();
   }
-#endif
 
   // Helper to swap an OSD in the up and acting set
   void modify_up_acting(int offset, int osd)
@@ -363,6 +372,108 @@ protected:
     OSDMap::Incremental pending_inc(osdmap->get_epoch() + 1);
     pending_inc.pending_osd_state_set(osd, CEPH_OSD_UP);
     pending_inc.new_weight[osd] = CEPH_OSD_IN;
+    apply_incremental(pending_inc);
+  }
+
+  // ============================================================================
+  // Helpers for upmap and upmap_primary
+  // ============================================================================
+
+  // Helper to set pg_upmap for a PG
+  // upmap - vector of OSD IDs
+  void set_pg_upmap(const vector<int32_t>& upmap)
+  {
+    dout(0) << "= set_pg_upmap for pg " << pg_t(0, pool_id)
+            << " to " << upmap << " =" << dendl;
+
+    pg_t pgid(0, pool_id);
+
+    // Validate the mapping
+    int pool_min_size = osdmap->get_pg_pool_min_size(pgid);
+    ceph_assert((int)upmap.size() >= pool_min_size);
+
+    int pool_size = osdmap->get_pg_pool_size(pgid);
+    ceph_assert((int)upmap.size() <= pool_size);
+
+    // Verify all OSDs exist
+    for (auto osd : upmap) {
+      if (osd != CRUSH_ITEM_NONE) {
+        ceph_assert(osdmap->exists(osd));
+      }
+    }
+
+    OSDMap::Incremental pending_inc(osdmap->get_epoch() + 1);
+    pending_inc.fsid = osdmap->get_fsid();
+    pending_inc.new_pg_upmap[pgid] = mempool::osdmap::vector<int32_t>(
+      upmap.begin(), upmap.end());
+    apply_incremental(pending_inc);
+  }
+
+  // Helper to clear pg_upmap for a PG
+  void clear_pg_upmap()
+  {
+    dout(0) << "= clear_pg_upmap for pg " << pg_t(0, pool_id) << " =" << dendl;
+
+    pg_t pgid(0, pool_id);
+    OSDMap::Incremental pending_inc(osdmap->get_epoch() + 1);
+    pending_inc.fsid = osdmap->get_fsid();
+    pending_inc.old_pg_upmap.insert(pgid);
+    apply_incremental(pending_inc);
+  }
+
+  // Helper to set pg_upmap_primary for a PG
+  // primary_osd - OSD ID to set as primary
+  void set_pg_upmap_primary(int32_t primary_osd)
+  {
+    dout(0) << "= set_pg_upmap_primary for pg " << pg_t(0, pool_id)
+            << " to osd." << primary_osd << " =" << dendl;
+
+    pg_t pgid(0, pool_id);
+
+    // Verify this is a replicated pool
+    const pg_pool_t *pt = osdmap->get_pg_pool(pgid.pool());
+    ceph_assert(pt->is_replicated());
+
+    // Verify OSD exists
+    if (primary_osd != CRUSH_ITEM_NONE) {
+      ceph_assert(osdmap->exists(primary_osd));
+    }
+
+    // Get current acting set
+    vector<int> acting_osds;
+    int current_primary;
+    osdmap->pg_to_acting_osds(pgid, &acting_osds, &current_primary);
+
+    // Verify the new primary is in the acting set
+    int found_idx = 0;
+    for (int i = 0; i < (int)acting_osds.size(); i++) {
+      if (acting_osds[i] == primary_osd) {
+        found_idx = i;
+        break;
+      }
+    }
+    ceph_assert(found_idx > 0);
+
+    // Create new acting set with swapped primary
+    vector<int> new_acting(acting_osds);
+    new_acting[found_idx] = new_acting[0];
+    new_acting[0] = primary_osd;
+
+    OSDMap::Incremental pending_inc(osdmap->get_epoch() + 1);
+    pending_inc.fsid = osdmap->get_fsid();
+    pending_inc.new_pg_upmap_primary[pgid] = primary_osd;
+    apply_incremental(pending_inc);
+  }
+
+  // Helper to clear pg_upmap_primary for a PG
+  void clear_pg_upmap_primary()
+  {
+    dout(0) << "= clear_pg_upmap_primary for pg " << pg_t(0, pool_id) << " =" << dendl;
+
+    pg_t pgid(0, pool_id);
+    OSDMap::Incremental pending_inc(osdmap->get_epoch() + 1);
+    pending_inc.fsid = osdmap->get_fsid();
+    pending_inc.old_pg_upmap_primary.insert(pgid);
     apply_incremental(pending_inc);
   }
 
@@ -881,8 +992,7 @@ protected:
     get_ps(acting_primary)->handle_event(evt, get_ctx(acting_primary));
   }
 
-#if POOL_MIGRATION
-// Helper - migration done
+  // Helper - migration done
   void test_event_migration_done()
   {
     dout(0) << "= test_event_migration_done =" << dendl;
@@ -893,7 +1003,68 @@ protected:
 
     get_ps(acting_primary)->handle_event(evt, get_ctx(acting_primary));
   }
-#endif
+
+  // Helper - start pool migration on target
+  void test_event_start_target_pool_migration(int64_t num_bytes, int64_t num_objects)
+  {
+    dout(0) << "= test_event_start_target_pool_migration =" << dendl;
+    auto evt = std::make_shared<PGPeeringEvent>(
+      osdmap->get_epoch(),
+      osdmap->get_epoch(),
+      StartTargetPoolMigration(
+        num_bytes,
+        num_objects));
+
+    get_ps(acting_primary)->handle_event(evt, get_ctx(acting_primary));
+  }
+
+  // Helper - stop pool migration on target
+  void test_event_stop_target_pool_migration()
+  {
+    dout(0) << "= test_event_stop_target_pool_migration =" << dendl;
+    auto evt = std::make_shared<PGPeeringEvent>(
+      osdmap->get_epoch(),
+      osdmap->get_epoch(),
+      PeeringState::StopTargetPoolMigration());
+
+    get_ps(acting_primary)->handle_event(evt, get_ctx(acting_primary));
+  }
+
+  // Helper - stop pool migration on source - unfound object
+  void test_event_stop_pool_migration_unfound()
+  {
+    dout(0) << "= test_event_stop_pool_migration_unfound =" << dendl;
+    auto evt = std::make_shared<PGPeeringEvent>(
+      osdmap->get_epoch(),
+      osdmap->get_epoch(),
+      PeeringState::PoolMigrationStoppedUnfound());
+
+    get_ps(acting_primary)->handle_event(evt, get_ctx(acting_primary));
+  }
+
+  // Helper - stop pool migration on source - too full
+  void test_event_stop_pool_migration_toofull()
+  {
+    dout(0) << "= test_event_stop_pool_migration_toofull =" << dendl;
+    auto evt = std::make_shared<PGPeeringEvent>(
+      osdmap->get_epoch(),
+      osdmap->get_epoch(),
+      PeeringState::PoolMigrationStoppedTooFull());
+
+    get_ps(acting_primary)->handle_event(evt, get_ctx(acting_primary));
+  }
+
+  // Helper - stop pool migration on source - revoked
+  void test_event_stop_pool_migration_revoked()
+  {
+    dout(0) << "= test_event_stop_pool_migration_revoked =" << dendl;
+    auto evt = std::make_shared<PGPeeringEvent>(
+      osdmap->get_epoch(),
+      osdmap->get_epoch(),
+      PeeringState::PoolMigrationStoppedRevoked());
+
+    get_ps(acting_primary)->handle_event(evt, get_ctx(acting_primary));
+  }
 
   // Helper - run peering cycle with new epochs if required for upthru or pgtemp
   void test_peering()
@@ -924,9 +1095,7 @@ protected:
     EXPECT_TRUE(ps->is_clean());
     EXPECT_FALSE(ps->is_recovering());
     EXPECT_FALSE(ps->is_backfilling());
-#if POOL_MIGRATION
     EXPECT_FALSE(ps->is_migrating());
-#endif
   }
 
   // Helper - verify primary OSD is in active+recovering state
@@ -938,9 +1107,7 @@ protected:
     EXPECT_FALSE(ps->is_clean());
     EXPECT_TRUE(ps->is_recovering());
     EXPECT_FALSE(ps->is_backfilling());
-#if POOL_MIGRATION
     EXPECT_FALSE(ps->is_migrating());
-#endif
   }
 
   // Helper - verify primary OSD is in active+backfilling state
@@ -952,9 +1119,7 @@ protected:
     EXPECT_FALSE(ps->is_clean());
     EXPECT_FALSE(ps->is_recovering());
     EXPECT_TRUE(ps->is_backfilling());
-#if POOL_MIGRATION
     EXPECT_FALSE(ps->is_migrating());
-#endif
   }
 
   // Helper - verify primary OSD is in active+migrating state
@@ -966,9 +1131,7 @@ protected:
     EXPECT_FALSE(ps->is_clean());
     EXPECT_FALSE(ps->is_recovering());
     EXPECT_FALSE(ps->is_backfilling());
-#if POOL_MIGRATION
     EXPECT_TRUE(ps->is_migrating());
-#endif
   }
 
   // Helper - verify replica OSD is activated
@@ -1003,7 +1166,7 @@ protected:
   // identical - if identical is true, all logs should be identical
   //            if identical is false, all logs should be equivalent
   //            with differences only because of partial writes
-  void verify_logs(bool identical = false)
+  void verify_logs(bool identical = false, bool tails_different = false)
   {
     auto logp = get_ps(acting_primary)->get_pg_log();
     int shard = 0;
@@ -1016,12 +1179,24 @@ protected:
       auto log = get_ps(osd)->get_pg_log();
       // Head and tail should match
       EXPECT_EQ(log.get_head(), logp.get_head());
-      EXPECT_EQ(log.get_tail(), logp.get_tail());
+      if (!tails_different) {
+	EXPECT_EQ(log.get_tail(), logp.get_tail());
+      }
       auto pi = logp.get_log().log.begin();
       auto pe = logp.get_log().log.end();
       auto i = log.get_log().log.begin();
       auto e = log.get_log().log.end();
       while (pi != pe && i != e) {
+	if (tails_different && pi->version <= log.get_tail()) {
+	  // Primary log has older tail
+	  ++pi;
+	  continue;
+	}
+	if (tails_different && i->version <= logp.get_tail()) {
+	  // Log has older tail
+	  ++i;
+	  continue;
+	}
         if (pi->version < i->version && !pi->is_written_shard(shard_id_t(shard))) {
           // Primary may have partial write log entries that this
           // shard does not have because it was not written to
@@ -1150,7 +1325,6 @@ protected:
     verify_logs();
   }
 
-#if POOL_MIGRATION
   // Helper - verify all OSDs in active+migrating state with log checks
   void verify_all_active_migrating(const eversion_t& expected_update = eversion_t(),
                                 const eversion_t& expected_tail = eversion_t())
@@ -1170,7 +1344,6 @@ protected:
     }
     verify_logs();
   }
-#endif
 
   // Helper - verify PWLC state
   void verify_pwlc(epoch_t e,  std::map<shard_id_t,std::pair<eversion_t, eversion_t>> pwlc, int toosd = -1)
@@ -1826,12 +1999,11 @@ TEST_F(PeeringStateTest, Backfill) {
   verify_all_active_clean(expected, expected_tail);
 }
 
-#if POOL_MIGRATION
 // Multi-OSD test of peering with pool migration all the way to active+clean
 TEST_F(PeeringStateTest, PoolMigration) {
   dout(0) << "== PoolMigration ==" << dendl;
   // Configure pool migration to an EC pool
-  migrate_to_ec_pool();
+  migrate_to_ec_pool_source();
   // Init
   test_create_peering_state();
   test_init();
@@ -1839,6 +2011,11 @@ TEST_F(PeeringStateTest, PoolMigration) {
   // Full peering cycle
   test_peering();
   // Verify pool migration started
+  EXPECT_TRUE(get_listener(acting[0])->pool_migration_source_reserved);
+  // Remote reservations successful
+  get_ps(acting[0])->state_set(PG_STATE_MIGRATING);
+  get_ps(acting[0])->state_clear(PG_STATE_MIGRATION_TOOFULL);
+  get_ps(acting[0])->state_clear(PG_STATE_MIGRATION_WAIT);
   verify_all_active_migrating(eversion_t(), eversion_t());
   // Signal migration complete
   test_event_migration_done();
@@ -1846,38 +2023,60 @@ TEST_F(PeeringStateTest, PoolMigration) {
   verify_all_active_clean(eversion_t(), eversion_t());
   EXPECT_TRUE(get_listener(acting[0])->pg_migrated_pool_sent);
 }
-#endif
 
-#if POOL_MIGRATION
 // Multi-OSD test of peering with pool migration too full
 TEST_F(PeeringStateTest, PoolMigrationTooFull) {
-  dout(0) << "== PoolMigration ==" << dendl;
+  dout(0) << "== PoolMigrationTooFull ==" << dendl;
   // Configure pool migration to an EC pool
-  migrate_to_ec_pool();
+  migrate_to_ec_pool_target();
   // Init
   test_create_peering_state();
   test_init();
   test_event_initialize();
-  // Fail reservation on OSD 1
-  get_listener(acting[1])->inject_fail_reserve_recovery_space = true;
   // Full peering cycle
   test_peering();
+  // Verify that we got to active+clean
+  verify_all_active_clean(eversion_t(), eversion_t());
+
+  // Start target pool migration - Fail reservation on OSD 1
+  get_listener(acting[1])->inject_fail_reserve_recovery_space = true;
+  test_event_start_target_pool_migration(102400, 10);
+  dispatch_all();
+  // Verify that pool migration is stalled with too full
+  EXPECT_EQ(get_listener(acting[0])->events_scheduled, 0);
+  EXPECT_FALSE(get_listener(acting[0])->pool_migration_target_reserved);
+  EXPECT_TRUE(get_listener(acting[0])->pool_migration_target_suspended);
+  EXPECT_TRUE(get_listener(acting[0])->pool_migration_target_suspended_toofull);
+  EXPECT_TRUE(get_ps(acting[0])->state_test(PG_STATE_MIGRATION_TOOFULL));
+  EXPECT_EQ(get_listener(acting[0])->last_state_entered, "Started/Primary/Active/Clean");
+  EXPECT_EQ(get_listener(acting[1])->last_state_entered, "Started/ReplicaActive/RepNotRecovering");
+  EXPECT_EQ(get_listener(acting[2])->last_state_entered, "Started/ReplicaActive/RepNotRecovering");
+  EXPECT_EQ(get_listener(acting[3])->last_state_entered, "Started/ReplicaActive/RepNotRecovering");
+
+  // Try again - this time rety should be scheduled locally
+  get_listener(acting[0])->pool_migration_target_suspended = false;
+  test_event_start_target_pool_migration(102400, 10);
+  dispatch_all();
   // Verify that pool migration is stalled with too full
   EXPECT_EQ(get_listener(acting[0])->events_scheduled, 1);
+  EXPECT_FALSE(get_listener(acting[0])->pool_migration_target_reserved);
+  EXPECT_FALSE(get_listener(acting[0])->pool_migration_target_suspended);
   EXPECT_TRUE(get_ps(acting[0])->state_test(PG_STATE_MIGRATION_TOOFULL));
-  EXPECT_EQ(get_listener(acting[0])->last_state_entered, "Started/Primary/Active/NotMigrating");
+  EXPECT_EQ(get_listener(acting[0])->last_state_entered, "Started/Primary/Active/Clean");
   EXPECT_EQ(get_listener(acting[1])->last_state_entered, "Started/ReplicaActive/RepNotRecovering");
   EXPECT_EQ(get_listener(acting[2])->last_state_entered, "Started/ReplicaActive/RepNotRecovering");
   EXPECT_EQ(get_listener(acting[3])->last_state_entered, "Started/ReplicaActive/RepNotRecovering");
 
   // Fail reservation on OSD 2 as well
   get_listener(acting[2])->inject_fail_reserve_recovery_space = true;
-  dispatch_all_events(true); // run stalled schedule_after event to retry migration
+  dispatch_all_events(true);  // run stalled schedule_after event to retry migration
   dispatch_all();
   // Verify that pool migration is stalled with too full
   EXPECT_EQ(get_listener(acting[0])->events_scheduled, 2);
+  EXPECT_FALSE(get_listener(acting[0])->pool_migration_target_reserved);
+  EXPECT_FALSE(get_listener(acting[0])->pool_migration_target_suspended);
   EXPECT_TRUE(get_ps(acting[0])->state_test(PG_STATE_MIGRATION_TOOFULL));
-  EXPECT_EQ(get_listener(acting[0])->last_state_entered, "Started/Primary/Active/NotMigrating");
+  EXPECT_EQ(get_listener(acting[0])->last_state_entered, "Started/Primary/Active/Clean");
   EXPECT_EQ(get_listener(acting[1])->last_state_entered, "Started/ReplicaActive/RepNotRecovering");
   EXPECT_EQ(get_listener(acting[2])->last_state_entered, "Started/ReplicaActive/RepNotRecovering");
   EXPECT_EQ(get_listener(acting[3])->last_state_entered, "Started/ReplicaActive/RepNotRecovering");
@@ -1888,32 +2087,36 @@ TEST_F(PeeringStateTest, PoolMigrationTooFull) {
   dispatch_all_events(true);  // run stalled schedule_after event to retry migration
   dispatch_all();
   // Verify pool migration started
+  EXPECT_TRUE(get_listener(acting[0])->pool_migration_target_reserved);
+  EXPECT_FALSE(get_listener(acting[0])->pool_migration_target_suspended);
   verify_all_active_migrating(eversion_t(), eversion_t());
   // Signal migration complete
-  test_event_migration_done();
+  test_event_stop_target_pool_migration();
   // Verify that we got to active+clean
   verify_all_active_clean(eversion_t(), eversion_t());
-  EXPECT_TRUE(get_listener(acting[0])->pg_migrated_pool_sent);
 }
-#endif
 
-#if POOL_MIGRATION
 // Multi-OSD test of peering with pool migration reservtion preempt
-TEST_F(PeeringStateTest, PoolMigrationPrempt) {
+TEST_F(PeeringStateTest, PoolMigrationPreempt) {
   dout(0) << "== PoolMigration ==" << dendl;
   // Configure pool migration to an EC pool
-  migrate_to_ec_pool();
+  migrate_to_ec_pool_target();
   // Init
   test_create_peering_state();
   test_init();
   test_event_initialize();
-  // Keep preempt reservation event on OSD 1
-  get_listener(acting[1])->inject_keep_preempt = true;
   // Full peering cycle
   test_peering();
+  // Verify that we got to active+clean
+  verify_all_active_clean(eversion_t(), eversion_t());
+
+  // Start target pool migration - Keep preempt reservation event on OSD 1
+  get_listener(acting[1])->inject_keep_preempt = true;
+  test_event_start_target_pool_migration(102400, 10);
+  dispatch_all();
   // Verify pool migration started
   verify_all_active_migrating(eversion_t(), eversion_t());
-  EXPECT_EQ(get_listener(acting[0])->io_reservations_requested, 1);
+  EXPECT_EQ(get_listener(acting[0])->remote_recovery_reservations_requested, 1);
   EXPECT_EQ(get_listener(acting[1])->remote_recovery_reservations_requested, 1);
   EXPECT_EQ(get_listener(acting[2])->remote_recovery_reservations_requested, 1);
   EXPECT_EQ(get_listener(acting[3])->remote_recovery_reservations_requested, 1);
@@ -1921,21 +2124,30 @@ TEST_F(PeeringStateTest, PoolMigrationPrempt) {
   EXPECT_EQ(get_listener(acting[1])->stalled_events.size(), 1); // captured preempt event
   EXPECT_EQ(get_listener(acting[2])->stalled_events.size(), 0);
   EXPECT_EQ(get_listener(acting[3])->stalled_events.size(), 0);
-  EXPECT_EQ(get_listener(acting[0])->last_state_entered, "Started/Primary/Active/MigratingSource");
+  EXPECT_EQ(get_listener(acting[0])->last_state_entered, "Started/Primary/Active/MigratingTarget");
   EXPECT_EQ(get_listener(acting[1])->last_state_entered, "Started/ReplicaActive/RepRecovering");
   EXPECT_EQ(get_listener(acting[2])->last_state_entered, "Started/ReplicaActive/RepRecovering");
   EXPECT_EQ(get_listener(acting[3])->last_state_entered, "Started/ReplicaActive/RepRecovering");
-  dout(0) << "= PoolMigration prempt reservation osd 1 =" << dendl;
+  EXPECT_TRUE(get_listener(acting[0])->pool_migration_target_reserved);
+  EXPECT_FALSE(get_listener(acting[0])->pool_migration_target_suspended);
+  get_listener(acting[0])->pool_migration_target_reserved = false;
+  dout(0) << "= PoolMigration preempt reservation osd 1 =" << dendl;
   dispatch_all_events(true); // preempt reservation on OSD 1
-  EXPECT_EQ(get_listener(acting[0])->last_state_entered, "Started/Primary/Active/MigratingSource");
+  EXPECT_EQ(get_listener(acting[0])->last_state_entered, "Started/Primary/Active/MigratingTarget");
   EXPECT_EQ(get_listener(acting[1])->last_state_entered, "Started/ReplicaActive/RepNotRecovering");
   EXPECT_EQ(get_listener(acting[2])->last_state_entered, "Started/ReplicaActive/RepRecovering");
   EXPECT_EQ(get_listener(acting[3])->last_state_entered, "Started/ReplicaActive/RepRecovering");
-  // Keep preempt reservation event on OSD 2 as well
-  get_listener(acting[2])->inject_keep_preempt = true;
   dispatch_all();
-  verify_all_active_migrating(eversion_t(), eversion_t());
-  EXPECT_EQ(get_listener(acting[0])->io_reservations_requested, 2);
+  EXPECT_FALSE(get_listener(acting[0])->pool_migration_target_reserved);
+  EXPECT_TRUE(get_listener(acting[0])->pool_migration_target_suspended);
+  EXPECT_FALSE(get_listener(acting[0])->pool_migration_target_suspended_toofull);
+  get_listener(acting[0])->pool_migration_target_suspended = false;
+  verify_all_active_clean(eversion_t(), eversion_t());
+  // Start target pool migration - Keep preempt reservation event on OSD 2 as well
+  get_listener(acting[2])->inject_keep_preempt = true;
+  test_event_start_target_pool_migration(102400, 10);
+  dispatch_all();
+  EXPECT_EQ(get_listener(acting[0])->remote_recovery_reservations_requested, 2);
   EXPECT_EQ(get_listener(acting[1])->remote_recovery_reservations_requested, 2);
   EXPECT_EQ(get_listener(acting[2])->remote_recovery_reservations_requested, 2);
   EXPECT_EQ(get_listener(acting[3])->remote_recovery_reservations_requested, 2);
@@ -1943,21 +2155,31 @@ TEST_F(PeeringStateTest, PoolMigrationPrempt) {
   EXPECT_EQ(get_listener(acting[1])->stalled_events.size(), 1); // captured preempt event
   EXPECT_EQ(get_listener(acting[2])->stalled_events.size(), 1); // captured preempt event
   EXPECT_EQ(get_listener(acting[3])->stalled_events.size(), 0);
-  EXPECT_EQ(get_listener(acting[0])->last_state_entered, "Started/Primary/Active/MigratingSource");
+  EXPECT_EQ(get_listener(acting[0])->last_state_entered, "Started/Primary/Active/MigratingTarget");
   EXPECT_EQ(get_listener(acting[1])->last_state_entered, "Started/ReplicaActive/RepRecovering");
   EXPECT_EQ(get_listener(acting[2])->last_state_entered, "Started/ReplicaActive/RepRecovering");
   EXPECT_EQ(get_listener(acting[3])->last_state_entered, "Started/ReplicaActive/RepRecovering");
-  dout(0) << "= PoolMigration prempt reservation osd 1 and 2 =" << dendl;
+  EXPECT_TRUE(get_listener(acting[0])->pool_migration_target_reserved);
+  EXPECT_FALSE(get_listener(acting[0])->pool_migration_target_suspended);
+  get_listener(acting[0])->pool_migration_target_reserved = false;
+  dout(0) << "= PoolMigration preempt reservation osd 1 and 2 =" << dendl;
   dispatch_all_events(true); // preempt reservation on OSD 1 and 2
-  EXPECT_EQ(get_listener(acting[0])->last_state_entered, "Started/Primary/Active/MigratingSource");
+  EXPECT_EQ(get_listener(acting[0])->last_state_entered, "Started/Primary/Active/MigratingTarget");
   EXPECT_EQ(get_listener(acting[1])->last_state_entered, "Started/ReplicaActive/RepNotRecovering");
   EXPECT_EQ(get_listener(acting[2])->last_state_entered, "Started/ReplicaActive/RepNotRecovering");
   EXPECT_EQ(get_listener(acting[3])->last_state_entered, "Started/ReplicaActive/RepRecovering");
-  // Keep preempt reservation event on OSD 0 (primary) as well
+  dispatch_all();
+  EXPECT_FALSE(get_listener(acting[0])->pool_migration_target_reserved);
+  EXPECT_TRUE(get_listener(acting[0])->pool_migration_target_suspended);
+  EXPECT_FALSE(get_listener(acting[0])->pool_migration_target_suspended_toofull);
+  get_listener(acting[0])->pool_migration_target_suspended = false;
+  verify_all_active_clean(eversion_t(), eversion_t());
+  // Start target pool migration - Keep preempt reservation event on OSD 0 (primary) as well
   get_listener(acting[0])->inject_keep_preempt = true;
+  test_event_start_target_pool_migration(102400, 10);
   dispatch_all();
   verify_all_active_migrating(eversion_t(), eversion_t());
-  EXPECT_EQ(get_listener(acting[0])->io_reservations_requested, 3);
+  EXPECT_EQ(get_listener(acting[0])->remote_recovery_reservations_requested, 3);
   EXPECT_EQ(get_listener(acting[1])->remote_recovery_reservations_requested, 3);
   EXPECT_EQ(get_listener(acting[2])->remote_recovery_reservations_requested, 3);
   EXPECT_EQ(get_listener(acting[3])->remote_recovery_reservations_requested, 3);
@@ -1965,25 +2187,36 @@ TEST_F(PeeringStateTest, PoolMigrationPrempt) {
   EXPECT_EQ(get_listener(acting[1])->stalled_events.size(), 1); // captured preempt event
   EXPECT_EQ(get_listener(acting[2])->stalled_events.size(), 1); // captured preempt event
   EXPECT_EQ(get_listener(acting[3])->stalled_events.size(), 0);
-  EXPECT_EQ(get_listener(acting[0])->last_state_entered, "Started/Primary/Active/MigratingSource");
+  EXPECT_EQ(get_listener(acting[0])->last_state_entered, "Started/Primary/Active/MigratingTarget");
   EXPECT_EQ(get_listener(acting[1])->last_state_entered, "Started/ReplicaActive/RepRecovering");
   EXPECT_EQ(get_listener(acting[2])->last_state_entered, "Started/ReplicaActive/RepRecovering");
   EXPECT_EQ(get_listener(acting[3])->last_state_entered, "Started/ReplicaActive/RepRecovering");
-  dout(0) << "= PoolMigration prempt reservation osd 0, 1 and 2 =" << dendl;
+  EXPECT_TRUE(get_listener(acting[0])->pool_migration_target_reserved);
+  EXPECT_FALSE(get_listener(acting[0])->pool_migration_target_suspended);
+  get_listener(acting[0])->pool_migration_target_reserved = false;
+  dout(0) << "= PoolMigration preempt reservation osd 0, 1 and 2 =" << dendl;
   // 0 Sends RELEASE first, then 1,2 send REVOKE
   dispatch_events(acting[0], true , 1);
   dispatch_events(acting[1], true , 1);
   dispatch_events(acting[2], true , 1);
   dispatch_all();
   dispatch_events(acting[0], true , 1);
-  EXPECT_EQ(get_listener(acting[0])->last_state_entered, "Started/Primary/Active/WaitLocalPoolMigrationReserved");
+  EXPECT_EQ(get_listener(acting[0])->last_state_entered, "Started/Primary/Active/Clean");
   EXPECT_EQ(get_listener(acting[1])->last_state_entered, "Started/ReplicaActive/RepNotRecovering");
   EXPECT_EQ(get_listener(acting[2])->last_state_entered, "Started/ReplicaActive/RepNotRecovering");
   EXPECT_EQ(get_listener(acting[3])->last_state_entered, "Started/ReplicaActive/RepNotRecovering");
   dispatch_all();
+  EXPECT_FALSE(get_listener(acting[0])->pool_migration_target_reserved);
+  EXPECT_TRUE(get_listener(acting[0])->pool_migration_target_suspended);
+  EXPECT_FALSE(get_listener(acting[0])->pool_migration_target_suspended_toofull);
+  get_listener(acting[0])->pool_migration_target_suspended = false;
+  verify_all_active_clean(eversion_t(), eversion_t());
+  // Start target pool migration - Still capturing premept events
+  test_event_start_target_pool_migration(102400, 10);
+  dispatch_all();
   // Verify pool migration started
   verify_all_active_migrating(eversion_t(), eversion_t());
-  EXPECT_EQ(get_listener(acting[0])->io_reservations_requested, 4);
+  EXPECT_EQ(get_listener(acting[0])->remote_recovery_reservations_requested, 4);
   EXPECT_EQ(get_listener(acting[1])->remote_recovery_reservations_requested, 4);
   EXPECT_EQ(get_listener(acting[2])->remote_recovery_reservations_requested, 4);
   EXPECT_EQ(get_listener(acting[3])->remote_recovery_reservations_requested, 4);
@@ -1991,32 +2224,159 @@ TEST_F(PeeringStateTest, PoolMigrationPrempt) {
   EXPECT_EQ(get_listener(acting[1])->stalled_events.size(), 1); // captured preempt event
   EXPECT_EQ(get_listener(acting[2])->stalled_events.size(), 1); // captured preempt event
   EXPECT_EQ(get_listener(acting[3])->stalled_events.size(), 0);
-  EXPECT_EQ(get_listener(acting[0])->last_state_entered, "Started/Primary/Active/MigratingSource");
+  EXPECT_EQ(get_listener(acting[0])->last_state_entered, "Started/Primary/Active/MigratingTarget");
   EXPECT_EQ(get_listener(acting[1])->last_state_entered, "Started/ReplicaActive/RepRecovering");
   EXPECT_EQ(get_listener(acting[2])->last_state_entered, "Started/ReplicaActive/RepRecovering");
   EXPECT_EQ(get_listener(acting[3])->last_state_entered, "Started/ReplicaActive/RepRecovering");
-  dout(0) << "= PoolMigration prempt reservation osd 0, 1 and 2 race hazard =" << dendl;
+  EXPECT_TRUE(get_listener(acting[0])->pool_migration_target_reserved);
+  EXPECT_FALSE(get_listener(acting[0])->pool_migration_target_suspended);
+  get_listener(acting[0])->pool_migration_target_reserved = false;
+  dout(0) << "= PoolMigration preempt reservation osd 0, 1 and 2 race hazard =" << dendl;
   // 1,2 send REVOKE first, then 0 sends RELEASE
   get_listener(acting[0])->inject_keep_preempt = false;
   get_listener(acting[1])->inject_keep_preempt = false;
   get_listener(acting[2])->inject_keep_preempt = false;
-  // 1 and 2 prempt reservation and send messages to osd 0
+  // 1 and 2 preempt reservation and send messages to osd 0
   dispatch_events(acting[1], true);
   dispatch_events(acting[2], true);
   dispatch_cluster_messages(1);
   dispatch_cluster_messages(2);
-  // 0 prempt reservation is slow
+  // 0 preempt reservation is slow
   dispatch_events(acting[0], true);
+  dispatch_all();
+  EXPECT_FALSE(get_listener(acting[0])->pool_migration_target_reserved);
+  EXPECT_TRUE(get_listener(acting[0])->pool_migration_target_suspended);
+  EXPECT_FALSE(get_listener(acting[0])->pool_migration_target_suspended_toofull);
+  get_listener(acting[0])->pool_migration_target_suspended = false;
+  verify_all_active_clean(eversion_t(), eversion_t());
+  // Start target pool migration
+  test_event_start_target_pool_migration(102400, 10);
   dispatch_all();
   // Verify pool migration started
   verify_all_active_migrating(eversion_t(), eversion_t());
+  EXPECT_TRUE(get_listener(acting[0])->pool_migration_target_reserved);
+  EXPECT_FALSE(get_listener(acting[0])->pool_migration_target_suspended);
+  get_listener(acting[0])->pool_migration_target_reserved = false;
   // Signal migration complete
-  test_event_migration_done();
+  test_event_stop_target_pool_migration();
   // Verify that we got to active+clean
+  EXPECT_FALSE(get_listener(acting[0])->pool_migration_target_reserved);
+  EXPECT_FALSE(get_listener(acting[0])->pool_migration_target_suspended);
   verify_all_active_clean(eversion_t(), eversion_t());
-  EXPECT_TRUE(get_listener(acting[0])->pg_migrated_pool_sent);
 }
-#endif
+
+// Test that BackfillTooFull event won't crash the OSD when received
+// in RepNotRecovering state.
+// This is to test the fix for https://tracker.ceph.com/issues/76751
+TEST_F(PeeringStateTest, BackfillTooFullInRepNotRecovering) {
+  dout(0) << "== BackfillTooFullInRepNotRecovering ==" << dendl;
+  // Init
+  test_create_peering_state();
+  test_init();
+  test_event_initialize();
+  // Append 3 log entries to all shards - trim the log so that
+  // backfill occurs later on
+  test_append_log_entry();
+  eversion_t expected_tail = test_append_log_entry();
+  eversion_t expected = test_append_log_entry(shard_id_set(), shard_id_set(), false, true);
+  // Full peering cycle
+  test_peering();
+  // Verify that we got to active+clean and that log entries were kept
+  verify_all_active_clean(expected, expected_tail);
+
+  // Swap out OSD 1 for OSD 9
+  modify_up_acting(1, 9);
+  test_create_peering_state(9, 1);
+  test_init(9);
+  test_event_initialize(9);
+  // Full peering cycle
+  test_peering();
+
+  // Verify OSD 9 is in RepNotRecovering
+  EXPECT_EQ(get_listener(acting[1])->last_state_entered,
+            "Started/ReplicaActive/RepNotRecovering");
+
+  // Inject BackfillTooFull event on OSD 9 while in RepNotRecovering
+  // This should NOT crash
+  auto evt = std::make_shared<PGPeeringEvent>(
+    osdmap->get_epoch(),
+    osdmap->get_epoch(),
+    PeeringState::BackfillTooFull());
+  get_ps(acting[1])->handle_event(evt, get_ctx(acting[1]));
+  dispatch_all();
+
+  // Verify the OSD state machine didn't enter Crashed
+  // If the bug is present, the process_event above would have aborted
+  EXPECT_NE(get_listener(acting[1])->last_state_entered,
+            "Crashed");
+  // The event should have been discarded, replica stays in RepNotRecovering
+  EXPECT_EQ(get_listener(acting[1])->last_state_entered,
+            "Started/ReplicaActive/RepNotRecovering");
+}
+
+// Test that BackfillTooFull event in RepWaitBackfillReserved state causes
+// the replica to reject the reservation and transition to RepNotRecovering
+TEST_F(PeeringStateTest, BackfillTooFullInRepWaitBackfillReserved) {
+  dout(0) << "== BackfillTooFullInRepWaitBackfillReserved ==" << dendl;
+  // Init
+  test_create_peering_state();
+  test_init();
+  test_event_initialize();
+  // Append 3 log entries to all shards - trim the log so that
+  // backfill occurs later on
+  test_append_log_entry();
+  eversion_t expected_tail = test_append_log_entry();
+  eversion_t expected = test_append_log_entry(shard_id_set(), shard_id_set(), false, true);
+  // Full peering cycle
+  test_peering();
+  // Verify that we got to active+clean and that log entries were kept
+  verify_all_active_clean(expected, expected_tail);
+
+  // Swap out OSD 1 for OSD 9
+  modify_up_acting(1, 9);
+  test_create_peering_state(9, 1);
+  test_init(9);
+  test_event_initialize(9);
+  test_peering();
+
+  // Verify OSD 9 is in RepNotRecovering
+  EXPECT_EQ(get_listener(acting[1])->last_state_entered,
+            "Started/ReplicaActive/RepNotRecovering");
+
+  // Inject event RequestBackfillPrio to move the state to RepWaitBackfillReserved
+  // Don't dispatch_all() so the RemoteBackfillReserved stays unprocessed
+  // and the replica remains in RepWaitBackfillReserved
+  auto evt1 = std::make_shared<PGPeeringEvent>(
+    osdmap->get_epoch(),
+    osdmap->get_epoch(),
+    RequestBackfillPrio(OSD_BACKFILL_PRIORITY_BASE, 0, 0));
+  get_ps(acting[1])->handle_event(evt1, get_ctx(acting[1]));
+
+  // Verify OSD 9 is in RepWaitBackfillReserved
+  EXPECT_EQ(get_listener(acting[1])->last_state_entered,
+            "Started/ReplicaActive/RepWaitBackfillReserved");
+
+  // Inject BackfillTooFull event on OSD 9 while in RepWaitBackfillReserved
+  // This should NOT crash
+  auto evt2 = std::make_shared<PGPeeringEvent>(
+    osdmap->get_epoch(),
+    osdmap->get_epoch(),
+    PeeringState::BackfillTooFull());
+  get_ps(acting[1])->handle_event(evt2, get_ctx(acting[1]));
+  dispatch_all();
+
+  // Verify the OSD state machine didn't enter Crashed
+  // If the bug is present, the process_event above would have aborted
+  EXPECT_NE(get_listener(acting[1])->last_state_entered,
+            "Crashed");
+
+  // The reservation should have been rejected and the state goes to RepNotRecovering
+  EXPECT_EQ(get_listener(acting[1])->last_state_entered,
+            "Started/ReplicaActive/RepNotRecovering");
+  // Verify reservation was rejected (unreserve called)
+  EXPECT_TRUE(get_listener(acting[1])->recovery_space_unreserved);
+}
+
 
 // ============================================================================
 // Tests for bug fixes
@@ -2192,22 +2552,180 @@ TEST_F(PeeringStateTest, Issue74218) {
   verify_logs();
 }
 
-// ============================================================================
-// Rebuild Stats Perf Counter Tests
+
+// Tests for the fix for https://tracker.ceph.com/issues/79706
 //
-// These tests exercise the latch logic in prepare_stats_for_publish() that
-// feeds rs_pg_rebuild_duration.
+// Code path 1:
+//
+// const eversion_t olast = olog.log.back().version;
+// if (olast == p->version ||
+//    (olast < p->version && p->version <= olog.head)) {
+//   // Normal case - both logs have entry p->version, or olog has
+//   // no entries between p->version and olog.head
+//   consider_adjusting_pwlc(p->version);
+//   ++p;
+// } ...
+TEST_F(PeeringStateTest, Issue79706_test1) {
+  dout(0) << "== Issue79706_test1 ==" << dendl;
+  test_create_peering_state();
+  test_init();
+  test_event_initialize();
+  test_peering();
+
+  // Note: This scenario is cheating a bit with the trim that is
+  // skipping OSD 1 followed by a full write without catching up
+  // with the trim. This is just an easier way to force
+  // the primary to request all the log from OSD 1.
+
+  // v1: full write to all shards (also clears first_write_in_interval)
+  (void)test_append_log_entry();
+  // v2: partial write to shards 0,2,3 only. Trim write v1
+  (void)test_append_log_entry(ss({0, 2, 3}), ss({0, 2, 3}),
+			      /*update_only=*/false, /*do_trim=*/true);
+  // v3: full write to all shards
+  (void)test_append_log_entry();
+  // v4: partial write to shards 0,2,3 only; update_only so no PWLC is
+  // created yet
+  (void)test_append_log_entry(ss({0, 2, 3}), ss({0, 2, 3}),
+			      /*update_only=*/true);
+
+  // To provoke the code path we need a backfilling/recovering shard
+  // This inconjuction with the trim makes PeeringState::GetLog::GetLog on
+  // the primary request more log entries. Swap out OSD 3 for OSD 9
+  modify_up_acting(3, 9);
+  test_create_peering_state(9, 3);
+  test_init(9);
+  test_event_initialize(9);
+
+  // Run peering
+  test_peering();
+
+  EXPECT_TRUE(get_ps(acting_primary)->is_active());
+  EXPECT_TRUE(get_ps(acting_primary)->is_peered());
+  verify_logs(false, true);
+}
+
+// Tests for the fix for https://tracker.ceph.com/issues/79706
+//
+// Code path 2:
+//
+// } else if (olast < p->version) {
+//   // Divergence is before the oldest entry both logs share
+//   consider_adjusting_pwlc(pg_log.get_tail());
+// } ...
+TEST_F(PeeringStateTest, Issue79706_test2) {
+  dout(0) << "== Issue79706_test2 ==" << dendl;
+  test_create_peering_state();
+  test_init();
+  test_event_initialize();
+  test_peering();
+
+  // v1: full write to all shards (also clears first_write_in_interval)
+  (void)test_append_log_entry();
+  // v2: partial write to shards 0,2,3 only; update_only so no PWLC is
+  // created yet. Trim the log.
+  (void)test_append_log_entry(ss({0, 2, 3}), ss({0, 2, 3}),
+			      /*update_only=*/true, /*do_trim=*/true);
+
+  // To provoke the code path we need a backfilling/recovering shard
+  // This makes PeeringState::GetLog::GetLog on the primary request more log entries.
+  // Swap out OSD 3 for OSD 9
+  modify_up_acting(3, 9);
+  test_create_peering_state(9, 3);
+  test_init(9);
+  test_event_initialize(9);
+
+  // Run peering
+  test_peering();
+
+  EXPECT_TRUE(get_ps(acting_primary)->is_active());
+  EXPECT_TRUE(get_ps(acting_primary)->is_peered());
+  verify_logs(false, true);
+}
+
+// Tests for the fix for https://tracker.ceph.com/issues/79706
+//
+// Code path 3:
+//
+// } else {
+//   // Other log is ahead of the primary log - give up
+//   p = pg_log.get_log().log.end();
+// }
+TEST_F(PeeringStateTest, Issue79706_test3) {
+  dout(0) << "== Issue79706_test3 ==" << dendl;
+  test_create_peering_state();
+  test_init();
+  test_event_initialize();
+  test_peering();
+
+  // v1: full write to all shards (also clears first_write_in_interval)
+  (void)test_append_log_entry();
+  // v2: partial write to shards 0,2,3 only. Trim write v1
+  (void)test_append_log_entry(ss({0, 2, 3}), ss({0, 2, 3}),
+			      /*update_only=*/true, true);
+
+  // vx.3: full write to OSD 1 only — write interrupted before applied
+  // to any other shards - becomes a divergent write
+  (void)test_append_log_entry(shard_id_set(), ss({1}),
+			      /*update_only=*/true);
+  --reqid.tid;
+  new_epoch(true);
+
+  // vy.3: partial write to shards 0,2,3; update_only (no commit, no PWLC),
+  (void)test_append_log_entry(ss({0, 2, 3}), ss({0, 2, 3}),
+                              /*update_only=*/true);
+
+  // To provoke the code path we need a backfilling/recovering shard
+  // This inconjuction with the trim makes PeeringState::GetLog::GetLog on
+  // the primary request more log entries. Swap out OSD 3 for OSD 9
+  modify_up_acting(3, 9);
+  test_create_peering_state(9, 3);
+  test_init(9);
+  test_event_initialize(9);
+
+  // Run peering
+  test_peering();
+
+  // After merge_log rolls back v2 on OSD 1, OSD 1 needs recovery for v3.
+  // verify_logs() is not called here because OSD 1's local pg_log still
+  // contains the divergent v2 entry until data recovery completes; the
+  // primary has correctly identified it as divergent and set OSD 1 to
+  // recover.  We only verify that the PG reached a valid active+peered state.
+  EXPECT_TRUE(get_ps(acting_primary)->is_active());
+  EXPECT_TRUE(get_ps(acting_primary)->is_peered());
+}
+
+
+// ============================================================================
+// PG Vulnerability-Window Perf Counter Tests
+//
+// These exercise the vulnerability-window tracking in
+// prepare_stats_for_publish() that feeds rs_pg_vulnerability_duration
+// (avgcount/sum/avgtime). The window is tracked by two pg_history_t
+// fields -- last_degraded (onset, latched once and never moved again) and
+// vuln_window_reported (the "recorded up to" marker, set to the time of the
+// clean publish that closes the window) -- which are genuinely merged across
+// peers on every peering info exchange, so it is recorded exactly once, by
+// whichever OSD is primary when the window closes, regardless of how many
+// primaries held it along the way. pg_stat_t.last_degraded mirrors the
+// history onset on every publish, purely for external reporting;
+// pg_stat_t.last_clean is stamped on every clean publish, and pg_history_t
+// is left unchanged by a clean publish that does not close a window.
 // Design notes:
 //   - call_prepare_stats(osd) passes nullopt so the publish branch always
-//     runs, which is needed to drive the latch even when stats are unchanged.
-//   - A 10 ms sleep between the latch call and the clean call ensures
-//     rebuild_dur.to_msec() > 0 so the record is committed.
+//     runs, which is what drives the window logic even when stats are
+//     otherwise unchanged.
+//   - A 10 ms sleep between opening the window and reaching clean ensures
+//     (close time - last_degraded).to_msec() > 0 so the record commits.
+//   - get_ps(osd)->get_info().stats.{last_degraded,last_clean} (the mirror)
+//     and get_ps(osd)->get_info().history.* (the source of truth) are read
+//     directly to check the latch/record/inheritance invariants.
 // ============================================================================
 
 // One complete failure+recovery cycle does the following:
 // - Swaps acting[slot] from old_osd to new_osd.
-// - Peers, latches (via call_prepare_stats while degraded).
-// - Sleeps sleep_ms to guarantee non-zero rebuild duration.
+// - Peers, opens the window (via call_prepare_stats while degraded).
+// - Sleeps to guarantee a non-zero window duration.
 // - Recovers, verifies clean, calls prepare_stats to commit the record.
 //
 // Acting set BEFORE call: [..., old_osd, ...] at position slot.
@@ -2215,10 +2733,12 @@ TEST_F(PeeringStateTest, Issue74218) {
 // The old_osd PeeringState is left in osd_peeringstate (may go stale).
 
 // ============================================================================
-// Test 1: Primary OSD records the rebuild duration after a recovery event.
+// Test 1: the primary records the vulnerability-window duration exactly once
+// on recovery. last_degraded stays pinned at the true onset afterward;
+// vuln_window_reported is what marks the episode as recorded.
 // ============================================================================
-TEST_F(PeeringStateTest, RebuildStatsLatchAndCount) {
-  dout(0) << "== RebuildStatsLatchAndCount ==" << dendl;
+TEST_F(PeeringStateTest, VulnerabilityWindowRecordedOnce) {
+  dout(0) << "== VulnerabilityWindowRecordedOnce ==" << dendl;
   test_create_peering_state();
   test_init();
   test_event_initialize();
@@ -2226,13 +2746,12 @@ TEST_F(PeeringStateTest, RebuildStatsLatchAndCount) {
   test_peering();
   verify_all_active_clean(v, eversion_t());
 
-  // Stamp last_clean on the primary so new_failure detection works later.
+  // Stamp last_clean on the primary so the onset latch has a baseline.
   call_prepare_stats(acting_primary);
 
   PerfCounters *perf = get_listener(acting_primary)->recoverystate_perf;
 
   // Introduce a missing replica: swap acting[1] from OSD 1 to OSD 9.
-  // OSD 9 starts fresh and needs the log entry recovered to it.
   modify_up_acting(1, 9);
   test_create_peering_state(9, 1);
   test_init(9);
@@ -2240,12 +2759,16 @@ TEST_F(PeeringStateTest, RebuildStatsLatchAndCount) {
   test_peering();
   // PG is now active+recovering+degraded on the primary.
 
-  // Latch: first prepare_stats call while vulnerable.
-  // The state-change block sets info.stats.last_change = now and
-  // rebuild_start_time = last_change inside the latch branch.
+  // Open the window: first prepare_stats call while vulnerable latches
+  // last_degraded to last_change.
   call_prepare_stats(acting_primary);
+  const utime_t onset = get_ps(acting_primary)->get_info().stats.last_degraded;
+  {
+    const auto &st = get_ps(acting_primary)->get_info().stats;
+    EXPECT_GT(st.last_degraded, st.last_clean)
+        << "a vulnerability window must be open while degraded";
+  }
 
-  // Sleep so that rebuild_dur.to_msec() > 0 when the record fires.
   std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
   // Drive the PG back to active+clean.
@@ -2256,20 +2779,39 @@ TEST_F(PeeringStateTest, RebuildStatsLatchAndCount) {
   test_event_all_replicas_recovered();
   verify_all_active_clean(v, eversion_t());
 
-  // Record: prepare_stats while clean fires the else branch, commits record.
+  // Close the window: prepare_stats while clean records it.
   call_prepare_stats(acting_primary);
-
-  // pg_rebuild_duration: at least one sample with a positive nanosecond sum.
-  auto [sum_ns, count] = perf->get_tavg_ns(rs_pg_rebuild_duration);
-  EXPECT_GE(count, 1u);
+  auto [sum_ns, count] = perf->get_tavg_ns(rs_pg_vulnerability_duration);
+  EXPECT_EQ(count, 1u);
   EXPECT_GT(sum_ns, 0u);
+
+  // pg_vulnerability_duration_min: one episode, so it equals the sum, and
+  // is non-zero even though this window is well under a second. The max is
+  // pg_vulnerability_duration's own max_inc (tinc_with_max).
+  const uint64_t min_ns =
+    perf->tget(rs_pg_vulnerability_duration_min).to_nsec();
+  EXPECT_GT(min_ns, 0u);
+  EXPECT_EQ(min_ns, sum_ns);
+
+  const auto &st = get_ps(acting_primary)->get_info().stats;
+  EXPECT_EQ(st.last_degraded, onset)
+      << "last_degraded stays pinned at the true onset after recording";
+  EXPECT_LT(st.last_degraded, st.last_clean)
+      << "last_clean has advanced past the (unmoved) onset once closed";
+  EXPECT_EQ(get_ps(acting_primary)->get_info().history.vuln_window_reported,
+            st.last_clean)
+      << "vuln_window_reported, not last_degraded, marks this episode as "
+         "recorded";
 }
 
 // ============================================================================
-// Test 2: A replica OSD never records anything, even when the PG is degraded.
+// Test 2: a replica never records anything (prepare_stats_for_publish() is
+// primary-only by convention). The test drives the full episode through the
+// primary and reads the replica's own recoverystate_perf counters to confirm
+// they stay untouched.
 // ============================================================================
-TEST_F(PeeringStateTest, RebuildStatsReplicaSkips) {
-  dout(0) << "== RebuildStatsReplicaSkips ==" << dendl;
+TEST_F(PeeringStateTest, VulnerabilityWindowReplicaSkips) {
+  dout(0) << "== VulnerabilityWindowReplicaSkips ==" << dendl;
   test_create_peering_state();
   test_init();
   test_event_initialize();
@@ -2285,12 +2827,9 @@ TEST_F(PeeringStateTest, RebuildStatsReplicaSkips) {
   test_event_initialize(9);
   test_peering();
 
-  // OSD 9 is the recovering replica. prepare_stats_for_publish() is only
-  // called by the primary.
   PerfCounters *replica_perf = get_listener(9)->recoverystate_perf;
 
-  // Drive the primary through the full latch+record cycle.
-  call_prepare_stats(acting_primary);   // latch fires on primary
+  call_prepare_stats(acting_primary);   // window opens on the primary
   std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
   test_begin_peer_recover(9, 1);
@@ -2300,26 +2839,27 @@ TEST_F(PeeringStateTest, RebuildStatsReplicaSkips) {
   test_event_all_replicas_recovered();
   verify_all_active_clean(v, eversion_t());
 
-  call_prepare_stats(acting_primary);   // record fires on primary
+  call_prepare_stats(acting_primary);   // record fires on the primary
 
-  // The rebuild counter on the replica must remain at its initial values.
   auto [sum_ns, count] =
-    replica_perf->get_tavg_ns(rs_pg_rebuild_duration);
+    replica_perf->get_tavg_ns(rs_pg_vulnerability_duration);
   EXPECT_EQ(count, 0u);
   EXPECT_EQ(sum_ns, 0u);
+  EXPECT_EQ(replica_perf->tget(rs_pg_vulnerability_duration_min).to_nsec(),
+            0u);
 
-  // Primary must have recorded the event (sanity-check the other side).
   auto [primary_sum_ns, primary_count] =
-    get_listener(acting_primary)->recoverystate_perf->get_tavg_ns(rs_pg_rebuild_duration);
+    get_listener(acting_primary)->recoverystate_perf->get_tavg_ns(
+      rs_pg_vulnerability_duration);
   EXPECT_GE(primary_count, 1u);
 }
 
 // ============================================================================
-// Test 3: A second prepare_stats call while still vulnerable does not
-// overwrite the already-latched start time or double-record the event.
+// Test 3: no record while the window is open, exactly one on close, and no
+// re-record on a later clean publish (which re-stamps last_clean).
 // ============================================================================
-TEST_F(PeeringStateTest, RebuildStatsNoDoubleLatch) {
-  dout(0) << "== RebuildStatsNoDoubleLatch ==" << dendl;
+TEST_F(PeeringStateTest, VulnerabilityWindowNoDoubleRecord) {
+  dout(0) << "== VulnerabilityWindowNoDoubleRecord ==" << dendl;
   test_create_peering_state();
   test_init();
   test_event_initialize();
@@ -2337,21 +2877,19 @@ TEST_F(PeeringStateTest, RebuildStatsNoDoubleLatch) {
 
   PerfCounters *perf = get_listener(acting_primary)->recoverystate_perf;
 
-  // First vulnerable call — latch fires (rebuild_start_time set).
+  // Several publishes while still degraded: the window stays open, nothing
+  // is recorded, and the onset does not move.
   call_prepare_stats(acting_primary);
-
-  // Second vulnerable call while still degraded. The latch is guarded by
-  // rebuild_start_time == utime_t(), which is now false, so the start
-  // time is not overwritten and no record is emitted.
+  const utime_t onset = get_ps(acting_primary)->get_info().stats.last_degraded;
   call_prepare_stats(acting_primary);
-
-  // Nothing recorded yet (PG still degraded): duration avgcount must be 0.
+  call_prepare_stats(acting_primary);
+  EXPECT_EQ(get_ps(acting_primary)->get_info().stats.last_degraded, onset)
+      << "onset must latch once and not move while the window is open";
   {
-    auto [sum_ns, count] = perf->get_tavg_ns(rs_pg_rebuild_duration);
+    auto [sum_ns, count] = perf->get_tavg_ns(rs_pg_vulnerability_duration);
     EXPECT_EQ(count, 0u);
   }
 
-  // Now complete the recovery and verify exactly one event is recorded.
   std::this_thread::sleep_for(std::chrono::milliseconds(10));
   test_begin_peer_recover(9, 1);
   test_on_peer_recover(9, 1, v);
@@ -2359,25 +2897,31 @@ TEST_F(PeeringStateTest, RebuildStatsNoDoubleLatch) {
   test_object_recovered();
   test_event_all_replicas_recovered();
   verify_all_active_clean(v, eversion_t());
-  call_prepare_stats(acting_primary);
 
+  call_prepare_stats(acting_primary); // close + record
   {
-    auto [sum_ns, count] = perf->get_tavg_ns(rs_pg_rebuild_duration);
+    auto [sum_ns, count] = perf->get_tavg_ns(rs_pg_vulnerability_duration);
     EXPECT_EQ(count, 1u);
+  }
+
+  // Further clean publishes re-stamp last_clean but must NOT re-record the
+  // already-closed window.
+  call_prepare_stats(acting_primary);
+  call_prepare_stats(acting_primary);
+  {
+    auto [sum_ns, count] = perf->get_tavg_ns(rs_pg_vulnerability_duration);
+    EXPECT_EQ(count, 1u) << "a closed window must be recorded exactly once";
   }
 }
 
 // ============================================================================
-// Test 4: Two sequential failure+recovery cycles accumulate independently.
+// Test 4: two sequential failure+recovery episodes accumulate independently.
 //
-// Cycle 1: acting[1] = 9   (OSD 1 -> OSD 9)
-// Cycle 2: acting[2] = 8   (OSD 2 -> OSD 8, while OSD 9 stays in slot 1)
-//
-// Using distinct slots avoids having to bring OSD 9 stale mid-test while
-// still exercising two independent latch+record sequences on the same primary.
+// Episode 1: acting[1] = 9   (OSD 1 -> OSD 9)
+// Episode 2: acting[2] = 8   (OSD 2 -> OSD 8, OSD 9 stays in slot 1)
 // ============================================================================
-TEST_F(PeeringStateTest, RebuildStatsCountAccumulates) {
-  dout(0) << "== RebuildStatsCountAccumulates ==" << dendl;
+TEST_F(PeeringStateTest, VulnerabilityWindowTwoEpisodesAccumulate) {
+  dout(0) << "== VulnerabilityWindowTwoEpisodesAccumulate ==" << dendl;
   test_create_peering_state();
   test_init();
   test_event_initialize();
@@ -2387,17 +2931,16 @@ TEST_F(PeeringStateTest, RebuildStatsCountAccumulates) {
 
   PerfCounters *perf = get_listener(acting_primary)->recoverystate_perf;
 
-  // ---- Cycle 1: replace acting[1] with OSD 9 ----
-  call_prepare_stats(acting_primary);     // stamp last_clean
+  // ---- Episode 1 ----
+  call_prepare_stats(acting_primary);
 
   modify_up_acting(1, 9);
   test_create_peering_state(9, 1);
   test_init(9);
   test_event_initialize(9);
   test_peering();
-  // active+recovering: OSD 9 needs recovery.
 
-  call_prepare_stats(acting_primary);     // latch fires
+  call_prepare_stats(acting_primary);
   std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
   test_begin_peer_recover(9, 1);
@@ -2406,28 +2949,23 @@ TEST_F(PeeringStateTest, RebuildStatsCountAccumulates) {
   test_object_recovered();
   test_event_all_replicas_recovered();
   verify_all_active_clean(v, eversion_t());
-  // Flush share_pg_info messages queued by cycle 1's Clean so they are
-  // delivered to the current replicas now, not stale during cycle 2.
   dispatch_all();
-  call_prepare_stats(acting_primary);     // record fires
-
+  call_prepare_stats(acting_primary);
   {
-    auto [sum_ns, count] = perf->get_tavg_ns(rs_pg_rebuild_duration);
+    auto [sum_ns, count] = perf->get_tavg_ns(rs_pg_vulnerability_duration);
     EXPECT_EQ(count, 1u);
   }
 
-  // ---- Cycle 2: replace acting[2] with OSD 8 ----
-  // OSD 9 remains in slot 1; OSD 8 joins as a fresh replica at slot 2.
-  call_prepare_stats(acting_primary);     // stamp last_clean for cycle 2
+  // ---- Episode 2 ----
+  call_prepare_stats(acting_primary);
 
   modify_up_acting(2, 8);
   test_create_peering_state(8, 2);
   test_init(8);
   test_event_initialize(8);
   test_peering();
-  // active+recovering: OSD 8 needs the object recovered to it.
 
-  call_prepare_stats(acting_primary);     // second latch fires
+  call_prepare_stats(acting_primary);
   std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
   test_begin_peer_recover(8, 2);
@@ -2436,24 +2974,28 @@ TEST_F(PeeringStateTest, RebuildStatsCountAccumulates) {
   test_object_recovered();
   test_event_all_replicas_recovered();
   verify_all_active_clean(v, eversion_t());
-  call_prepare_stats(acting_primary);     // second record fires
+  call_prepare_stats(acting_primary);
 
-  // Both events must appear in the duration avgcount.
-  auto [sum_ns, count] = perf->get_tavg_ns(rs_pg_rebuild_duration);
+  auto [sum_ns, count] = perf->get_tavg_ns(rs_pg_vulnerability_duration);
   EXPECT_EQ(count, 2u);
   EXPECT_GT(sum_ns, 0u);
+
+  // Two episodes recorded: the min is set and bounded by the total.
+  // (Both windows are ~10 ms here, so it may equal either.)
+  const uint64_t min_ns =
+    perf->tget(rs_pg_vulnerability_duration_min).to_nsec();
+  EXPECT_GT(min_ns, 0u);
+  EXPECT_LE(min_ns, sum_ns);
 }
 
 // ============================================================================
-// Test 5: Latch is discarded when the OSD loses its primary role mid-rebuild.
-//
-// If a new interval begins while rebuild_start_time is set and the OSD
-// transitions from primary to stray, clear_primary_state() must discard the
-// stale latch so no spurious rebuild event is emitted for a recovery that the
-// OSD no longer owns.
+// Test 5: the window survives a peering-interval restart that leaves the
+// primary role unchanged (acting-set churn among non-primary slots), and is
+// still recorded as a single episode.
 // ============================================================================
-TEST_F(PeeringStateTest, RebuildStatsLatchClearedOnRoleChange) {
-  dout(0) << "== RebuildStatsLatchClearedOnRoleChange ==" << dendl;
+TEST_F(PeeringStateTest, VulnerabilityWindowSurvivesSamePrimaryIntervalRestart) {
+  dout(0) << "== VulnerabilityWindowSurvivesSamePrimaryIntervalRestart =="
+          << dendl;
   test_create_peering_state();
   test_init();
   test_event_initialize();
@@ -2461,113 +3003,711 @@ TEST_F(PeeringStateTest, RebuildStatsLatchClearedOnRoleChange) {
   test_peering();
   verify_all_active_clean(v, eversion_t());
 
-  // Record last_clean so the new_failure guard inside the latch is satisfied.
   call_prepare_stats(acting_primary);        // acting_primary = OSD 0
 
-  // --- Phase 1: degrade the PG while OSD 0 is still primary. ---
-  // Replace acting[1] (OSD 1) with OSD 9; OSD 9 needs recovery.
+  // --- Degrade while OSD 0 stays primary. ---
   modify_up_acting(1, 9);
   test_create_peering_state(9, 1);
   test_init(9);
   test_event_initialize(9);
   test_peering();
-  // PG is now active+recovering+degraded; OSD 0 remains primary.
 
-  PerfCounters *perf_osd0 = get_listener(0)->recoverystate_perf;
-
-  // Latch: first prepare_stats call while vulnerable sets rebuild_start_time
-  // on OSD 0.
-  call_prepare_stats(acting_primary);
-  ASSERT_NE(get_ps(0)->get_rebuild_start_time(), utime_t())
-      << "latch must be set before role change";
-
-  // --- Phase 2: change the primary before recovery completes. ---
-  // Swap acting[0] from OSD 0 to OSD 7. OSD 0 leaves the acting set
-  // entirely and becomes a stray; OSD 7 takes over as primary.
-  modify_up_acting(0, 7);
-  acting_primary = 7;
-  up_primary = 7;
-  test_create_peering_state(7, 0);
-  test_init(7);
-  test_event_initialize(7);
-
-  // advance_map on OSD 0: the new acting set excludes OSD 0, so
-  // should_restart_peering()->start_peering_interval() resets the
-  // three latch variables since the role of OSD 0 is now changed.
-  test_event_advance_map();
-
-  // --- Phase 3: verify latch is cleared on the old primary. ---
-  EXPECT_EQ(get_ps(0)->get_rebuild_start_time(), utime_t());
-  EXPECT_EQ(get_ps(0)->get_rebuild_base_recovered(), 0);
-  EXPECT_FALSE(get_ps(0)->get_rebuild_had_redundancy_loss());
-
-  // No rebuild record must have been emitted: the latch was discarded, not
-  // fired. A spurious emission here would record a duration spanning a
-  // recovery that OSD 0 did not complete.
-  auto [sum_ns, count] = perf_osd0->get_tavg_ns(rs_pg_rebuild_duration);
-  EXPECT_EQ(count, 0u);
-  EXPECT_EQ(sum_ns,  0u);
-}
-
-// ============================================================================
-// Test 6: Latch survives a peering-interval restart that leaves the primary
-// role unchanged.
-//
-// Acting-set churn among non-primary slots (e.g. a backfill peer being
-// added mid-rebuild) forces start_peering_interval() to run again, but the
-// primary OSD does not change across the transition. Regression test: this
-// must not discard an in-progress rebuild's latch, or the eventual recovery
-// never gets recorded even though the same primary owned it the whole time.
-// ============================================================================
-TEST_F(PeeringStateTest, RebuildStatsLatchSurvivesSamePrimaryIntervalRestart) {
-  dout(0) << "== RebuildStatsLatchSurvivesSamePrimaryIntervalRestart ==" << dendl;
-  test_create_peering_state();
-  test_init();
-  test_event_initialize();
-  eversion_t v = test_append_log_entry();
-  test_peering();
-  verify_all_active_clean(v, eversion_t());
-
-  // Stamp last_clean so the new_failure guard inside the latch is satisfied.
-  call_prepare_stats(acting_primary);        // acting_primary = OSD 0
-
-  // --- Phase 1: degrade the PG while OSD 0 stays primary. ---
-  // Replace acting[1] (OSD 1) with OSD 9; OSD 9 needs recovery.
-  modify_up_acting(1, 9);
-  test_create_peering_state(9, 1);
-  test_init(9);
-  test_event_initialize(9);
-  test_peering();
-  // PG is now active+recovering+degraded; OSD 0 remains primary.
-
-  // Latch: first prepare_stats call while vulnerable sets rebuild_start_time.
-  call_prepare_stats(acting_primary);
-  utime_t latched_at = get_ps(0)->get_rebuild_start_time();
-  ASSERT_NE(latched_at, utime_t())
-      << "latch must be set before the second interval restart";
+  call_prepare_stats(acting_primary);        // window opens
+  const utime_t onset = get_ps(0)->get_info().stats.last_degraded;
+  ASSERT_GT(onset, get_ps(0)->get_info().stats.last_clean);
 
   std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
-  // --- Phase 2: a second acting-set change (e.g. a backfill target joining)
-  // forces another interval restart via start_peering_interval(), but OSD 0
-  // stays primary throughout. This tests the scenario involving
-  // clear_primary_state(), which should not wipe the latch here, since no
-  // primary role change occurred.
+  // --- A second acting-set change (e.g. a backfill target joining) forces
+  // another interval restart, but OSD 0 stays primary throughout. ---
   modify_up_acting(2, 8);
   test_create_peering_state(8, 2);
   test_init(8);
   test_event_initialize(8);
   test_peering();
 
-  // --- Phase 3: verify the latch survived unchanged on OSD 0. ---
-  EXPECT_EQ(get_ps(0)->get_rebuild_start_time(), latched_at)
-      << "same-primary interval restart must not clear an in-progress latch";
-  EXPECT_EQ(get_ps(0)->get_rebuild_base_recovered(), 0);
+  // The onset is unchanged: the window did not restart.
+  EXPECT_EQ(get_ps(0)->get_info().stats.last_degraded, onset)
+      << "same-primary interval restart must not disturb the open window";
+  {
+    auto [sum_ns, count] =
+      get_listener(0)->recoverystate_perf->get_tavg_ns(
+        rs_pg_vulnerability_duration);
+    EXPECT_EQ(count, 0u) << "nothing recorded while the window is still open";
+  }
 
-  // No record should have fired yet: the rebuild is still ongoing.
+  // --- Recover the remaining missing copy and reach clean. ---
+  test_begin_peer_recover(9, 1);
+  test_on_peer_recover(9, 1, v);
+  test_recover_got(9, v);
+  test_begin_peer_recover(8, 2);
+  test_on_peer_recover(8, 2, v);
+  test_recover_got(8, v);
+  test_object_recovered();
+  test_event_all_replicas_recovered();
+  verify_all_active_clean(v, eversion_t());
+  call_prepare_stats(acting_primary);
+
+  auto [sum_ns, count] =
+    get_listener(0)->recoverystate_perf->get_tavg_ns(
+      rs_pg_vulnerability_duration);
+  EXPECT_EQ(count, 1u)
+      << "one continuous episode across an interval restart = one record";
+  EXPECT_GT(sum_ns,  0u);
+}
+
+// ============================================================================
+// Test 6: after a mid-window primary handover, the departing primary (which
+// never observes the close) still records nothing, but the new primary
+// inherits the TRUE original onset via pg_history_t::merge() -- not a fresh
+// one from its own takeover point -- so the whole episode is recorded once,
+// on the final primary, with the full duration.
+// ============================================================================
+TEST_F(PeeringStateTest, VulnerabilityWindowSurvivesHandover) {
+  dout(0) << "== VulnerabilityWindowSurvivesHandover ==" << dendl;
+  test_create_peering_state();
+  test_init();
+  test_event_initialize();
+  eversion_t v = test_append_log_entry();
+  test_peering();
+  verify_all_active_clean(v, eversion_t());
+
+  call_prepare_stats(acting_primary);        // acting_primary = OSD 0
+
+  // --- Degrade while OSD 0 is primary. ---
+  modify_up_acting(1, 9);
+  test_create_peering_state(9, 1);
+  test_init(9);
+  test_event_initialize(9);
+  test_peering();
+
   PerfCounters *perf_osd0 = get_listener(0)->recoverystate_perf;
-  auto [sum_ns, count] = perf_osd0->get_tavg_ns(rs_pg_rebuild_duration);
-  EXPECT_EQ(count, 0u);
+
+  call_prepare_stats(acting_primary);        // OSD 0 opens the window
+  const utime_t original_onset = get_ps(0)->get_info().stats.last_degraded;
+  ASSERT_GT(original_onset, get_ps(0)->get_info().stats.last_clean);
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+  // --- Handover: swap acting[0] OSD 0 -> OSD 7 before recovery completes. ---
+  modify_up_acting(0, 7);
+  acting_primary = 7;
+  up_primary = 7;
+  test_create_peering_state(7, 0);
+  test_init(7);
+  test_event_initialize(7);
+  test_event_advance_map();
+  test_peering();   // OSD 7 activates as the new primary
+
+  // OSD 0 never observes the close, so it still records nothing.
+  {
+    auto [sum_ns, count] =
+      perf_osd0->get_tavg_ns(rs_pg_vulnerability_duration);
+    EXPECT_EQ(count, 0u);
+  }
+
+  // OSD 7 inherits the TRUE original onset via pg_history_t::merge(),
+  // not a fresh one from its own takeover point.
+  call_prepare_stats(acting_primary);
+  EXPECT_EQ(get_ps(7)->get_info().stats.last_degraded, original_onset)
+      << "the new primary must inherit the true onset across a handover";
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+  test_recover_got(7, v);
+  test_begin_peer_recover(9, 1);
+  test_on_peer_recover(9, 1, v);
+  test_recover_got(9, v);
+  test_object_recovered();
+  test_event_all_replicas_recovered();
+  verify_all_active_clean(v, eversion_t());
+  call_prepare_stats(acting_primary);
+
+  auto [sum_ns, count] =
+    get_listener(7)->recoverystate_perf->get_tavg_ns(
+      rs_pg_vulnerability_duration);
+  EXPECT_EQ(count, 1u)
+      << "the whole episode -- across the handover -- is recorded once";
+  EXPECT_GT(sum_ns, 0u);
+}
+
+// ============================================================================
+// Test 7: a two-handover chain (0 -> 7 -> 8) records a single window, on the
+// final primary only, spanning the TRUE original onset -- each intermediate
+// primary inherits it via pg_history_t::merge() rather than opening its own
+// fresh window, same mechanism as Test 6, exercised across two hops.
+// ============================================================================
+TEST_F(PeeringStateTest, VulnerabilityWindowiSurvivesMultiHopHandover) {
+  dout(0) << "== VulnerabilityWindowiSurvivesMultiHopHandover ==" << dendl;
+  test_create_peering_state();
+  test_init();
+  test_event_initialize();
+  eversion_t v = test_append_log_entry();
+  test_peering();
+  verify_all_active_clean(v, eversion_t());
+
+  call_prepare_stats(acting_primary);        // acting_primary = OSD 0
+
+  modify_up_acting(1, 9);
+  test_create_peering_state(9, 1);
+  test_init(9);
+  test_event_initialize(9);
+  test_peering();
+
+  PerfCounters *perf_osd0 = get_listener(0)->recoverystate_perf;
+
+  call_prepare_stats(acting_primary);
+  const utime_t original_onset = get_ps(0)->get_info().stats.last_degraded;
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+  // --- Hop 1: OSD 0 -> OSD 7. ---
+  modify_up_acting(0, 7);
+  acting_primary = 7;
+  up_primary = 7;
+  test_create_peering_state(7, 0);
+  test_init(7);
+  test_event_initialize(7);
+  test_event_advance_map();
+  test_peering();
+
+  {
+    auto [sum_ns, count] =
+      perf_osd0->get_tavg_ns(rs_pg_vulnerability_duration);
+    EXPECT_EQ(count, 0u);
+  }
+
+  PerfCounters *perf_osd7 = get_listener(7)->recoverystate_perf;
+  call_prepare_stats(acting_primary);
+  EXPECT_EQ(get_ps(7)->get_info().stats.last_degraded, original_onset)
+      << "the intermediate primary must inherit the true onset";
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+  // --- Hop 2: OSD 7 -> OSD 8. ---
+  modify_up_acting(0, 8);
+  acting_primary = 8;
+  up_primary = 8;
+  test_create_peering_state(8, 0);
+  test_init(8);
+  test_event_initialize(8);
+  test_event_advance_map();
+  test_peering();
+
+  {
+    auto [sum_ns, count] =
+      perf_osd7->get_tavg_ns(rs_pg_vulnerability_duration);
+    EXPECT_EQ(count, 0u);
+  }
+
+  call_prepare_stats(acting_primary);
+  EXPECT_EQ(get_ps(8)->get_info().stats.last_degraded, original_onset)
+      << "the final primary must still carry the ORIGINAL onset across "
+         "both hops, not either intermediate primary's own takeover point";
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+  // --- Recover to completion under OSD 8. ---
+  test_recover_got(8, v);
+  test_begin_peer_recover(9, 1);
+  test_on_peer_recover(9, 1, v);
+  test_recover_got(9, v);
+  test_object_recovered();
+  test_event_all_replicas_recovered();
+  verify_all_active_clean(v, eversion_t());
+  call_prepare_stats(acting_primary);
+
+  auto [sum_ns, count] =
+    get_listener(8)->recoverystate_perf->get_tavg_ns(
+    rs_pg_vulnerability_duration);
+  EXPECT_EQ(count, 1u)
+      << "the whole episode -- across both hops -- is recorded exactly once";
+  EXPECT_GT(sum_ns, 0u);
+}
+
+// ============================================================================
+// Test 8: a brand-new, empty replica joining WHILE a window is already open
+// correctly inherits that open, unrecorded window as part of the wholesale
+// pg_info_t copy in Stray::react(MLogRec)'s "restart backfill" branch (the
+// replica is DNE, so last_backfill is unset, and `ps->info = msg->info;`
+// copies info.history along with everything else). Unlike pg_stat_t, which
+// is only ever wholesale-copied and never merged, pg_history_t is a genuine
+// coordinated-merge structure -- so if this replica later becomes primary,
+// it correctly records the whole episode rather than losing or truncating
+// it, and inheriting the onset here is the intended behavior, not a bug.
+// ============================================================================
+TEST_F(PeeringStateTest, VulnerabilityWindowNewReplicaInheritsOpenWindow) {
+  dout(0) << "== VulnerabilityWindowNewReplicaInheritsOpenWindow ==" << dendl;
+  test_create_peering_state();
+  test_init();
+  test_event_initialize();
+  eversion_t v = test_append_log_entry();
+  test_peering();
+  verify_all_active_clean(v, eversion_t());
+
+  call_prepare_stats(acting_primary);        // acting_primary = OSD 0
+
+  // --- Degrade while OSD 0 stays primary: open a window. ---
+  modify_up_acting(1, 9);
+  test_create_peering_state(9, 1);
+  test_init(9);
+  test_event_initialize(9);
+  test_peering();
+
+  call_prepare_stats(acting_primary);        // window opens
+  const utime_t onset = get_ps(0)->get_info().stats.last_degraded;
+  ASSERT_GT(onset, get_ps(0)->get_info().stats.last_clean);
+
+  // --- A brand-new, empty replica (OSD 8) joins WHILE the window is still
+  // open. Its very first log+info exchange goes through
+  // Stray::react(MLogRec)'s "restart backfill" branch (it is DNE, so
+  // last_backfill is unset), which fully-copies OSD 0's current
+  // pg_info_t -- including the still-open info.history. ---
+  modify_up_acting(2, 8);
+  test_create_peering_state(8, 2);
+  test_init(8);
+  test_event_initialize(8);
+  test_peering();
+
+  // OSD 8 genuinely carries the SAME true onset -- correct, since
+  // pg_history_t is a coordinated-merge structure, not a wholesale-copy-
+  // only one.
+  EXPECT_EQ(get_ps(8)->get_info().history.last_degraded, onset)
+      << "a new replica joining mid-window must inherit the true onset";
+
+  // --- Recover the episode normally under OSD 0, to confirm the new
+  // replica's join didn't disturb the primary's own bookkeeping either. ---
+  test_begin_peer_recover(9, 1);
+  test_on_peer_recover(9, 1, v);
+  test_recover_got(9, v);
+  test_begin_peer_recover(8, 2);
+  test_on_peer_recover(8, 2, v);
+  test_recover_got(8, v);
+  test_object_recovered();
+  test_event_all_replicas_recovered();
+  verify_all_active_clean(v, eversion_t());
+  call_prepare_stats(acting_primary);
+
+  auto [sum_ns, count] =
+    get_listener(0)->recoverystate_perf->get_tavg_ns(
+      rs_pg_vulnerability_duration);
+  EXPECT_EQ(count, 1u)
+      << "the original primary still records exactly one window, unaffected "
+         "by the new replica's join";
+  EXPECT_GT(sum_ns, 0u);
+}
+
+// ============================================================================
+// Test 9: PG::publish_stats_to_osd()'s force-write of a new vulnerability/
+// rebuild latch transition must not fire while a peering-event dispatch
+// (PG::do_peering_event()/PeeringState::advance_map()/activate_map()) is in
+// progress -- those dispatchers already call write_if_dirty(rctx.transaction)
+// right after the dispatch, so a standalone write from inside the same
+// dispatch is both redundant and, for a brand-new PG whose own collection-
+// creation transaction is still pending, unsafe (it can reach BlueStore for
+// a collection that doesn't exist yet).
+//
+// PeeringState::is_dispatching_peering_event() must be true for
+// every publish_stats_to_osd() call inside advance_map()'s/activate_map()'s
+// handle_event(), false after -- the guard behind PG::publish_stats_to_osd()'s
+// ObjectStore-race fix, unreachable from this harness, so checked here.
+// Single-OSD pool keeps GetInfo synchronous; dispatch_all()/dispatch_events()
+// are skipped since they'd bypass PG::do_peering_event() (the guard's real
+// home) via a raw handle_event() call. Checks last_state_entered, not
+// is_active(), since PG_STATE_ACTIVE needs an on-commit event only
+// dispatch_events() delivers.
+// ============================================================================
+TEST_F(PeeringStateTest, DispatchGuardCoversAdvanceAndActivateMap) {
+  dout(0) << "== DispatchGuardCoversAdvanceAndActivateMap ==" << dendl;
+  create_rep_pool(1);
+  test_create_peering_state();
+  test_init();
+  test_event_initialize();
+
+  MockPeeringListener *pl = get_listener(acting_primary);
+  pl->publish_stats_call_count = 0;
+  pl->saw_publish_stats_outside_dispatch = false;
+
+  // Drives the PG through its initial peering cascade (Peering -> GetInfo
+  // -> GetLog -> GetMissing -> Active) via repeated advance_map()/
+  // activate_map() calls -- the same dispatchers OSD::handle_pg_create_
+  // info() uses for a brand-new PG -- stopping as soon as Active is
+  // reached rather than looping to full convergence.
+  test_append_log_entry();
+  for (int i = 0; i < 4 &&
+       pl->last_state_entered != "Started/Primary/Active/Activating"; i++) {
+    test_event_advance_map();
+    test_event_activate_map();
+    new_epoch(false);
+  }
+
+  ASSERT_EQ(pl->last_state_entered, "Started/Primary/Active/Activating")
+      << "test setup assumption broken: the PG never reached Active via "
+         "advance_map()/activate_map() alone";
+
+  EXPECT_GT(pl->publish_stats_call_count, 0)
+      << "peering never called publish_stats_to_osd() -- test setup "
+         "assumption broken";
+  EXPECT_FALSE(pl->saw_publish_stats_outside_dispatch)
+      << "a publish_stats_to_osd() call during peering observed "
+         "is_dispatching_peering_event() == false -- every call reachable "
+         "from the statechart should only ever run from inside "
+         "advance_map()'s or activate_map()'s own handle_event() dispatch";
+  EXPECT_FALSE(get_ps(acting_primary)->is_dispatching_peering_event())
+      << "the guard must be cleared once peering settles";
+
+  // A later, independent advance_map() call (e.g. a routine epoch bump)
+  // reaching Active::react(AdvMap), which unconditionally republishes,
+  // must also see the guard engaged while it runs. Active::react(AdvMap)
+  // applies to any of Active's sub-states, so this holds even though the
+  // PG is only just-Active here, not yet Clean.
+  pl->publish_stats_call_count = 0;
+  pl->saw_publish_stats_outside_dispatch = false;
+  test_event_advance_map(acting_primary);
+
+  EXPECT_GT(pl->publish_stats_call_count, 0)
+      << "advance_map() on an already-active PG never called "
+         "publish_stats_to_osd() -- test setup assumption broken";
+  EXPECT_FALSE(pl->saw_publish_stats_outside_dispatch)
+      << "a publish_stats_to_osd() call during advance_map()'s dispatch "
+         "observed is_dispatching_peering_event() == false";
+  EXPECT_FALSE(get_ps(acting_primary)->is_dispatching_peering_event())
+      << "the guard must be cleared once advance_map() returns";
+}
+
+// ============================================================================
+// Test 10: info.history is only durably written when dirty_info/dirty_big_info
+// is set AND some transaction carrying that flag gets committed --
+// prepare_stats_for_publish() is called from many contexts (op/repop
+// completions included) that don't always have a transaction in flight,
+// so it must mark info dirty itself on both the arm and the close
+// transition, rather than leaving persistence to whatever unrelated
+// write happens to come along next.
+// ============================================================================
+TEST_F(PeeringStateTest, VulnerabilityWindowMarksInfoDirty) {
+  dout(0) << "== VulnerabilityWindowMarksInfoDirty ==" << dendl;
+  test_create_peering_state();
+  test_init();
+  test_event_initialize();
+  eversion_t v = test_append_log_entry();
+  test_peering();
+  verify_all_active_clean(v, eversion_t());
+
+  call_prepare_stats(acting_primary);
+
+  // Introduce a missing replica: swap acting[1] from OSD 1 to OSD 9.
+  modify_up_acting(1, 9);
+  test_create_peering_state(9, 1);
+  test_init(9);
+  test_event_initialize(9);
+  test_peering();
+  // PG is now active+recovering+degraded on the primary.
+
+  // Drain whatever unrelated dirty state peering itself left behind, so
+  // the arm transition below is checked against a clean baseline.
+  {
+    ObjectStore::Transaction t;
+    get_ps(acting_primary)->write_if_dirty(t);
+  }
+  ASSERT_FALSE(get_ps(acting_primary)->debug_has_dirty_state());
+
+  // Arm: the first publish while vulnerable must mark info dirty.
+  call_prepare_stats(acting_primary);
+  EXPECT_TRUE(get_ps(acting_primary)->debug_has_dirty_state())
+      << "arming the vulnerability-window latch must mark info dirty for "
+         "a prompt write";
+
+  {
+    ObjectStore::Transaction t;
+    get_ps(acting_primary)->write_if_dirty(t);
+  }
+  ASSERT_FALSE(get_ps(acting_primary)->debug_has_dirty_state());
+
+  // Drive the PG back to active+clean.
+  test_begin_peer_recover(9, 1);
+  test_on_peer_recover(9, 1, v);
+  test_recover_got(9, v);
+  test_object_recovered();
+  test_event_all_replicas_recovered();
+  verify_all_active_clean(v, eversion_t());
+
+  // Close: the publish that records the episode must also mark info
+  // dirty.
+  call_prepare_stats(acting_primary);
+  EXPECT_TRUE(get_ps(acting_primary)->debug_has_dirty_state())
+      << "recording a closed vulnerability window must mark info dirty "
+         "for a prompt write";
+}
+
+// ============================================================================
+// Test 11: Same persistence gap as the vulnerability-window latch above, but for
+// the active-rebuild span (last_rebuild_active_start/rebuild_span_reported):
+// neither Recovering::Recovering()'s arm nor close_rebuild_span()'s close
+// marked info dirty, so a just-armed or just-recorded value had no
+// guarantee of surviving a restart before some unrelated transaction came
+// along to flush it.
+// ============================================================================
+TEST_F(PeeringStateTest, ActiveRebuildLatchMarksInfoDirty) {
+  dout(0) << "== ActiveRebuildLatchMarksInfoDirty ==" << dendl;
+  test_create_peering_state();
+  test_init();
+  test_event_initialize();
+  eversion_t v = test_append_log_entry();
+  test_peering();
+  verify_all_active_clean(v, eversion_t());
+
+  // Introduce a missing replica: swap acting[1] from OSD 1 to OSD 9.
+  // test_peering() below drives the PG straight into Recovering, which
+  // arms the active-rebuild latch as part of the same call.
+  modify_up_acting(1, 9);
+  test_create_peering_state(9, 1);
+  test_init(9);
+  test_event_initialize(9);
+
+  {
+    ObjectStore::Transaction t;
+    get_ps(acting_primary)->write_if_dirty(t);
+  }
+  ASSERT_FALSE(get_ps(acting_primary)->debug_has_dirty_state());
+  const utime_t pre_arm_reported =
+      get_ps(acting_primary)->get_info().history.rebuild_span_reported;
+
+  test_peering();
+  // PG is now active+recovering+degraded on the primary.
+
+  const utime_t onset =
+      get_ps(acting_primary)->get_info().history.last_rebuild_active_start;
+  EXPECT_GT(onset, pre_arm_reported)
+      << "entering Recovering must arm the active-rebuild latch";
+  EXPECT_TRUE(get_ps(acting_primary)->debug_has_dirty_state())
+      << "arming the active-rebuild latch must mark info dirty for a "
+         "prompt write";
+
+  {
+    ObjectStore::Transaction t;
+    get_ps(acting_primary)->write_if_dirty(t);
+  }
+  ASSERT_FALSE(get_ps(acting_primary)->debug_has_dirty_state());
+
+  // Drive the PG back to active+clean -- closes the active-rebuild span
+  // via Recovered::Recovered()'s close_rebuild_span() call, unconditionally,
+  // with no separate explicit publish needed.
+  test_begin_peer_recover(9, 1);
+  test_on_peer_recover(9, 1, v);
+  test_recover_got(9, v);
+  test_object_recovered();
+  test_event_all_replicas_recovered();
+  verify_all_active_clean(v, eversion_t());
+
+  EXPECT_GT(get_ps(acting_primary)->get_info().history.rebuild_span_reported,
+            onset)
+      << "closing the active-rebuild span must advance rebuild_span_reported";
+  EXPECT_TRUE(get_ps(acting_primary)->debug_has_dirty_state())
+      << "closing the active-rebuild span must mark info dirty for a "
+         "prompt write";
+}
+
+// ============================================================================
+// Test 12: Recording a window marks it for sharing
+// (rebuild_stats_close_unshared), and the replicas receive the post-close
+// history (vuln_window_reported) on the next Active AdvMap. try_mark_clean()
+// itself always shares right after publishing, but prepare_stats_for_publish()
+// is reachable from other contexts (e.g. an op's on-commit callback) that don't
+// -- a replica left holding the pre-close history would, if promoted, see the
+// already-recorded window as still open and record it again.
+// ============================================================================
+TEST_F(PeeringStateTest, VulnerabilityWindowCloseSharesWithReplicasOnAdvMap) {
+  dout(0) << "== VulnerabilityWindowCloseSharesWithReplicasOnAdvMap ==" << dendl;
+  test_create_peering_state();
+  test_init();
+  test_event_initialize();
+  eversion_t v = test_append_log_entry();
+  test_peering();
+  verify_all_active_clean(v, eversion_t());
+
+  call_prepare_stats(acting_primary);
+
+  modify_up_acting(1, 9);
+  test_create_peering_state(9, 1);
+  test_init(9);
+  test_event_initialize(9);
+  test_peering();
+
+  call_prepare_stats(acting_primary);  // window opens on the primary
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+  test_begin_peer_recover(9, 1);
+  test_on_peer_recover(9, 1, v);
+  test_recover_got(9, v);
+  test_object_recovered();
+  test_event_all_replicas_recovered();
+  verify_all_active_clean(v, eversion_t());
+
+  call_prepare_stats(acting_primary);  // window closes and is recorded
+  auto *primary = get_ps(acting_primary);
+  const utime_t reported = primary->get_info().history.vuln_window_reported;
+  ASSERT_GT(reported, primary->get_info().history.last_degraded);
+  EXPECT_TRUE(primary->rebuild_stats_close_unshared);
+
+  for (auto osd : acting) {
+    if (osd == acting_primary) continue;
+    EXPECT_LT(get_ps(osd)->get_info().history.vuln_window_reported, reported)
+        << "osd." << osd << " has not been told about the close yet";
+  }
+
+  // Drain whatever unrelated dirty state (e.g. dirty_big_info from
+  // activation) is still set, so only rebuild_stats_close_unshared can
+  // trigger the retry-share below.
+  {
+    ObjectStore::Transaction t;
+    primary->write_if_dirty(t);
+  }
+  test_event_advance_map(acting_primary);  // same map: Active AdvMap
+  dispatch_all();
+
+  EXPECT_FALSE(primary->rebuild_stats_close_unshared);
+  for (auto osd : acting) {
+    if (osd == acting_primary) continue;
+    const auto &h = get_ps(osd)->get_info().history;
+    EXPECT_EQ(h.vuln_window_reported, reported)
+        << "osd." << osd << " must learn the window was recorded";
+    EXPECT_LE(h.last_degraded, h.vuln_window_reported)
+        << "osd." << osd << " must not see the recorded window as open";
+  }
+}
+
+// ============================================================================
+// Test 13: Same gap as VulnerabilityWindowCloseSharesWithReplicasOnAdvMap
+// above, for the other rebuild-stats counter: close_rebuild_span() (reached
+// from Recovered::Recovered()) records unconditionally, but nothing there
+// guarantees a share_pg_info() follows soon -- the publish right after is
+// itself conditional, and GoClean (the path to try_mark_clean()'s
+// unconditional share) only posts once every replica is activated. Calls
+// close_rebuild_span() directly, the same way call_prepare_stats() drives
+// the vulnerability-window close above, to isolate this one call from
+// whatever else the full recover/activate/GoClean sequence would otherwise
+// trigger alongside it.
+// ============================================================================
+TEST_F(PeeringStateTest, RebuildSpanCloseSharesWithReplicasOnAdvMap) {
+  dout(0) << "== RebuildSpanCloseSharesWithReplicasOnAdvMap ==" << dendl;
+  test_create_peering_state();
+  test_init();
+  test_event_initialize();
+  eversion_t v = test_append_log_entry();
+  test_peering();
+  verify_all_active_clean(v, eversion_t());
+
+  // Introduce a missing replica: swap acting[1] from OSD 1 to OSD 9.
+  // test_peering() drives the PG straight into Recovering, arming the
+  // active-rebuild latch.
+  modify_up_acting(1, 9);
+  test_create_peering_state(9, 1);
+  test_init(9);
+  test_event_initialize(9);
+  test_peering();
+
+  auto *primary = get_ps(acting_primary);
+  const utime_t onset = primary->get_info().history.last_rebuild_active_start;
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+  primary->close_rebuild_span();  // span closes and is recorded
+  const utime_t reported = primary->get_info().history.rebuild_span_reported;
+  ASSERT_GT(reported, onset);
+  EXPECT_TRUE(primary->rebuild_stats_close_unshared);
+
+  for (auto osd : acting) {
+    if (osd == acting_primary) continue;
+    EXPECT_LT(get_ps(osd)->get_info().history.rebuild_span_reported, reported)
+        << "osd." << osd << " has not been told about the close yet";
+  }
+
+  // Drain whatever unrelated dirty state (e.g. dirty_big_info from
+  // activation) is still set, so only rebuild_stats_close_unshared can
+  // trigger the retry-share below.
+  {
+    ObjectStore::Transaction t;
+    primary->write_if_dirty(t);
+  }
+  test_event_advance_map(acting_primary);  // same map: Active AdvMap
+  dispatch_all();
+
+  EXPECT_FALSE(primary->rebuild_stats_close_unshared);
+  for (auto osd : acting) {
+    if (osd == acting_primary) continue;
+    const auto &h = get_ps(osd)->get_info().history;
+    EXPECT_EQ(h.rebuild_span_reported, reported)
+        << "osd." << osd << " must learn the span was recorded";
+    EXPECT_LE(h.last_rebuild_active_start, h.rebuild_span_reported)
+        << "osd." << osd << " must not see the recorded span as open";
+  }
+}
+
+// ============================================================================
+// Test 14: A clean publish that does not close a window must leave
+// pg_history_t unchanged and must not mark info dirty. Stats are published
+// on every client write, and pg_fast_info_t does not cover pg_history_t, so
+// any history change there makes prepare_info_keymap() write the full _info
+// instead of _fastinfo on every op. Only pg_stat_t.last_clean, which
+// _fastinfo covers, may advance. Checked both before any window and after a
+// recorded close.
+// ============================================================================
+TEST_F(PeeringStateTest, VulnerabilityWindowCleanPublishKeepsHistory) {
+  dout(0) << "== VulnerabilityWindowCleanPublishKeepsHistory ==" << dendl;
+  test_create_peering_state();
+  test_init();
+  test_event_initialize();
+  eversion_t v = test_append_log_entry();
+  test_peering();
+  verify_all_active_clean(v, eversion_t());
+
+  auto *primary = get_ps(acting_primary);
+  auto check_clean_publishes_keep_history = [&](const char *when) {
+    {
+      ObjectStore::Transaction t;
+      primary->write_if_dirty(t);
+    }
+    ASSERT_FALSE(primary->debug_has_dirty_state());
+    const pg_history_t history = primary->get_info().history;
+    const utime_t last_clean = primary->get_info().stats.last_clean;
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    call_prepare_stats(acting_primary);
+    call_prepare_stats(acting_primary);
+
+    EXPECT_GT(primary->get_info().stats.last_clean, last_clean)
+        << when << ": a clean publish must stamp pg_stat_t.last_clean";
+    EXPECT_EQ(primary->get_info().history, history)
+        << when << ": a clean publish must not change pg_history_t";
+    EXPECT_FALSE(primary->debug_has_dirty_state())
+        << when << ": a clean publish must not mark info dirty";
+  };
+
+  // Let the first publish settle anything initial peering left behind.
+  call_prepare_stats(acting_primary);
+  check_clean_publishes_keep_history("before any window");
+
+  // One full episode, so the second check runs after a recorded close.
+  modify_up_acting(1, 9);
+  test_create_peering_state(9, 1);
+  test_init(9);
+  test_event_initialize(9);
+  test_peering();
+
+  call_prepare_stats(acting_primary);  // window opens on the primary
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+  test_begin_peer_recover(9, 1);
+  test_on_peer_recover(9, 1, v);
+  test_recover_got(9, v);
+  test_object_recovered();
+  test_event_all_replicas_recovered();
+  verify_all_active_clean(v, eversion_t());
+
+  call_prepare_stats(acting_primary);  // window closes and is recorded
+  auto [sum_ns, count] = get_listener(acting_primary)->recoverystate_perf
+    ->get_tavg_ns(rs_pg_vulnerability_duration);
+  ASSERT_EQ(count, 1u);
+  const auto &h = primary->get_info().history;
+  EXPECT_EQ(h.vuln_window_reported, primary->get_info().stats.last_clean)
+      << "the close must record up to the clean publish that closed it";
+  EXPECT_EQ(h.last_clean, h.vuln_window_reported);
+
+  check_clean_publishes_keep_history("after a recorded close");
 }
 
 // ============================================================================

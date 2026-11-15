@@ -1126,29 +1126,36 @@ TEST(TestSnapSet, Stats) {
     return maybe_oi;
   });
 
+  auto set_omap_flag = [&expected_stats](auto maybe_oi) {
+    ceph_assert(maybe_oi);
+    maybe_oi->set_flag(object_info_t::FLAG_OMAP);
+    expected_stats.num_objects_omap++;
+    return maybe_oi;
+  };
+
   {
-    auto &so = add_simple_head(32, [](auto ret) { return ret; });
+    auto &so = add_simple_head(32, set_omap_flag);
     expected_stats.num_omap_keys += (so.object_omap_keys = 10);
     expected_stats.num_omap_bytes += (so.object_omap_bytes = 100);
-    expected_stats.num_objects_omap++;
   }
 
   {
-    auto &so = add_simple_head(64, [](auto ret) { return ret; });
+    auto &so = add_simple_head(64, set_omap_flag);
     expected_stats.num_omap_keys +=
       (so.object_omap_keys = (TEST_OMAP_KEY_LIMIT + 1));
     expected_stats.num_omap_bytes +=
       (so.object_omap_bytes = so.object_omap_keys);
-    expected_stats.num_objects_omap++;
     expected_stats.num_large_omap_objects++;
   }
 
+  // an omap object as seen by a shallow scrub: omap not scanned
+  add_simple_head(16, set_omap_flag);
+
   {
-    auto &so = add_simple_head(64, [](auto ret) { return ret; });
+    auto &so = add_simple_head(64, set_omap_flag);
     expected_stats.num_omap_keys += (so.object_omap_keys = 1);
     expected_stats.num_omap_bytes +=
       (so.object_omap_bytes = (TEST_OMAP_BYTES_LIMIT + 1));
-    expected_stats.num_objects_omap++;
     expected_stats.num_large_omap_objects++;
   }
 
@@ -1205,4 +1212,265 @@ TEST(TestSnapSet, Stats) {
     "Got snapset_errors: {}", ret.snapset_errors);
 
   EXPECT_EQ(ret.stats, expected_stats);
+}
+
+namespace {
+
+using crimson::osd::scrub::update_stats_from_scrub;
+
+const eversion_t TEST_LAST_UPDATE{5, 10};
+const utime_t TEST_NOW{1000, 0};
+
+/// pg stats as left by a previous deep scrub that found errors
+pg_stat_t make_stored_pg_stats()
+{
+  pg_stat_t ret;
+  auto &sum = ret.stats.sum;
+  sum.num_objects = 4;
+  sum.num_bytes = 400;
+  sum.num_shallow_scrub_errors = 1;
+  sum.num_deep_scrub_errors = 2;
+  sum.num_scrub_errors = 3;
+  sum.num_omap_keys = 10;
+  sum.num_omap_bytes = 100;
+  sum.num_large_omap_objects = 1;
+  return ret;
+}
+
+/// scrubbed stats matching the scrub_checked_stats of make_stored_pg_stats()
+object_stat_sum_t make_scrubbed_stats()
+{
+  object_stat_sum_t ret;
+  ret.num_objects = 4;
+  ret.num_bytes = 400;
+  return ret;
+}
+
+} // namespace
+
+TEST(TestScrubStats, ShallowScrubKeepsDeepOnlyStats) {
+  auto pg_stats = make_stored_pg_stats();
+  pg_history_t history;
+  auto scrubbed = make_scrubbed_stats();
+  scrubbed.num_shallow_scrub_errors = 1;
+  scrubbed.num_scrub_errors = 1;
+
+  const auto ret = update_stats_from_scrub(
+    false, scrubbed, TEST_LAST_UPDATE, TEST_NOW, history, pg_stats);
+  EXPECT_FALSE(ret.repaired_invalid_stats);
+  EXPECT_TRUE(ret.stat_mismatches.empty());
+
+  const auto &sum = pg_stats.stats.sum;
+  EXPECT_EQ(sum.num_shallow_scrub_errors, 1);
+  EXPECT_EQ(sum.num_deep_scrub_errors, 2);
+  EXPECT_EQ(sum.num_scrub_errors, 3);
+  EXPECT_EQ(sum.num_omap_keys, 10);
+  EXPECT_EQ(sum.num_omap_bytes, 100);
+  EXPECT_EQ(sum.num_large_omap_objects, 1);
+
+  EXPECT_EQ(history.last_scrub, TEST_LAST_UPDATE);
+  EXPECT_EQ(history.last_scrub_stamp, TEST_NOW);
+  EXPECT_EQ(history.last_deep_scrub, eversion_t{});
+  EXPECT_EQ(history.last_deep_scrub_stamp, utime_t{});
+  EXPECT_EQ(history.last_clean_scrub_stamp, utime_t{});
+}
+
+TEST(TestScrubStats, CleanShallowScrubKeepsDeepErrors) {
+  auto pg_stats = make_stored_pg_stats();
+  pg_history_t history;
+
+  const auto ret = update_stats_from_scrub(
+    false, make_scrubbed_stats(), TEST_LAST_UPDATE, TEST_NOW,
+    history, pg_stats);
+  EXPECT_TRUE(ret.stat_mismatches.empty());
+
+  const auto &sum = pg_stats.stats.sum;
+  EXPECT_EQ(sum.num_shallow_scrub_errors, 0);
+  EXPECT_EQ(sum.num_deep_scrub_errors, 2);
+  EXPECT_EQ(sum.num_scrub_errors, 2);
+  // as in classic: clean as far as a shallow scrub can tell
+  EXPECT_EQ(history.last_clean_scrub_stamp, TEST_NOW);
+}
+
+TEST(TestScrubStats, DeepScrubReplacesMaintainedStats) {
+  auto pg_stats = make_stored_pg_stats();
+  pg_history_t history;
+  auto scrubbed = make_scrubbed_stats();
+  scrubbed.num_deep_scrub_errors = 1;
+  scrubbed.num_scrub_errors = 1;
+  scrubbed.num_omap_keys = 20;
+  scrubbed.num_omap_bytes = 200;
+
+  const auto ret = update_stats_from_scrub(
+    true, scrubbed, TEST_LAST_UPDATE, TEST_NOW, history, pg_stats);
+  EXPECT_TRUE(ret.stat_mismatches.empty());
+
+  const auto &sum = pg_stats.stats.sum;
+  EXPECT_EQ(sum.num_shallow_scrub_errors, 0);
+  EXPECT_EQ(sum.num_deep_scrub_errors, 1);
+  EXPECT_EQ(sum.num_scrub_errors, 1);
+  EXPECT_EQ(sum.num_omap_keys, 20);
+  EXPECT_EQ(sum.num_omap_bytes, 200);
+  EXPECT_EQ(sum.num_large_omap_objects, 0);
+
+  EXPECT_EQ(history.last_scrub, TEST_LAST_UPDATE);
+  EXPECT_EQ(history.last_scrub_stamp, TEST_NOW);
+  EXPECT_EQ(history.last_deep_scrub, TEST_LAST_UPDATE);
+  EXPECT_EQ(history.last_deep_scrub_stamp, TEST_NOW);
+  EXPECT_EQ(history.last_clean_scrub_stamp, utime_t{});
+}
+
+TEST(TestScrubStats, CleanDeepScrub) {
+  auto pg_stats = make_stored_pg_stats();
+  pg_history_t history;
+
+  update_stats_from_scrub(
+    true, make_scrubbed_stats(), TEST_LAST_UPDATE, TEST_NOW,
+    history, pg_stats);
+
+  EXPECT_EQ(pg_stats.stats.sum.num_scrub_errors, 0);
+  EXPECT_EQ(history.last_clean_scrub_stamp, TEST_NOW);
+}
+
+TEST(TestScrubStats, StatMismatchCountsAsError) {
+  for (bool deep : {false, true}) {
+    auto pg_stats = make_stored_pg_stats();
+    pg_history_t history;
+    auto scrubbed = make_scrubbed_stats();
+    scrubbed.num_objects = 3;
+
+    const auto ret = update_stats_from_scrub(
+      deep, scrubbed, TEST_LAST_UPDATE, TEST_NOW, history, pg_stats);
+    EXPECT_EQ(ret.stat_mismatches.size(), 1) << "deep: " << deep;
+
+    const auto &sum = pg_stats.stats.sum;
+    EXPECT_EQ(sum.num_shallow_scrub_errors, 1) << "deep: " << deep;
+    EXPECT_EQ(sum.num_scrub_errors, deep ? 1 : 3) << "deep: " << deep;
+    EXPECT_EQ(history.last_clean_scrub_stamp, utime_t{}) << "deep: " << deep;
+  }
+}
+
+TEST(TestScrubStats, InvalidStatMismatchIgnored) {
+  auto pg_stats = make_stored_pg_stats();
+  pg_stats.stats.sum.num_objects_omap = 2;
+  pg_stats.omap_stats_invalid = true;
+  pg_history_t history;
+
+  const auto ret = update_stats_from_scrub(
+    true, make_scrubbed_stats(), TEST_LAST_UPDATE, TEST_NOW,
+    history, pg_stats);
+  EXPECT_TRUE(ret.stat_mismatches.empty());
+  EXPECT_EQ(pg_stats.stats.sum.num_scrub_errors, 0);
+}
+
+TEST(TestScrubStats, InvalidStatsAreReplaced) {
+  auto pg_stats = make_stored_pg_stats();
+  pg_stats.stats_invalid = true;
+  pg_history_t history;
+  auto scrubbed = make_scrubbed_stats();
+  scrubbed.num_objects = 3;
+
+  const auto ret = update_stats_from_scrub(
+    false, scrubbed, TEST_LAST_UPDATE, TEST_NOW, history, pg_stats);
+  EXPECT_TRUE(ret.repaired_invalid_stats);
+  EXPECT_TRUE(ret.stat_mismatches.empty());
+  EXPECT_FALSE(pg_stats.stats_invalid);
+  EXPECT_EQ(pg_stats.stats.sum.num_objects, 3);
+}
+
+namespace {
+
+class FakeScrubContext : public crimson::osd::scrub::ScrubContext {
+  DoutPrefix dpp{nullptr, ceph_subsys_test, "test_crimson_scrub"};
+  std::set<pg_shard_t> ids{pg_shard_t{0, shard_id_t::NO_SHARD}};
+
+public:
+  bool stopping = false;
+  bool snaptrim_started = false;
+  int notify_end = 0;
+
+  const std::set<pg_shard_t> &get_ids_to_scrub() const final {
+    return ids;
+  }
+  crimson::osd::scrub::chunk_validation_policy_t get_policy() const final {
+    return {
+      *ids.begin(),
+      TEST_MAX_OBJECT_SIZE,
+      std::string{TEST_INTERNAL_NAMESPACE},
+      TEST_OMAP_KEY_LIMIT,
+      TEST_OMAP_BYTES_LIMIT
+    };
+  }
+  void notify_scrub_start(bool) final {}
+  void notify_scrub_end(bool) final {
+    ++notify_end;
+    // same rule as PG::kick_snap_trim(): no new op while stopping
+    if (!stopping) {
+      snaptrim_started = true;
+    }
+  }
+  void request_range(const hobject_t &) final {}
+  void reserve_range(const hobject_t &, const hobject_t &) final {}
+  void release_range() final {}
+  void scan_range(
+    pg_shard_t, eversion_t, bool,
+    const hobject_t &, const hobject_t &) final {}
+  bool await_update(const eversion_t &) final { return true; }
+  void generate_and_submit_chunk_result(
+    const hobject_t &, const hobject_t &, bool) final {}
+  void emit_chunk_result(
+    const request_range_result_t &,
+    crimson::osd::scrub::chunk_result_t &&) final {}
+  void emit_scrub_result(bool, object_stat_sum_t) final {}
+  DoutPrefixProvider &get_dpp() final { return dpp; }
+};
+
+using crimson::osd::scrub::Inactive;
+using crimson::osd::scrub::PrimaryActive;
+using crimson::osd::scrub::ScrubMachine;
+using crimson::osd::scrub::Scrubbing;
+namespace events = crimson::osd::scrub::events;
+
+} // namespace
+
+TEST(TestScrubMachine, StopFromAwaitScrub) {
+  FakeScrubContext ctx;
+  ScrubMachine machine(ctx);
+  machine.initiate();
+  machine.process_event(events::primary_activate_t{});
+  ASSERT_TRUE(machine.state_downcast<const PrimaryActive *>());
+
+  machine.process_event(events::reset_t{});
+  EXPECT_TRUE(machine.state_downcast<const Inactive *>());
+  EXPECT_EQ(ctx.notify_end, 0);
+  EXPECT_FALSE(ctx.snaptrim_started);
+}
+
+TEST(TestScrubMachine, StopDuringScrubDoesNotStartSnapTrim) {
+  FakeScrubContext ctx;
+  ScrubMachine machine(ctx);
+  machine.initiate();
+  machine.process_event(events::primary_activate_t{});
+  machine.process_event(events::start_scrub_t{false});
+  ASSERT_TRUE(machine.state_downcast<const Scrubbing *>());
+
+  ctx.stopping = true;
+  machine.process_event(events::reset_t{});
+  EXPECT_TRUE(machine.state_downcast<const Inactive *>());
+  EXPECT_EQ(ctx.notify_end, 1);
+  EXPECT_FALSE(ctx.snaptrim_started);
+}
+
+TEST(TestScrubMachine, ScrubEndStartsSnapTrimWhenNotStopping) {
+  FakeScrubContext ctx;
+  ScrubMachine machine(ctx);
+  machine.initiate();
+  machine.process_event(events::primary_activate_t{});
+  machine.process_event(events::start_scrub_t{false});
+  ASSERT_TRUE(machine.state_downcast<const Scrubbing *>());
+
+  machine.process_event(events::reset_t{});
+  EXPECT_TRUE(machine.state_downcast<const Inactive *>());
+  EXPECT_EQ(ctx.notify_end, 1);
+  EXPECT_TRUE(ctx.snaptrim_started);
 }

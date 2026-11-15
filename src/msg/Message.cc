@@ -11,6 +11,7 @@
 #include <iostream>
 
 #include "include/types.h"
+#include "include/msgr_encoder.h"
 
 #include "global/global_context.h"
 
@@ -54,6 +55,7 @@
 #include "messages/MCommandReply.h"
 #include "messages/MBackfillReserve.h"
 #include "messages/MRecoveryReserve.h"
+#include "messages/MPoolMigrationReserve.h"
 
 #include "messages/MRoute.h"
 #include "messages/MForward.h"
@@ -102,6 +104,7 @@
 #include "messages/MOSDPGRecoveryDeleteReply.h"
 #include "messages/MOSDPGReadyToMerge.h"
 #include "messages/MOSDPGStopMerge.h"
+#include "messages/MOSDPGMigratedPool.h"
 
 #include "messages/MRemoveSnaps.h"
 
@@ -130,6 +133,7 @@
 #include "messages/MClientSnap.h"
 #include "messages/MClientQuota.h"
 #include "messages/MClientMetrics.h"
+#include "messages/MQuarantineDisable.h"
 
 #include "messages/MMDSPeerRequest.h"
 #include "messages/MMDSQuiesceDbListing.h"
@@ -473,6 +477,9 @@ Message *decode_message(CephContext *cct,
   case MSG_OSD_RECOVERY_RESERVE:
     m = make_message<MRecoveryReserve>();
     break;
+  case MSG_OSD_POOLMIGRATION_RESERVE:
+    m = make_message<MPoolMigrationReserve>();
+    break;
   case MSG_OSD_FORCE_RECOVERY:
     m = make_message<MOSDForceRecovery>();
     break;
@@ -651,6 +658,9 @@ Message *decode_message(CephContext *cct,
   case MSG_OSD_PG_STOP_MERGE:
     m = make_message<MOSDPGStopMerge>();
     break;
+  case MSG_OSD_PG_MIGRATED_POOL:
+    m = make_message<MOSDPGMigratedPool>();
+    break;
   case MSG_OSD_EC_WRITE:
     m = make_message<MOSDECSubOpWrite>();
     break;
@@ -723,6 +733,10 @@ Message *decode_message(CephContext *cct,
     break;
   case CEPH_MSG_CLIENT_METRICS:
     m = make_message<MClientMetrics>();
+    break;
+
+  case CEPH_MSG_CLIENT_QUARANTINE_DISABLE:
+    m = make_message<MQuarantineDisable>();
     break;
 
     // mds

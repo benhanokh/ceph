@@ -307,6 +307,31 @@ export class ServiceFormComponent extends CdForm implements OnInit {
         null,
         [CdValidators.number(false), Validators.min(1), Validators.max(65535)]
       ],
+      rgw_frontend_http_port: [
+        null,
+        [CdValidators.number(false), Validators.min(1), Validators.max(65535)]
+      ],
+      metrics_push_enabled: [false],
+      metrics_push_interval: [
+        3600,
+        [
+          CdValidators.composeIf({ service_type: 'rgw', metrics_push_enabled: true }, [
+            Validators.required,
+            CdValidators.number(false),
+            Validators.min(60)
+          ])
+        ]
+      ],
+      metrics_push_timeout: [
+        300,
+        [
+          CdValidators.composeIf({ service_type: 'rgw', metrics_push_enabled: true }, [
+            Validators.required,
+            CdValidators.number(false),
+            Validators.min(30)
+          ])
+        ]
+      ],
       realm_name: [null],
       zonegroup_name: [null],
       zone_name: [null],
@@ -676,6 +701,15 @@ export class ServiceFormComponent extends CdForm implements OnInit {
       allowlist_domains: [null],
       ssl_insecure_skip_verify: [false]
     });
+    this.serviceForm.addValidators(
+      CdValidators.doNotMatch(
+        'rgw_frontend_port',
+        'rgw_frontend_http_port',
+        (form: AbstractControl) =>
+          form.get('service_type')?.value === 'rgw' && !!form.get('ssl')?.value,
+        443
+      )
+    );
   }
 
   resolveRoute() {
@@ -820,6 +854,9 @@ export class ServiceFormComponent extends CdForm implements OnInit {
               this.serviceForm
                 .get('rgw_frontend_port')
                 .setValue(response[0].spec?.rgw_frontend_port);
+              this.serviceForm
+                .get('rgw_frontend_http_port')
+                .setValue(response[0].spec?.rgw_frontend_http_port);
               this.setRgwFields(
                 response[0].spec?.rgw_realm,
                 response[0].spec?.rgw_zonegroup,
@@ -827,6 +864,15 @@ export class ServiceFormComponent extends CdForm implements OnInit {
                 response[0].spec?.qat
               );
               this.serviceForm.get('ssl').setValue(response[0].spec?.ssl);
+              if (response[0].spec?.metrics_push_enabled) {
+                this.serviceForm.get('metrics_push_enabled').setValue(true);
+                this.serviceForm
+                  .get('metrics_push_interval')
+                  .setValue(response[0].spec?.metrics_push_interval ?? 3600);
+                this.serviceForm
+                  .get('metrics_push_timeout')
+                  .setValue(response[0].spec?.metrics_push_timeout ?? 300);
+              }
               if (response[0].spec?.zonegroup_hostnames?.length) {
                 this.serviceForm
                   .get('zonegroup_hostnames')
@@ -1026,6 +1072,13 @@ export class ServiceFormComponent extends CdForm implements OnInit {
         }
       });
     }
+
+    // The HTTP port only applies with SSL: drop it when SSL is switched off
+    this.serviceForm.get('ssl')?.valueChanges.subscribe((ssl: boolean) => {
+      if (!ssl) {
+        this.serviceForm.get('rgw_frontend_http_port')?.setValue(null);
+      }
+    });
   }
 
   getDefaultsEntitiesForRgw(
@@ -1639,7 +1692,19 @@ export class ServiceFormComponent extends CdForm implements OnInit {
           if (_.isNumber(values['rgw_frontend_port']) && values['rgw_frontend_port'] > 0) {
             serviceSpec['rgw_frontend_port'] = values['rgw_frontend_port'];
           }
+          if (
+            values['ssl'] &&
+            _.isNumber(values['rgw_frontend_http_port']) &&
+            values['rgw_frontend_http_port'] > 0
+          ) {
+            serviceSpec['rgw_frontend_http_port'] = values['rgw_frontend_http_port'];
+          }
           serviceSpec['ssl'] = values['ssl'];
+          if (values['metrics_push_enabled']) {
+            serviceSpec['metrics_push_enabled'] = true;
+            serviceSpec['metrics_push_interval'] = values['metrics_push_interval'];
+            serviceSpec['metrics_push_timeout'] = values['metrics_push_timeout'];
+          }
           if (values['virtual_host_enabled'] && values['zonegroup_hostnames']?.length > 0) {
             serviceSpec['zonegroup_hostnames'] = values['zonegroup_hostnames'];
           }

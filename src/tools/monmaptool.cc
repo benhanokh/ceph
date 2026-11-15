@@ -22,6 +22,8 @@
 #include "auth/Crypto.h"
 #include "global/global_context.h"
 #include "global/global_init.h"
+#include "include/ceph_fs.h" // for CEPH_CRYPTO_AES256KRB5
+#include "include/container_ios.h"
 #include "include/str_list.h"
 #include "mon/MonMap.h"
 #include "mon/mon_types.h" // for ceph::features::mon::*
@@ -408,7 +410,7 @@ int main(int argc, const char **argv)
     monmap.strategy = static_cast<MonMap::election_strategy>(
 		  g_conf().get_val<uint64_t>("mon_election_default_strategy"));
     if (min_mon_release == ceph_release_t::unknown) {
-      min_mon_release = ceph_release_t::umbrella;
+      min_mon_release = ceph_release_t::vampire;
     }
     // TODO: why do we not use build_initial in our normal path here!?!?!
     modified = true;

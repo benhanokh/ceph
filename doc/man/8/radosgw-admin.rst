@@ -159,7 +159,7 @@ as follows:
 
 :command:`object rm`
   Remove an S3/Swift object. Include "--yes-i-really-mean-it" to remove object's
-  entry from bucket index, for example if it's damaged.
+  entry from bucket index, for example if it is damaged.
 
 :command:`object stat`
   Stat an S3/Swift object for its metadata.
@@ -373,7 +373,7 @@ as follows:
 
 :command:`log show`
   Dump a log from specific object or (bucket + date + bucket-id).
-  (NOTE: required to specify formatting of date to "YYYY-MM-DD-hh")
+  (NOTE: required to specify formatting of the date as "YYYY-MM-DD-hh")
 
 :command:`log rm`
   Remove log object.
@@ -429,10 +429,11 @@ as follows:
   List bucket index log which is needed for multi-site deployments.
 
 :command:`bilog trim`
-  Trim bucket index log (use start-marker, end-marker) manually instead
+  Trim bucket index log (use end-marker) manually instead
   of relying on the gateway's integrated log sync.
   Before trimming, compare the listings and make sure the last sync was
-  complete, otherwise it can reinitiate a sync.
+  complete, otherwise it can reinitiate a sync. Without an end-marker the
+  trim has no upper bound, so it requires --yes-i-really-mean-it.
 
 :command:`datalog list`
   List data log which is needed for multi-site deployments.
@@ -469,7 +470,7 @@ as follows:
 :command:`role list`
   List the roles with specified path prefix.
 
-:command:`role modify`
+:command:`role-trust-policy modify`
   Modify the assume role policy of an existing role.
 
 :command:`role-policy put`
@@ -483,6 +484,24 @@ as follows:
 
 :command:`role-policy delete`
   Remove the policy attached to a role
+
+:command:`oidc-provider create`
+  Create an OIDC provider. If ``account-id`` is not specified,
+  the provider is created in the global scope.
+
+:command:`oidc-provider modify`
+  Update thumbprints and/or client-ids of an OIDC provider. The provided list
+  fully replaces the existing list for that field; unspecified fields are left
+  unchanged.
+
+:command:`oidc-provider get`
+  Get information about an OIDC provider.
+
+:command:`oidc-provider delete`
+  Delete an OIDC provider.
+
+:command:`oidc-provider list`
+  List OIDC providers.
 
 :command:`reshard add`
   Schedule a resharding of a bucket
@@ -526,12 +545,12 @@ Options
 .. option:: -c ceph.conf, --conf=ceph.conf
 
    Use ``ceph.conf`` configuration file instead of the default
-   ``/etc/ceph/ceph.conf`` to determine monitor addresses during
+   ``/etc/ceph/ceph.conf`` to determine Monitor addresses during
    startup.
 
 .. option:: -m monaddress[:port]
 
-   Connect to specified monitor (instead of selecting one
+   Connect to specified Monitor (instead of selecting one
    from ceph.conf).
 
 .. option:: --tenant=<tenant>
@@ -573,7 +592,7 @@ Options
 
 .. option:: --generate-key
 
-    create user with or without credentials.
+    Create user with or without credentials.
     If this option set to false, then user cannot set --gen-access-key/--gen-secret/--secret-key/--access-key.
     If this option set to true, then user cannot set  --secret-key/--access-key and bypass options for --gen-secret/--gen-access-key.
     Default is true.
@@ -616,7 +635,7 @@ Options
 .. option:: --pool=<pool>
 
    Specify the pool name.
-   Also used with `orphans find` as data pool to scan for leaked rados objects.
+   Also used with `orphans find` as data pool to scan for leaked RADOS objects.
 
 .. option:: --object=object
 
@@ -659,7 +678,7 @@ Options
 .. option:: --purge-keys
 
    When specified, subuser removal will also purge the subuser' keys.
-   
+
 .. option:: --purge-objects
 
    When specified, the bucket removal will also purge all objects in it.
@@ -865,7 +884,7 @@ Options
 
 .. option:: --categories=<list>
 
-    Comma separated list of categories, used in usage show.
+    Comma-separated list of categories, used in usage show.
 
 .. option:: --caps=<caps>
 
@@ -917,11 +936,11 @@ Options
 
 .. option:: --restore-status
 
-   Filter objects return by the 'restore list' command by status.
+   Filter objects returned by the 'restore list' command by status.
 
 .. option:: --show-restore-stats
 
-   Shows restore stats in a bucket stat command. Here the bucket name need be provided.
+   Shows restore stats in a bucket stat command. The bucket name needs to be provided.
 
 Quota Options
 =============
@@ -949,7 +968,7 @@ Orphans Search Options
 .. option:: --orphan-stale-secs
 
    Number of seconds to wait before declaring an object to be an orphan.
-   The efault is 86400 (24 hours).
+   The default is 86400 (24 hours).
 
 .. option:: --job-id
 
@@ -993,19 +1012,27 @@ Role Options
    The path prefix for filtering the roles.
 
 
+OIDC Provider Options
+=====================
+
+.. option:: --provider-url
+
+   URL of the OIDC provider.
+
+.. option:: --client-ids
+
+   Comma-separated list of client IDs.
+
+.. option:: --thumbprints
+
+   Comma-separated list of thumbprints.
+
+
 Bucket Notifications/PubSub Options
 ===================================
-.. option:: --topic                   
+.. option:: --topic
 
    The bucket notifications/pubsub topic name.
-
-.. option:: --subscription
-
-   The pubsub subscription name.
-
-.. option:: --event-id
-
-   The event id in a pubsub subscription.
 
 
 Examples
@@ -1091,5 +1118,5 @@ https://docs.ceph.com for more information.
 See also
 ========
 
-:doc:`ceph <ceph>`\(8)
+:doc:`ceph <ceph>`\(8),
 :doc:`radosgw <radosgw>`\(8)

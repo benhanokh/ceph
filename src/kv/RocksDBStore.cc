@@ -36,6 +36,7 @@
 #include "common/PriorityCache.h"
 #include "common/strtol.h"
 #include "include/common_fwd.h"
+#include "include/container_ios.h"
 #include "include/scope_guard.h"
 #include "include/str_list.h"
 #include "include/stringify.h"
@@ -2777,9 +2778,8 @@ public:
   // invalid is larger then actual value
   bool is_main_smaller() {
     if (main->valid()) {
-      if (current_shard != shards.end()) {
+      if (current_shard != shards.end() && current_shard->second->valid()) {
 	auto main_rk = main->raw_key();
-	ceph_assert(current_shard->second->valid());
 	auto shards_rk = current_shard->second->raw_key();
 	if (main_rk.first < shards_rk.first)
 	  return true;
@@ -3114,7 +3114,14 @@ public:
 
   int status() override
   {
-    //because we already had to inspect key, it must be ok
+    if (main->status() != 0) {
+      return -1;
+    }
+    for (auto& [prefix, it] : shards) {
+      if (it->status() != 0) {
+        return -1;
+      }
+    }
     return 0;
   }
 

@@ -659,8 +659,9 @@ this case, you should install the required package and restart your Manager
 daemons.
 
 This health check is applied only to enabled modules. If a module is not
-enabled, you can see whether it is reporting dependency issues in the output of
-``ceph module ls``.
+enabled, you can see whether it is reporting dependency issues in the
+``can_run`` and ``error_string`` fields of the output of
+``ceph mgr module ls --format=json-pretty``.
 
 
 MGR_MODULE_ERROR
@@ -1134,13 +1135,12 @@ OSDs, the cluster usage statistics reported by ``ceph df`` will be inaccurate.
 
 The old OSDs can be updated to use the new usage-tracking scheme by stopping
 each OSD, running a repair operation, and then restarting the OSD. For example,
-to update ``osd.123``, run the following commands:
+to update ``osd.123``, stop it (see :ref:`rados-operating-daemons`), run the
+following command, and then start it again:
 
 .. prompt:: bash #
 
-   systemctl stop ceph-osd@123
    ceph-bluestore-tool repair --path /var/lib/ceph/osd/ceph-123
-   systemctl start ceph-osd@123
 
 To disable this alert, run the following command:
 
@@ -1160,14 +1160,13 @@ cluster will report an approximate value for per-pool omap usage based on the
 most recent deep scrub.
 
 The OSDs can be updated to track by pool by stopping each OSD, running a repair
-operation, and then restarting the OSD. For example, to update ``osd.123``, run
-the following commands:
+operation, and then restarting the OSD. For example, to update ``osd.123``, stop
+it (see :ref:`rados-operating-daemons`), run the following command, and then
+start it again:
 
 .. prompt:: bash #
 
-   systemctl stop ceph-osd@123
    ceph-bluestore-tool repair --path /var/lib/ceph/osd/ceph-123
-   systemctl start ceph-osd@123
 
 To disable this alert, run the following command:
 
@@ -1186,13 +1185,12 @@ Per-PG omap allows faster PG removal when PGs migrate.
 
 The older OSDs can be updated to track by PG by stopping each OSD, running a
 repair operation, and then restarting the OSD. For example, to update
-``osd.123``, run the following commands:
+``osd.123``, stop it (see :ref:`rados-operating-daemons`), run the following
+command, and then start it again:
 
 .. prompt:: bash #
 
-   systemctl stop ceph-osd@123
    ceph-bluestore-tool repair --path /var/lib/ceph/osd/ceph-123
-   systemctl start ceph-osd@123
 
 To disable this alert, run the following command:
 
@@ -1200,6 +1198,84 @@ To disable this alert, run the following command:
 
    ceph config set global bluestore_warn_on_no_per_pg_omap false
 
+BLUESTORE_NO_DB_SHARDING
+________________________
+
+One or more OSDs have a RocksDB database that does not use column family
+sharding. OSDs created prior to the Pacific release store all of their
+key-value data in a single RocksDB column family, whereas OSDs created in
+Pacific or later releases shard the data across several column families,
+which improves caching and compaction efficiency and reduces the disk space
+that is temporarily required during compaction. See
+:ref:`bluestore-rocksdb-sharding` for more information.
+
+The OSDs can be updated to use sharding by stopping each OSD and resharding
+its RocksDB database. For example, to reshard ``osd.123``, stop it (see
+:ref:`rados-operating-daemons`), run the following command, and then start it
+again:
+
+.. prompt:: bash #
+
+   ceph-bluestore-tool \
+    --path /var/lib/ceph/osd/ceph-123 \
+    --sharding="m(3) p(3,0-12) O(3,0-13)=block_cache={type=binned_lru} L P" \
+    reshard
+
+To disable this alert, run the following command:
+
+.. prompt:: bash #
+
+   ceph config set global bluestore_warn_on_no_db_sharding false
+
+
+BLUESTORE_LEGACY_MIN_ALLOC_SIZE
+_______________________________
+
+One or more OSDs use a BlueStore allocation unit (``min_alloc_size``) that
+differs from the one a newly deployed OSD would use on the same device.
+This is typically the case for HDD-backed OSDs created prior to the Pacific
+release, which used a 64 KiB allocation unit, whereas the current default is
+4 KiB. OSDs that use a larger allocation unit than necessary suffer from
+increased space usage ("space amplification") when storing small objects,
+erasure-coded chunks, or compressed data. Conversely, OSDs with an
+allocation unit smaller than the one currently configured — for example,
+OSDs deployed before ``bluestore_use_optimal_io_size_for_min_alloc_size``
+was enabled for coarse-IU devices — do not benefit from the intended
+alignment.
+
+The on-disk allocation unit of each OSD is compared against the value that
+a newly created OSD would get on the same device with the current
+configuration. Deliberate choices therefore do not raise this warning: an
+explicitly configured ``bluestore_min_alloc_size`` or a value derived from
+the device's optimal IO size when
+``bluestore_use_optimal_io_size_for_min_alloc_size`` is enabled — for
+example, to align with the coarse indirection unit (IU) of some QLC NVMe
+devices — is considered intentional.
+
+The allocation unit is set when the OSD is created and cannot be changed
+afterwards. To align an OSD with the current configuration, redeploy (destroy
+and re-create) it. Make sure that the cluster is healthy and has enough free
+capacity before doing so, and redeploy only one OSD or failure domain at a
+time. To display the allocation unit of each OSD, run the following command:
+
+.. prompt:: bash #
+
+   ceph osd metadata | jq '.[] | {id, bluestore_min_alloc_size}'
+
+If a large allocation unit is used deliberately without the configuration
+options described above, the alert can be disabled for specific OSDs or
+device classes only, using a configuration mask:
+
+.. prompt:: bash #
+
+   ceph config set osd.123 bluestore_warn_on_legacy_min_alloc_size false
+   ceph config set osd/class:hdd bluestore_warn_on_legacy_min_alloc_size false
+
+To disable this alert entirely, run the following command:
+
+.. prompt:: bash #
+
+   ceph config set global bluestore_warn_on_legacy_min_alloc_size false
 
 BLUESTORE_DISK_SIZE_MISMATCH
 ____________________________
@@ -1407,7 +1483,7 @@ runs or by an external tool that runs a command the following form:
 
 .. prompt:: bash #
 
-   ceph device set-life-expectancy <device-id> <from> <to>
+   ceph device set-life-expectancy <device-id> <from> [<to>]
 
 You can change the stored life expectancy manually, but such a change usually
 doesn't accomplish anything. The reason for this is that whichever tool
@@ -1583,6 +1659,43 @@ size in bytes, search the cluster log for ``Large omap object found``. This issu
 can be caused by RGW bucket index objects that do not have automatic resharding
 enabled. For more information on resharding, see :ref:`RGW Dynamic Bucket Index
 Resharding <rgw_dynamic_bucket_index_resharding>`.
+
+The pool that holds the object usually shows what it is:
+
+- In an RGW log pool, such as ``default.rgw.log``, the object is usually a log
+  that has not been trimmed:
+
+  - Usage logs (``usage.<n>``) grow until they are trimmed: see
+    :ref:`rgw-trim-usage`.
+  - In multisite deployments, RGW trims the metadata log (``meta.log.*``), the
+    data log, and bucket index logs every
+    :confval:`rgw_sync_log_trim_interval` unless that is set to 0, but it never
+    trims the sync error log (``sync.error-log.<n>``) on its own. See
+    :ref:`rgw-multisite-check-the-logs`, and the ``trim`` commands in
+    :ref:`man-radosgw-admin`.
+
+- In an RGW bucket index pool, such as ``default.rgw.buckets.index``, the
+  object is a bucket index shard, which holds an entry for each object in its
+  part of the bucket:
+
+  - A bucket that has outgrown its shards needs resharding, as described
+    above.
+  - In multisite deployments, the shard also holds the bucket index log
+    (bilog), which RGW trims as the other zones sync it, so the bilog keeps
+    growing while sync is stalled or broken. To trim a bilog by hand, check
+    that sync has caught up, then run ``radosgw-admin bilog trim`` as described
+    in :ref:`man-radosgw-admin`. Beginning with the Vampire release, new
+    buckets keep their bilog in a FIFO in the log pool instead, and existing
+    buckets move it there when they are next resharded.
+
+- In a CephFS metadata pool, the object is usually a directory fragment. See
+  :ref:`cephfs-large-omap-objects`.
+
+Changing the pool's ``pg_num`` does not prevent large omap objects: an object
+and all of its omap are stored in a single placement group, so splitting or
+merging placement groups moves the object without making it smaller. After a
+split or merge, the warning can remain until the placement group that holds
+the object is deep scrubbed again.
 
 To adjust the thresholds mentioned above, run a command of following form:
 
@@ -1781,9 +1894,79 @@ For more information, see :ref:`specifying_pool_target_size`.
 TOO_FEW_OSDS
 ____________
 
-The number of OSDs in the cluster is below the configurable threshold of
-:confval:`osd_pool_default_size`. This means that some or all data may not be able to
+The number of OSDs in the cluster is below the size of a new pool,
+:confval:`osd_pool_default_num_zones` times :confval:`osd_pool_default_size`,
+which counts the replicas in each zone.
+This means that some or all data may not be able to
 satisfy the data protection policy specified in CRUSH rules and pool settings.
+
+.. _pool-default-config-override:
+
+POOL_DEFAULT_CONFIG_OVERRIDE
+____________________________
+
+A pool creation default has a value in the ``global`` section of the
+central config store, as ``ceph osd pool default set`` writes it, but one or
+more Monitors override it. ``ceph osd pool create`` runs on the Monitors,
+so it does not use the global value. A setting that is more specific than the
+``global`` section overrides it: one in a ``mon`` or ``mon.<id>`` section of
+the central config store, a masked one such as ``global/host:<host>``, or one
+in a Monitor's local configuration file, environment, command line or runtime
+settings. A setting in the central config store raises the warning even when
+its value is the same as the global value; a Monitor's local setting raises it
+only when its value differs.
+
+``ceph health detail`` names each option and where it is set, for example:
+
+.. code-block:: none
+
+   [WRN] POOL_DEFAULT_CONFIG_OVERRIDE: mon a has pool creation defaults that override their global values
+       osd_pool_default_size is set in section mon of the configuration database
+
+To resolve the warning, remove the override and then set the default with
+``ceph osd pool default set``, which checks the value and writes it to the
+``global`` section:
+
+#. Find where the override is set. ``ceph health detail`` names the option and
+   the section or Monitor. ``ceph osd pool default get`` shows the value that
+   the Monitor serving the command uses and where it comes from.
+
+#. Remove the override where it is set:
+
+   * In a section of the central config store (``mon``, ``mon.<id>`` or a
+     masked section such as ``global/host:<host>``), remove it from that
+     section:
+
+     .. prompt:: bash $
+
+        ceph config rm mon osd_pool_default_size
+
+   * In a Monitor's local configuration file, remove the option from the
+     ``ceph.conf`` on that Monitor's host and restart the Monitor.
+   * On a Monitor's command line or in its environment (for example
+     ``CEPH_ARGS``), remove it there and restart the Monitor.
+   * As a runtime setting made with ``ceph tell mon.<id> config set``, unset
+     it:
+
+     .. prompt:: bash $
+
+        ceph tell mon.<id> config unset osd_pool_default_size
+
+#. Set the default that you want with ``ceph osd pool default set``, for
+   example:
+
+   .. prompt:: bash $
+
+      ceph osd pool default set --replica 3
+
+#. Check that every default now comes from the ``global`` section, or is the
+   built-in default:
+
+   .. prompt:: bash $
+
+      ceph osd pool default get
+
+The warning clears once every Monitor uses the global values.
 
 SMALLER_PGP_NUM
 _______________
@@ -1850,7 +2033,7 @@ One or more pools have reached (or are very close to reaching) their quota. The
 threshold to raise this health check is determined by the
 :confval:`mon_pool_quota_crit_threshold` configuration option.
 
-Pool quotas can be adjusted up or down (or removed) by running commands of the the following
+Pool quotas can be adjusted up or down (or removed) by running commands of the following
 forms:
 
 .. prompt:: bash #
@@ -2141,6 +2324,40 @@ We encourage you to fix this by making sure the CRUSH locations of all Monitors,
 with the exception of a tiebreaker Monitor,
 belong to the dividing buckets. For more information, see :ref:`stretch_mode`.
 
+STRETCH_MODE_POOL_NOT_CONVERTED
+_______________________________
+
+When an upgrade is committed with ``ceph osd require-osd-release`` on a cluster
+in stretch mode, the Monitors give each stretch pool two zones, with half of its
+replicas in each. Only a replicated pool whose CRUSH rule places half of an even
+number of replicas in each zone can be split this way. Any other stretch pool
+keeps one zone and the rules of earlier releases.
+
+Before the commit, this warning names the stretch pools that the commit will
+leave with one zone. Change them so that it can split them, for example with
+``ceph osd pool set {pool-name} size 4`` if their rule places two replicas in
+each zone, or with ``ceph osd pool set {pool-name} crush_rule {rule-name}`` to
+give a pool of size 4 a rule that does.
+
+After the commit, this warning names the stretch pools that kept one zone. They
+still serve I/O, but ``ceph mon disable_stretch_mode`` is refused while any of
+them remains, because it would leave them stretched. ``ceph osd pool set
+{pool-name} crush_rule`` is refused for them too. Fix each pool in one of two
+ways:
+
+* To keep the pool in both zones, run ``ceph osd pool set {pool-name}
+  num_zones 2 --replica 2``. The pool gets two replicas in each zone, on a
+  generated CRUSH rule. A pool of size 3 gains a replica, so make sure that the
+  cluster has space for it first. To keep the pool on one device class, add
+  ``--class {class}``. To keep a CRUSH rule of your own that places two
+  replicas in each zone, add ``--crush_rule {rule-name}``.
+* To make it an ordinary pool in one zone, run ``ceph osd pool set
+  {pool-name} num_zones 1``. The pool gets three replicas, or ``--replica
+  {n}``, on the default CRUSH rule, or ``--crush_rule {rule-name}``. Stretch
+  mode then no longer handles the pool when a zone fails.
+
+For more information, see :ref:`stretch_mode`.
+
 NVMeoF Gateway
 --------------
 
@@ -2216,7 +2433,7 @@ To entirely disable this alert, run the following command:
 
 .. prompt:: bash #
 
-   ceph config set mgr/crash/warn_recent_interval 0
+   ceph config set mgr mgr/crash/warn_recent_interval 0
 
 RECENT_MGR_MODULE_CRASH
 _______________________
@@ -2258,7 +2475,7 @@ To entirely disable this alert, run the following command:
 
 .. prompt:: bash #
 
-   ceph config set mgr/crash/warn_recent_interval 0
+   ceph config set mgr mgr/crash/warn_recent_interval 0
 
 TELEMETRY_CHANGED
 _________________
@@ -2286,7 +2503,7 @@ To re-enable telemetry (and silence the alert), run the following command:
 
 .. prompt:: bash #
 
-   ceph telemetry on
+   ceph telemetry on --license sharing-1-0
 
 To disable telemetry (and silence the alert), run the following command:
 
@@ -2356,6 +2573,34 @@ To disable the debug mode, run the following command:
 .. prompt:: bash #
 
    ceph dashboard debug disable
+
+HIGH_DEBUG_LEVEL
+________________
+
+One or more OSDs or Monitors have a debug subsystem whose log level is at or
+above :confval:`high_debug_level_threshold`. High log levels can produce enough
+log output to saturate the log device and slow the daemon down. This alert is
+raised only if :confval:`high_debug_level_threshold` is set to a non-zero value
+(it is ``0``, disabled, by default).
+
+The alert lists the affected daemons and the highest log level found. To see
+which debug settings of a daemon differ from their defaults, run a command of
+the following form and look for ``debug_`` options:
+
+.. prompt:: bash #
+
+   ceph config show <daemon-name>
+
+Unless :confval:`high_debug_level_reset_timeout` is ``0``, the daemon reverts
+the level automatically once that timeout expires, and the alert clears. To
+clear the alert sooner, lower the level by running a command of the following
+form:
+
+.. prompt:: bash #
+
+   ceph tell <daemon-name> config set debug_<subsystem> <level>
+
+For more information, see :ref:`high-debug-level-guard`.
 
 BLAUM_ROTH_W_IS_NOT_PRIME
 _________________________

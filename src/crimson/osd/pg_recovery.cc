@@ -754,12 +754,24 @@ void PGRecovery::request_budget_retry()
   std::ignore = do_request_budget_retry();
 }
 
-void PGRecovery::on_pg_clean()
+void PGRecovery::reset_backfill_state()
 {
   replica_scan_throttle_releasers.clear();
   budget_retry_releaser.reset();
   budget_retry_in_flight = false;
   backfill_state.reset();
+}
+
+void PGRecovery::on_pg_clean()
+{
+  reset_backfill_state();
+}
+
+void PGRecovery::cancel_backfill()
+{
+  LOG_PREFIX(PGRecovery::cancel_backfill);
+  DEBUGDPP("cancelling backfill state on interval change", *pg->get_dpp());
+  reset_backfill_state();
 }
 
 // PGListener wrapper to PG::start_peering_event_operation
@@ -861,6 +873,34 @@ hobject_t PGRecovery::get_temp_recovery_object(
   return pg->get_recovery_backend()->get_temp_recovery_object(
     target,
     version);
+}
+
+void PGRecovery::on_pool_migration_source_suspended()
+{
+  LOG_PREFIX(PGRecovery::on_pool_migration_source_suspended);
+  DEBUGDPP("", *pg->get_dpp());
+  // TODO
+}
+
+void PGRecovery::on_pool_migration_source_reserved()
+{
+  LOG_PREFIX(PGRecovery::on_pool_migration_source_reserved);
+  DEBUGDPP("", *pg->get_dpp());
+  // TODO
+}
+
+void PGRecovery::on_pool_migration_target_suspended(bool toofull)
+{
+  LOG_PREFIX(PGRecovery::on_pool_migration_target_suspended);
+  DEBUGDPP("", *pg->get_dpp());
+  // TODO
+}
+
+void PGRecovery::on_pool_migration_target_reserved()
+{
+  LOG_PREFIX(PGRecovery::on_pool_migration_target_reserved);
+  DEBUGDPP("", *pg->get_dpp());
+  // TODO
 }
 
 } // namespace crimson::osd

@@ -142,12 +142,14 @@
  */ 
 
 #include <map>
+#include <optional>
 #include <set>
 #include <vector>
 #include <ostream>
 #include <memory>
 #include <string>
 #include "include/buffer_fwd.h"
+#include "osd/ECTypes.h"
 #include "osd/osd_types.h"
 
 #define IGNORE_DEPRECATED \
@@ -223,8 +225,26 @@ namespace ceph {
      * @return a rule on success or a negative errno on error.
      */
     virtual int create_rule(const std::string &name,
-			    CrushWrapper &crush,
-			    std::ostream *ss) const = 0;
+                            CrushWrapper &crush,
+                            std::ostream *ss) const {
+      return create_rule(name, 1, "", "", "", std::nullopt, crush, ss);
+    }
+
+    /**
+     * @param device_class selects the device class of the generated rule:
+     *   std::nullopt inherits the profile's crush-device-class, while an
+     *   explicit value is used verbatim -- an empty string forces a rule with
+     *   no device class, which lets a pool drop an inherited class without
+     *   editing its profile.
+     */
+    virtual int create_rule(const std::string &name,
+                            int num_zones,
+                            const std::string &root,
+                            const std::string &zone_failure_domain,
+                            const std::string &osd_failure_domain,
+                            const std::optional<std::string> &device_class,
+                            CrushWrapper &crush,
+                            std::ostream *ss) const = 0;
 
     /**
      * Return the number of chunks created by a call to the **encode**
@@ -299,18 +319,16 @@ namespace ceph {
      * **minimum_to_decode_with_cost** where each **available** chunk
      * has the same cost.
      *
-     * @see minimum_to_decode_with_cost 
+     * @see minimum_to_decode_with_cost
      *
      * @param [in] want_to_read chunk indexes to be decoded
      * @param [in] available chunk indexes containing valid data
-     * @param [out] minimum chunk indexes and corresponding 
-     *              subchunk index offsets, count.
+     * @param [out] minimum chunk indexes to retrieve
      * @return **0** on success or a negative errno on error.
      */
     virtual int minimum_to_decode(const shard_id_set &want_to_read,
                           const shard_id_set &available,
-                          shard_id_set &minimum_set,
-                          mini_flat_map<shard_id_t, std::vector<std::pair<int, int>>> *minimum_sub_chunks) = 0;
+                          shard_id_set &minimum_set) = 0;
 
     // Interface for legacy EC.
     [[deprecated]]
@@ -677,7 +695,7 @@ namespace ceph {
        */
       FLAG_EC_PLUGIN_REQUIRE_SUB_CHUNKS = 1<<5,
       /* Optimized EC is supported only if this flag is set. All other flags
-       * are irrelevant if this flag is false.
+       * are irrelevant if this flag or the experimental flag are false.
        */
       FLAG_EC_PLUGIN_OPTIMIZED_SUPPORTED = 1<<6,
       /* This plugin supports the ability to encode CRCs of data shards to get
@@ -690,6 +708,12 @@ namespace ceph {
        * shard and that the data shards are simply striped.
        */
       FLAG_EC_PLUGIN_DIRECT_READS = 1<<8,
+      /* Optimized EC is allowed to be used expermimentally if this flag is set.
+         All other flags are irrelevant if this flag or the supported flag are
+         false. Experimental plugins are not supported and are purely for
+         development and testing.
+       */
+      FLAG_EC_PLUGIN_OPTIMIZED_EXPERIMENTAL = 1<<9
     };
     static const char *get_optimization_flag_name(const plugin_flags flag) {
       switch (flag) {
@@ -702,8 +726,9 @@ namespace ceph {
       case FLAG_EC_PLUGIN_OPTIMIZED_SUPPORTED: return "optimizedsupport";
       case FLAG_EC_PLUGIN_CRC_ENCODE_DECODE_SUPPORT:
         return "crcencodedecode";
-      case FLAG_EC_PLUGIN_DIRECT_READS:
-        return "directreads";
+      case FLAG_EC_PLUGIN_DIRECT_READS: return "directreads";
+      case FLAG_EC_PLUGIN_OPTIMIZED_EXPERIMENTAL:
+        return "experimentaloptimizedsupport";
       default: return "???";
       }
     }

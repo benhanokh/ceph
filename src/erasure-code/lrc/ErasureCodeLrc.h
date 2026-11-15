@@ -102,13 +102,23 @@ public:
 			 shard_id_set *minimum) override;
 
   int create_rule(const std::string &name,
-			     CrushWrapper &crush,
-			     std::ostream *ss) const override;
+                  int num_zones,
+                  const std::string &root,
+                  const std::string &zone_failure_domain,
+                  const std::string &osd_failure_domain,
+                  const std::optional<std::string> &device_class,
+                  CrushWrapper &crush,
+                  std::ostream *ss) const override;
+  int create_rule(const std::string &name,
+                  CrushWrapper &crush,
+                  std::ostream *ss) const override;
 
   uint64_t get_supported_optimizations() const override {
-    return FLAG_EC_PLUGIN_PARTIAL_READ_OPTIMIZATION |
+    return FLAG_EC_PLUGIN_OPTIMIZED_EXPERIMENTAL |
+      FLAG_EC_PLUGIN_PARTIAL_READ_OPTIMIZATION |
       FLAG_EC_PLUGIN_PARTIAL_WRITE_OPTIMIZATION |
-      FLAG_EC_PLUGIN_ZERO_INPUT_ZERO_OUTPUT_OPTIMIZATION;
+      FLAG_EC_PLUGIN_ZERO_INPUT_ZERO_OUTPUT_OPTIMIZATION |
+      FLAG_EC_PLUGIN_DIRECT_READS;
   }
 
   unsigned int get_chunk_count() const override {

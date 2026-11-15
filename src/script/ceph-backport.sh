@@ -1643,8 +1643,8 @@ fi
 tracker_title="$(echo "$remote_api_output" | jq -r '.issue.subject')"
 debug "Title of $redmine_url is ->$tracker_title<-"
 
-tracker_description="$(echo "$remote_api_output" | jq -r '.issue.description')"
-debug "Description of $redmine_url is ->$tracker_description<-"
+tracker_pr_id="$(echo "$remote_api_output" | jq -r '.issue.custom_fields[]? | select(.id == 21) | .value')"
+debug "Pull request ID of $redmine_url is ->$tracker_pr_id<-"
 
 tracker_assignee_id="$(echo "$remote_api_output" | jq -r '.issue.assigned_to.id')"
 tracker_assignee_name="$(echo "$remote_api_output" | jq -r '.issue.assigned_to.name')"
@@ -1739,7 +1739,18 @@ if [ "$PR_PHASE" ] ; then
     
     debug "Generating backport PR title"
     if [ "$original_pr" ] ; then
-        backport_pr_title="${milestone}: $(curl --silent https://api.github.com/repos/ceph/ceph/pulls/${original_pr} | jq -r '.title')"
+        remote_api_output=$(curl -u ${github_user}:${github_token} --silent "https://api.github.com/repos/ceph/ceph/pulls/${original_pr}")
+        original_pr_title=$(echo "$remote_api_output" | jq -r '.title')
+        if [ -z "$original_pr_title" ] || [ "$original_pr_title" = "null" ] ; then
+            if [ "$FORCE" ] ; then
+                warning "could not determine title of ${original_pr_url}: check the backport PR title"
+            else
+                error "could not determine title of ${original_pr_url}"
+                info "(hint) run with --force to open the backport PR anyway"
+                false
+            fi
+        fi
+        backport_pr_title="${milestone}: ${original_pr_title}"
     else
         if [[ $tracker_title =~ ^${milestone}: ]] ; then
             backport_pr_title="${tracker_title}"
@@ -1781,13 +1792,13 @@ fi
 
 if [ "$TRACKER_PHASE" ] ; then
     debug "Considering Backport tracker issue ${redmine_url}"
-    status_should_be=2 # In Progress
-    desc_should_be="${backport_pr_url}"
+    status_should_be=13 # Fix Under Review
+    pr_id_should_be="${backport_pr_number}"
     assignee_should_be="${redmine_user_id}"
     if [ "$EXISTING_PR" ] ; then
-        data_binary="{\"issue\":{\"description\":\"${desc_should_be}\",\"status_id\":${status_should_be},\"custom_fields\":[{\"id\":21,\"value\":\"${backport_pr_number}\"}]}}"
+        data_binary="{\"issue\":{\"status_id\":${status_should_be},\"custom_fields\":[{\"id\":21,\"value\":\"${backport_pr_number}\"}]}}"
     else
-        data_binary="{\"issue\":{\"description\":\"${desc_should_be}\",\"status_id\":${status_should_be},\"assigned_to_id\":${assignee_should_be},\"custom_fields\":[{\"id\":21,\"value\":\"${backport_pr_number}\"}]}}"
+        data_binary="{\"issue\":{\"status_id\":${status_should_be},\"assigned_to_id\":${assignee_should_be},\"custom_fields\":[{\"id\":21,\"value\":\"${backport_pr_number}\"}]}}"
     fi
     remote_api_status_code="$(curl --write-out '%{http_code}' --output /dev/null --silent -X PUT --header "Content-type: application/json" --data-binary "${data_binary}" "${redmine_url}.json?key=$redmine_key")"
     if [ "$FORCE" ] || [ "$EXISTING_PR" ] ; then 
@@ -1806,19 +1817,19 @@ if [ "$TRACKER_PHASE" ] ; then
     # check if anything actually changed on the Redmine issue
     remote_api_output=$(curl --silent "${redmine_url}.json?include=journals")
     status_is="$(echo "$remote_api_output" | jq -r '.issue.status.id')"
-    desc_is="$(echo "$remote_api_output" | jq -r '.issue.description')"
+    pr_id_is="$(echo "$remote_api_output" | jq -r '.issue.custom_fields[]? | select(.id == 21) | .value')"
     assignee_is="$(echo "$remote_api_output" | jq -r '.issue.assigned_to.id')"
     tracker_was_updated=""
     tracker_is_in_desired_state="yes"
     [ "$(tracker_component_was_updated "status" "$tracker_status_id" "$status_is")" ] && tracker_was_updated="yes"
-    [ "$(tracker_component_was_updated "desc" "$tracker_description" "$desc_is")" ] && tracker_was_updated="yes"
+    [ "$(tracker_component_was_updated "pr_id" "$tracker_pr_id" "$pr_id_is")" ] && tracker_was_updated="yes"
     if [ "$EXISTING_PR" ] ; then
          true
     else
          [ "$(tracker_component_was_updated "assignee" "$tracker_assignee_id" "$assignee_is")" ] && tracker_was_updated="yes"
     fi
     [ "$(tracker_component_is_in_desired_state "status" "$status_is" "$status_should_be")" ] || tracker_is_in_desired_state=""
-    [ "$(tracker_component_is_in_desired_state "desc" "$desc_is" "$desc_should_be")" ] || tracker_is_in_desired_state=""
+    [ "$(tracker_component_is_in_desired_state "pr_id" "$pr_id_is" "$pr_id_should_be")" ] || tracker_is_in_desired_state=""
     if [ "$EXISTING_PR" ] ; then
         true
     else
@@ -1833,7 +1844,7 @@ if [ "$TRACKER_PHASE" ] ; then
         warning "backport tracker ${redmine_url} was updated, but is not in the desired state. Please check it."
         exit 1
     else
-        data_binary="{\"issue\":{\"notes\":\"please link this Backport tracker issue with GitHub PR ${desc_should_be}\nceph-backport.sh version ${SCRIPT_VERSION}\"}}"
+        data_binary="{\"issue\":{\"notes\":\"please link this Backport tracker issue with GitHub PR ${backport_pr_url}\nceph-backport.sh version ${SCRIPT_VERSION}\"}}"
         remote_api_status_code=$(curl --write-out '%{http_code}' --output /dev/null --silent -X PUT --header "Content-type: application/json" --data-binary "${data_binary}" "${redmine_url}.json?key=$redmine_key")
         if [ "${remote_api_status_code:0:1}" = "2" ] ; then
             info "Comment added to ${redmine_url}"

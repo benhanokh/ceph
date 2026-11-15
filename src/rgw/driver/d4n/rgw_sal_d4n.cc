@@ -845,6 +845,8 @@ int D4NFilterObject::copy_object(const ACLOwner& owner,
                               bool high_precision_time,
                               const char* if_match,
                               const char* if_nomatch,
+                              const char* dest_if_match,
+                              const char* dest_if_nomatch,
                               AttrsMod attrs_mod,
                               bool copy_if_newer,
                               Attrs& attrs,
@@ -861,6 +863,11 @@ int D4NFilterObject::copy_object(const ACLOwner& owner,
                               optional_yield y)
 {
   bool write_to_cache = g_conf()->d4n_writecache_enabled;
+  // XXX: destination conditionals are not checked against the write cache yet
+  if (write_to_cache && (dest_if_match || dest_if_nomatch)) {
+    ldpp_dout(dpp, 10) << "D4NFilterObject::" << __func__ << "(): destination If-Match/If-None-Match not supported with write cache enabled" << dendl;
+    return -ERR_NOT_IMPLEMENTED;
+  }
   bool dirty{false};
   std::unique_ptr<rgw::sal::Object::ReadOp> read_op(this->get_read_op());
   read_op->params.mod_ptr = mod_ptr;
@@ -886,7 +893,8 @@ int D4NFilterObject::copy_object(const ACLOwner& owner,
                            nextBucket(src_bucket),
                            dest_placement, src_mtime, mtime,
                            mod_ptr, unmod_ptr, high_precision_time, if_match,
-                           if_nomatch, attrs_mod, copy_if_newer, attrs,
+                           if_nomatch, dest_if_match, dest_if_nomatch,
+                           attrs_mod, copy_if_newer, attrs,
                            category, olh_epoch, delete_at, version_id, tag,
                            etag, progress_cb, progress_data, dp_factory, dpp, y);
     if (ret < 0) {
@@ -1202,13 +1210,13 @@ int D4NFilterObject::get_obj_attrs_from_cache(const DoutPrefixProvider* dpp, opt
 int D4NFilterObject::set_attr_crypt_parts(const DoutPrefixProvider* dpp, optional_yield y, rgw::sal::Attrs& attrs)
 {
   if (attrs.count(RGW_ATTR_CRYPT_MODE)) {
-    std::vector<size_t> parts_len;
+    std::vector<uint64_t> parts_len;
     uint64_t obj_size = this->get_size();
     uint64_t obj_max_chunk_size = dpp->get_cct()->_conf->rgw_max_chunk_size;
     uint64_t num_parts = (obj_size%obj_max_chunk_size) == 0 ? obj_size/obj_max_chunk_size : (obj_size/obj_max_chunk_size) + 1;
-    size_t remainder_size = obj_size;
+    uint64_t remainder_size = obj_size;
     for (uint64_t part = 0; part < num_parts; part++) {
-      size_t part_len;
+      uint64_t part_len;
       if (part == (num_parts - 1)) { //last part
         part_len = remainder_size;
       } else {

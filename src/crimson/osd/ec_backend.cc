@@ -1,5 +1,3 @@
-#include <boost/iterator/counting_iterator.hpp>
-
 #include "crimson/common/log.h"
 #include "crimson/osd/pg.h"
 #include "crimson/osd/shard_services.h"
@@ -108,12 +106,29 @@ struct ECCrimsonOp : ECCommon::RMWPipeline::Op {
   PGTransactionUPtr t;
   const PGLog &pg_log;
 
+  std::optional<hobject_t> consider_updating_migration_watermark(ECListener *parent) override {
+    // TODO: Implement migration watermark logic
+    return std::nullopt;  // For now, return empty (no migration)
+  }
+
   static PGTransactionUPtr translate_transaction(
     ceph::os::Transaction&& t,
-    crimson::osd::ObjectContextRef &&obc)
+    crimson::osd::ObjectContextRef &&obc,
+    crimson::osd::ObjectContextRef &&new_clone,
+    crimson::osd::ObjectContextRef &&rollback_to)
   {
     auto t_pg = std::make_unique<PGTransaction>();
     t_pg->add_obc(std::move(obc));
+    // as PrimaryLogPG::issue_repop() does, so that ECTransaction
+    // updates the attr_cache of the clone too
+    if (new_clone) {
+      t_pg->add_obc(std::move(new_clone));
+    }
+    // as PrimaryLogPG::_rollback_to() does, so that ECTransaction
+    // can read the OI and the xattrs of the source of the clone op
+    if (rollback_to) {
+      t_pg->add_obc(std::move(rollback_to));
+    }
     auto i = std::begin(t);
     while (i.have_op()) {
       auto* op = i.decode_op();
@@ -246,10 +261,14 @@ struct ECCrimsonOp : ECCommon::RMWPipeline::Op {
 
   ECCrimsonOp(ceph::os::Transaction&& t,
               crimson::osd::ObjectContextRef &&obc,
+              crimson::osd::ObjectContextRef &&new_clone,
+              crimson::osd::ObjectContextRef &&rollback_to,
               const PGLog &pg_log,
        ECCommon::RMWPipeline& rmw_pipeline)
     : Op(rmw_pipeline),
-      t(translate_transaction(std::move(t), std::move(obc))),
+      t(translate_transaction(std::move(t), std::move(obc),
+                              std::move(new_clone),
+                              std::move(rollback_to))),
       pg_log(pg_log) {
   }
 
@@ -314,6 +333,7 @@ ECBackend::rep_op_fut_t
 ECBackend::submit_transaction(const std::set<pg_shard_t> &pg_shards,
                               crimson::osd::ObjectContextRef&& obc,
 			      crimson::osd::ObjectContextRef&& new_clone,
+			      crimson::osd::ObjectContextRef&& rollback_to,
                               ceph::os::Transaction&& txn,
                               osd_op_params_t&& osd_op_p,
                               epoch_t min_epoch, epoch_t max_epoch,
@@ -325,7 +345,8 @@ ECBackend::submit_transaction(const std::set<pg_shard_t> &pg_shards,
   DEBUGDPP("hoid={} attr_cache={}", dpp, hoid, obc->attr_cache);
   auto op =
     std::make_unique<ECCrimsonOp>(
-      std::move(txn), std::move(obc), pg_log, rmw_pipeline);
+      std::move(txn), std::move(obc), std::move(new_clone),
+      std::move(rollback_to), pg_log, rmw_pipeline);
   op->hoid = hoid;
   //op->delta_stats = delta_stats;
   op->version = osd_op_p.at_version;
@@ -496,13 +517,6 @@ ECBackend::handle_rep_write_reply(ECSubWriteReply&& op)
   return write_iertr::now();
 }
 
-bool ECBackend::is_single_chunk(const hobject_t& obj, const ECSubRead& op)
-{
-  return (op.subchunks.find(obj)->second.size() == 1) &&
-    (op.subchunks.find(obj)->second.front().second ==
-      ec_impl->get_sub_chunk_count());
-}
-
 ECBackend::ll_read_errorator::future<ceph::bufferlist>
 ECBackend::maybe_chunked_read(
   const hobject_t& obj,
@@ -514,44 +528,9 @@ ECBackend::maybe_chunked_read(
   LOG_PREFIX(ECBackend::maybe_chunked_read);
   DEBUGDPP("tid={} hoid={} off={} size={} flags={}", dpp, op.tid, obj, off, size, flags);
   DEBUGDPP("tid={} ghobj={}", dpp, op.tid, ghobject_t{obj, ghobject_t::NO_GEN, get_shard()});
-  if (is_single_chunk(obj, op)) {
-    return crimson::os::with_store<&crimson::os::FuturizedStore::Shard::read>(
-      store,
-      coll, ghobject_t{obj, ghobject_t::NO_GEN, get_shard()}, off, size, flags);
-  } else {
-    return seastar::do_with(ceph::bufferlist{}, [=, this] (auto&& result_bl) {
-      const int subchunk_size =
-        sinfo.get_chunk_size() / ec_impl->get_sub_chunk_count();
-      return crimson::do_for_each(
-        boost::make_counting_iterator(0UL),
-        boost::make_counting_iterator(1 + (size-1) / sinfo.get_chunk_size()),
-        [off, flags, subchunk_size, &obj, &op, &result_bl, this] (const auto m) {
-          const auto& sub_spec = op.subchunks.find(obj)->second;
-          return crimson::do_for_each(
-            std::begin(sub_spec),
-            std::end(sub_spec),
-            [&obj, off, flags, subchunk_size, m, &result_bl, this] (const auto& subchunk) {
-              const auto [sub_off_count, sub_size_count] = subchunk;
-              return crimson::os::with_store<&crimson::os::FuturizedStore::Shard::read>(
-                store,
-                coll,
-                ghobject_t{obj, ghobject_t::NO_GEN, get_shard()},
-                off + m*sinfo.get_chunk_size() + sub_off_count*subchunk_size,
-                sub_size_count * subchunk_size,
-                flags
-              ).safe_then([&result_bl] (auto&& sub_bl) {
-		result_bl.claim_append(sub_bl);
-                return ll_read_errorator::now();
-              });
-            }
-          );
-        }
-      ).safe_then([&result_bl] {
-        return ll_read_errorator::make_ready_future<ceph::bufferlist>(
-          std::move(result_bl));
-      });
-    });
-  }
+  return crimson::os::with_store<&crimson::os::FuturizedStore::Shard::read>(
+    store,
+    coll, ghobject_t{obj, ghobject_t::NO_GEN, get_shard()}, off, size, flags);
 }
 
 void ECBackend::objects_read_and_reconstruct(
@@ -763,8 +742,7 @@ ECBackend::handle_rep_read_reply(ECSubReadReply& mop)
 
       int err = -EIO; // If attributes needed but not read.
       if (!rop.to_read.at(oid).want_attrs || rop.complete.at(oid).attrs) {
-        err = ec_impl->minimum_to_decode(want_to_read, have, dummy_minimum,
-                                         nullptr);
+        err = ec_impl->minimum_to_decode(want_to_read, have, dummy_minimum);
       }
 
       if (err) {

@@ -109,6 +109,7 @@ class ECBackend : public ECCommon {
 
   void on_change();
   void clear_recovery_state();
+  void cancel_recovery_op(const hobject_t &soid);
 
   void dump_recovery_info(ceph::Formatter *f) const;
 
@@ -277,7 +278,7 @@ public:
 
   ceph::ErasureCodeInterfaceRef ec_impl;
 
-  PGBackend::Listener *get_parent() { return parent; }
+  PGBackend::Listener *get_parent() const { return parent; }
 
   /**
    * ECRecPred
@@ -299,18 +300,11 @@ public:
     bool operator()(const std::set<pg_shard_t> &_have) const override {
       shard_id_set have;
       for (pg_shard_t p: _have) {
-        have.insert(p.shard);
-      }
-      std::unique_ptr<shard_id_map<std::vector<std::pair<int, int>>>>
-          min_sub_chunks = nullptr;
-      if (sinfo->supports_sub_chunks()) {
-        min_sub_chunks = std::make_unique<shard_id_map<std::vector<std::pair<
-          int, int>>>>(sinfo->get_k_plus_m());
+        have.insert(sinfo->get_rel_shard(p.shard));
       }
       shard_id_set min;
 
-      return ec_impl->minimum_to_decode(want, have, min, min_sub_chunks.get())
-          == 0;
+      return ec_impl->minimum_to_decode(want, have, min) == 0;
     }
   };
 
@@ -337,6 +331,13 @@ public:
 
   uint64_t get_is_nonprimary_shard(shard_id_t shard) const {
     return sinfo.is_nonprimary_shard(shard);
+  }
+
+  /// Relative (per-zone) shard ID for this OSD; use instead of
+  /// whoami_shard().shard when indexing EC per-zone structures.
+  shard_id_t whoami_rel_shard() const {
+    shard_id_t abs = get_parent()->whoami_shard().shard;
+    return sinfo.get_shard(sinfo.get_raw_shard(abs));
   }
 
   /**

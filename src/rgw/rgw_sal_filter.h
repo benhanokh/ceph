@@ -397,9 +397,11 @@ public:
 				      const std::map<std::string,
 				      std::string>& meta) override;
   virtual void get_quota(RGWQuota& quota) override;
-  virtual void get_ratelimit(RGWRateLimitInfo& bucket_ratelimit,
-			     RGWRateLimitInfo& user_ratelimit,
-			     RGWRateLimitInfo& anon_ratelimit) override;
+  virtual void get_ratelimit(
+      RGWRateLimitInfo& bucket_ratelimit,
+      RGWRateLimitInfo& user_ratelimit,
+      RGWRateLimitInfo& account_ratelimit,
+      RGWRateLimitInfo& anon_ratelimit) override;
   virtual int set_buckets_enabled(const DoutPrefixProvider* dpp,
 				  std::vector<rgw_bucket>& buckets,
 				  bool enabled, optional_yield y) override;
@@ -492,6 +494,18 @@ public:
 
   virtual const std::string& get_compression_type(const rgw_placement_rule& rule) override;
   virtual bool valid_placement(const rgw_placement_rule& rule) override;
+  int load_vector_bucket(const DoutPrefixProvider* dpp, const rgw_bucket& b,
+                          std::unique_ptr<VectorBucket>* bucket, optional_yield y) override {
+    return next->load_vector_bucket(dpp, b, bucket, y);
+  }
+  int list_vector_buckets(const DoutPrefixProvider* dpp,
+                           const rgw_owner& owner, const std::string& ns,
+                           const std::string& marker, const std::string& end_marker,
+                           uint64_t max, BucketList& buckets,
+                           optional_yield y) override {
+    return next->list_vector_buckets(dpp, owner, ns, marker,
+                                     end_marker, max, buckets, y);
+  }
 
   virtual void shutdown(void) override { next->shutdown(); };
 
@@ -555,6 +569,7 @@ public:
                   GroupList& listing) override;
 
   RGWUserInfo& get_info() override { return next->get_info(); }
+  const RGWUserInfo& get_info() const override { return next->get_info(); }
   virtual void print(std::ostream& out) const override { return next->print(out); }
 
   /* Internal to Filters */
@@ -782,6 +797,7 @@ public:
                const ceph::real_time* mod_ptr, const ceph::real_time* unmod_ptr,
                bool high_precision_time,
                const char* if_match, const char* if_nomatch,
+               const char* dest_if_match, const char* dest_if_nomatch,
                AttrsMod attrs_mod, bool copy_if_newer, Attrs& attrs,
                RGWObjCategory category, uint64_t olh_epoch,
 	       boost::optional<ceph::real_time> delete_at,
@@ -814,6 +830,8 @@ public:
 
   virtual int load_obj_state(const DoutPrefixProvider *dpp, optional_yield y,
                              bool follow_olh = true) override;
+  virtual int update_olh(const DoutPrefixProvider* dpp, optional_yield y,
+                         uint32_t flags) override;
   virtual int set_obj_attrs(const DoutPrefixProvider* dpp, Attrs* setattrs,
 			    Attrs* delattrs, optional_yield y, uint32_t flags) override;
   virtual int get_obj_attrs(optional_yield y, const DoutPrefixProvider* dpp) override;

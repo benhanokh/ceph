@@ -1,6 +1,8 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
 // vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
+#include <fmt/chrono.h>
+
 #include "rgw_common.h"
 #include "rgw_rest_client.h"
 #include "rgw_acl_s3.h"
@@ -416,6 +418,10 @@ auto RGWRESTSimpleRequest::forward_request(const DoutPrefixProvider *dpp, const 
     new_env.set(std::move(key), v);
   }
 
+  const char* content_type = info.env->get("CONTENT_TYPE");
+  if (content_type) {
+    new_env.set("HTTP_CONTENT_TYPE", content_type);
+  }
 
   int ret = sign_request(dpp, key, region, s, new_env, new_info, nullptr);
   if (ret < 0) {

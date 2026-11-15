@@ -25,11 +25,12 @@ from ceph.utils import datetime_now
 import orchestrator
 from orchestrator import OrchestratorError, set_exception_subject, OrchestratorEvent, \
     DaemonDescriptionStatus, daemon_type_to_service
-from cephadm.services.cephadmservice import CephadmDaemonDeploySpec
+from cephadm.services.cephadmservice import CephadmDaemonDeploySpec, DaemonDeployContext
 from cephadm.schedule import HostAssignment, HostSelector
 from cephadm.autotune import MemoryAutotuner
 from cephadm.utils import forall_hosts, cephadmNoImage, is_repo_digest, \
-    CephadmNoImage, CEPH_TYPES, ContainerInspectInfo, SpecialHostLabels
+    CephadmNoImage, CEPH_TYPES, ContainerInspectInfo, SpecialHostLabels, \
+    build_ceph_volume_cmd
 from mgr_module import MonCommandFailed
 from mgr_util import format_bytes
 from cephadm.services.service_registry import service_registry
@@ -171,16 +172,20 @@ class CephadmServe:
                 self.mgr.service_action('reconfig', svc)
 
     def _serve_sleep(self) -> None:
-        sleep_interval = max(
-            30,
-            min(
-                self.mgr.host_check_interval,
-                self.mgr.facts_cache_timeout,
-                self.mgr.daemon_cache_timeout,
-                self.mgr.device_cache_timeout,
-                self.mgr.stray_daemon_check_interval,
-            )
-        )
+        candidates = [
+            self.mgr.host_check_interval,
+            self.mgr.facts_cache_timeout,
+            self.mgr.daemon_cache_timeout,
+            self.mgr.device_cache_timeout,
+            self.mgr.stray_daemon_check_interval,
+        ]
+        if self.mgr.use_agent:
+            # _agent_down() only runs once per serve loop, so cap the sleep at
+            # the down-detection threshold. A future larger refactor is to run
+            # agent-down detection on its own thread.
+            down_mult = max(self.mgr.agent_down_multiplier, 1.5)
+            candidates.append(int(down_mult * self.mgr.agent_refresh_rate))
+        sleep_interval = max(30, min(candidates))
         self.log.debug('Sleeping for %d seconds', sleep_interval)
         self.mgr.event.wait(sleep_interval)
         self.mgr.event.clear()
@@ -404,24 +409,25 @@ class CephadmServe:
     def _refresh_host_devices(self, host: str) -> Optional[str]:
         with_lsm = self.mgr.device_enhanced_scan
         list_all = self.mgr.inventory_list_all
-        inventory_args = ['--', 'inventory',
-                          '--format=json-pretty',
-                          '--filter-for-batch']
+        inventory_args = build_ceph_volume_cmd(
+            self.mgr.ceph_volume_log_level,
+            ['inventory', '--format=json-pretty', '--filter-for-batch'])
         if with_lsm:
             inventory_args.insert(-1, "--with-lsm")
         if list_all:
             inventory_args.insert(-1, "--list-all")
-
         try:
             try:
-                with self.mgr.async_timeout_handler(host, 'cephadm ceph-volume -- inventory'):
+                with self.mgr.async_timeout_handler(
+                        host, f'cephadm ceph-volume {" ".join(inventory_args)}'):
                     devices = self.mgr.wait_async(self._run_cephadm_json(
                         host, 'osd', 'ceph-volume', inventory_args, log_output=self.mgr.log_refresh_metadata))
             except OrchestratorError as e:
                 if 'unrecognized arguments: --filter-for-batch' in str(e):
                     rerun_args = inventory_args.copy()
                     rerun_args.remove('--filter-for-batch')
-                    with self.mgr.async_timeout_handler(host, 'cephadm ceph-volume -- inventory'):
+                    with self.mgr.async_timeout_handler(
+                            host, f'cephadm ceph-volume {" ".join(rerun_args)}'):
                         devices = self.mgr.wait_async(self._run_cephadm_json(
                             host, 'osd', 'ceph-volume', rerun_args, log_output=self.mgr.log_refresh_metadata))
                 else:
@@ -1105,7 +1111,7 @@ class CephadmServe:
                     slot.daemon_type, daemon_id, slot.hostname))
 
                 try:
-                    daemon_spec = svc.prepare_create(daemon_spec)
+                    daemon_spec = svc.prepare_create(DaemonDeployContext(daemon_spec, spec))
                     with self.mgr.async_timeout_handler(slot.hostname, f'cephadm deploy ({daemon_spec.daemon_type} type dameon)'):
                         self.mgr.wait_async(self._create_daemon(daemon_spec))
                     r = True
@@ -1345,6 +1351,25 @@ class CephadmServe:
             if action:
                 if scheduled_action == 'redeploy' and action == 'reconfig':
                     action = 'redeploy'
+                # For OSD redeploy/reconfig that was NOT explicitly scheduled by
+                # the user (i.e. scheduled_action was None), check ok-to-stop
+                # before proceeding.  A redeploy/reconfig stops the OSD; running
+                # it when the cluster cannot afford to lose that OSD risks data
+                # unavailability.  If the OSD is not safe to stop right now,
+                # defer the action to the next serve-loop iteration.
+                if (
+                    dd.daemon_type == 'osd'
+                    and action in ('redeploy', 'reconfig')
+                    and not scheduled_action
+                ):
+                    r = svc_obj.ok_to_stop([dd.daemon_id])
+                    if r.retval:
+                        self.log.info(
+                            'Skipping %s of %s (not ok-to-stop: %s); '
+                            'will retry next serve loop',
+                            action, dd.name(), r.stderr,
+                        )
+                        continue
                 try:
                     daemon_spec = CephadmDaemonDeploySpec.from_daemon_description(dd)
                     reconfig_extras: dict[str, Any] = {}
@@ -1353,7 +1378,6 @@ class CephadmServe:
                     if send_signal_to_daemon:
                         reconfig_extras['send_signal_to_daemon'] = send_signal_to_daemon
                     self.mgr._daemon_action(daemon_spec, action=action, **reconfig_extras)
-
                     if self.mgr.cache.rm_scheduled_daemon_action(dd.hostname, dd.name()):
                         self.mgr.cache.save_host(dd.hostname)
                 except OrchestratorError as e:
@@ -1557,8 +1581,6 @@ class CephadmServe:
                     spec = cast(CustomContainerSpec,
                                 self.mgr.spec_store[daemon_spec.service_name].spec)
                     image = spec.image
-                    if spec.ports:
-                        ports.extend(spec.ports)
 
                 # TCP port to open in the host firewall
                 if len(ports) > 0:

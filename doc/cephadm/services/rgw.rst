@@ -70,7 +70,7 @@ example spec file:
       label: rgw
       count_per_host: 2
     networks:
-    - 192.169.142.0/24
+    - 192.168.142.0/24
     spec:
       rgw_frontend_port: 8080
 
@@ -101,6 +101,58 @@ example spec file:
 .. note:: ``cephadm`` combines the arguments from the ``spec`` section with those from
 	  ``rgw_frontend_extra_args`` into a single space-separated arguments list
 	  which is used to set the value of the ``rgw_frontends`` configuration parameter.
+
+Adding a second port to accept HTTP traffic
+-------------------------------------------
+
+When SSL is enabled, the ``rgw_frontend_http_port`` parameter configures
+an additional port on the frontend that accepts plain HTTP traffic, while
+``rgw_frontend_port`` keeps serving HTTPS. The value is an integer, it must
+differ from ``rgw_frontend_port`` and it requires ``ssl: true``. Specs that set it
+without SSL are rejected by validation.
+
+Example spec file:
+
+.. code-block:: yaml
+
+    service_type: rgw
+    service_id: foo
+    placement:
+      label: rgw
+      count_per_host: 2
+    spec:
+      rgw_realm: myrealm
+      rgw_zone: myzone
+      rgw_frontend_type: "beast"
+      rgw_frontend_port: 443
+      rgw_frontend_http_port: 8080
+      ssl: true
+      generate_cert: true
+
+With ``count_per_host`` greater than one, each daemon on a host uses the
+next consecutive port for both ports, so the range starting at
+``rgw_frontend_port`` and the range starting at ``rgw_frontend_http_port``
+must not overlap. For the same reason ``port``, ``ssl_port``, ``endpoint``
+and ``ssl_endpoint`` cannot be set in ``rgw_frontend_extra_args`` when
+``rgw_frontend_http_port`` is used with ``count_per_host`` greater than
+one: every daemon on the host would bind the same fixed port.
+A port given in ``rgw_frontend_extra_args`` must also differ from
+``rgw_frontend_port``, from ``rgw_frontend_http_port`` and from the other
+ports in ``rgw_frontend_extra_args``.
+
+
+.. note::
+   ``cephadm`` combines the arguments from the ``spec`` section with those from
+   ``rgw_frontend_extra_args`` into a single space-separated argument list
+   which is used to set the value of the ``rgw_frontends`` configuration
+   parameter. Ports given in ``rgw_frontend_extra_args`` are passed on
+   unchanged and are independent of ``rgw_frontend_http_port``.
+
+.. note::
+   Adding ``rgw_frontend_http_port`` to an existing service redeploys
+   its RGW daemons so that the new port is opened.
+
+
 
 Multisite zones
 ---------------
@@ -148,13 +200,14 @@ HTTPS certificates, all managed through the cephadm Certificate Manager (certmgr
   signs a certificate for the RGW service automatically.
 
 - **inline:**
-  Users can set the ``certificate_source`` to ``inline`` in the spec and
-  embed the certificate and private key directly in the spec using
-  the ``ssl_cert`` and ``ssl_key`` fields.
+  Users can set ``certificate_source`` to ``inline`` and embed the certificate
+  and private key directly in the spec using ``ssl_cert`` and ``ssl_key``.
+  ``ssl_cert`` may contain a certificate chain: leaf certificate followed by
+  optional intermediate CA certificates.
 
 - **reference:**
-  Users can register their own certificate and key with certmgr and
-  set the ``certificate_source`` to ``reference`` in the spec.
+  Users can register their own certificate and key with certmgr and set
+  ``certificate_source`` to ``reference`` in the spec.
 
 **Option 1: Inline certificate and key**
 
@@ -167,7 +220,10 @@ HTTPS certificates, all managed through the cephadm Certificate Manager (certmgr
     certificate_source: inline
     ssl_cert: |
       -----BEGIN CERTIFICATE-----
-      (PEM cert contents here)
+      (PEM leaf cert contents here)
+      -----END CERTIFICATE-----
+      -----BEGIN CERTIFICATE-----
+      (optional PEM intermediate cert contents here)
       -----END CERTIFICATE-----
     ssl_key: |
       -----BEGIN PRIVATE KEY-----
@@ -183,8 +239,12 @@ Apply the spec:
 .. note::
 
    The older ``rgw_frontend_ssl_certificate`` field is still supported
-   for backward compatibility, but it is deprecated.
-   New deployments should use ``ssl_cert`` / ``ssl_key`` instead.
+   for backward compatibility, but it is deprecated.  New deployments
+   should use ``ssl_cert`` / ``ssl_key`` instead.  If used,
+   ``rgw_frontend_ssl_certificate`` must contain a combined PEM bundle:
+   unencrypted private key, leaf certificate, and optional intermediate CA
+   certificates.  A certificate chain without the private key is not valid
+   for this field.
 
 **Option 2: Reference to a registered certificate/key**
 
@@ -192,8 +252,8 @@ First, register the certificate and key with certmgr:
 
 .. prompt:: bash #
 
-  ceph orch certmgr cert set --cert-name rgw_ssl_cert --service-name rgw.<service_id> -i $PWD/server_cert.pem
-  ceph orch certmgr key set --key-name rgw_ssl_key  --service-name rgw.<service_id> -i $PWD/server_key
+  ceph orch certmgr cert set rgw_ssl_cert --service-name rgw.<service_id> -i $PWD/server_cert.pem
+  ceph orch certmgr key set rgw_ssl_key --service-name rgw.<service_id> -i $PWD/server_key.pem
 
 Then use ``reference`` source in the RGW spec:
 
@@ -335,6 +395,69 @@ new client requests during this time.
     or ``ceph orch daemon redeploy <daemon-name>`` commands
 
 
+Pushing bucket usage metrics to Pushgateway
+--------------------------------------------
+
+Cephadm can optionally push per-bucket and per-user RGW storage usage metrics
+to a Prometheus Pushgateway at a configurable interval.  A running pushgateway
+service is required (see :ref:`mgr-cephadm-monitoring`).
+
+To enable this, set ``metrics_push_enabled`` to ``true`` in the RGW service
+spec.  The following options are available:
+
+- ``metrics_push_enabled`` (bool, default ``false``) – enable the periodic
+  metrics push timer.
+- ``metrics_push_interval`` (int, default ``3600``, minimum ``60``) – how
+  often (in seconds) the push job runs.
+- ``metrics_push_timeout`` (int, default ``300``, minimum ``30``) – maximum
+  time (in seconds) the job can run before being killed.
+
+Example spec:
+
+.. code-block:: yaml
+
+    service_type: rgw
+    service_id: myrealm.myzone
+    placement:
+      hosts:
+      - host1
+    spec:
+      rgw_realm: myrealm
+      rgw_zone: myzone
+      metrics_push_enabled: true
+      metrics_push_interval: 3600
+      metrics_push_timeout: 300
+
+When enabled, cephadm installs a systemd timer for each RGW daemon that
+periodically runs the ``rgw-export-bucket-usage`` script inside the RGW
+container.  The following Prometheus metrics are pushed:
+
+- ``ceph_rgw_bucket_usage_bytes`` – total logical size in bytes per bucket
+- ``ceph_rgw_bucket_usage_bytes_utilized`` – total compressed size in bytes
+  per bucket
+- ``ceph_rgw_bucket_usage_objects`` – total number of objects per bucket
+
+Each metric carries ``bucket``, ``owner``, ``tenant``, and ``zone`` labels.
+
+When a service has multiple RGW daemons, only one daemon (the first
+sorted by name) is elected to run the metrics-push timer.  This avoids
+redundant bucket-stats scans across all daemons.  If the elected daemon
+becomes unavailable, the push pauses until cephadm recovers the daemon.
+To force a new election, remove the unhealthy daemon with
+``ceph orch daemon rm <daemon-name>``.
+
+.. note::
+
+   Enable ``metrics_push_enabled`` on only one RGW service per zone.
+   If multiple services share a zone and both enable it, each will
+   independently scan and push bucket stats for that zone.
+
+The timer is automatically cleaned up when the RGW daemon is removed or when
+``metrics_push_enabled`` is set to ``false``.  Changing ``metrics_push_interval``
+or ``metrics_push_timeout`` automatically reconfigures the timer.  When
+``secure_monitoring_stack`` is enabled, metrics are pushed over HTTPS with
+mTLS certificates that are provisioned automatically.
+
 Service specification
 ---------------------
 
@@ -355,7 +478,7 @@ balancing on a floating virtual IP.
 
 If the RGW service is configured with SSL enabled, then the ingress service
 will use the `ssl` and `verify none` options in the backend configuration.
-Trust verification is disabled because the backends are accessed by IP 
+Trust verification is disabled because the backends are accessed by IP
 address instead of FQDN.
 
 .. image:: ../../images/HAProxy_for_RGW.svg
@@ -409,6 +532,8 @@ Service specs are YAML blocks with the following properties:
       use_keepalived_multicast: <bool>          # optional: Default is False.
       vrrp_interface_network: <string>/<string> # optional: ex: 192.168.20.0/24
       health_check_interval: <string>           # optional: Default is 2s.
+      haproxy_log_target: <string>              # optional: Default is journald. Use none to disable logging.
+      haproxy_log_level: <string>               # optional: Default is info.
       ssl: true
       certificate_source: inline                # optional: Default is cephadm-signed
       ssl_cert: |                               # optional: SSL certificate and key
@@ -539,6 +664,21 @@ where the properties of this service specification are:
 * ``monitor_networks``
     If ``monitor_networks`` is specified, an IP address that matches one of the specified
     networks will be used. If an IP address is not present, then default host IP will be used.
+* ``haproxy_log_target``
+    Where HAProxy sends its logs. Default is ``journald``: HAProxy writes its logs to stdout
+    and cephadm's Podman ``journald`` log driver forwards them to the host systemd journal.
+    Read them with ``cephadm logs --name <haproxy-daemon>`` or
+    ``journalctl -u ceph-<fsid>@<haproxy-daemon>``. Set to ``none`` to stop HAProxy access
+    logging. Note that HAProxy startup, shutdown, and configuration messages (for example,
+    worker fork/exit lines) may still appear in the journal even when the target is ``none``.
+* ``haproxy_log_level``
+    Severity filter on the HAProxy ``log`` directive. Default is ``info``. Valid values are
+    ``debug``, ``info``, ``notice``, ``warning``, and ``err``. Access logs are emitted at
+    ``info`` severity, so ``info`` (or ``debug``) is required to see per-request (HTTP) or
+    per-connection (TCP) access records. A stricter level (``notice``, ``warning``, or ``err``)
+    suppresses normal access logs and keeps only higher-severity events. ``debug`` additionally
+    enables HAProxy health-check status logging (``option log-health-checks``) and is meant for
+    troubleshooting.
 
 .. _ingress-virtual-ip:
 

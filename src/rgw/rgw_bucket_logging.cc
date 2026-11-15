@@ -3,6 +3,7 @@
 
 #include <time.h>
 #include <random>
+#include <fmt/chrono.h>
 #include "common/ceph_time.h"
 #include "rgw_bucket_logging.h"
 #include "rgw_bucket_logging_types.h"
@@ -465,7 +466,8 @@ int log_record(rgw::sal::Driver* driver,
     const DoutPrefixProvider *dpp,
     optional_yield y,
     bool async_completion,
-    bool log_source_bucket) {
+    bool log_source_bucket,
+    bool bucket_deleted) {
   record_input input;
   input.bucket = s->bucket.get();
   input.time = s->time;
@@ -509,12 +511,11 @@ int log_record(rgw::sal::Driver* driver,
   }
   input.http_ret = s->err.http_ret;
   input.err_code = s->err.err_code;
-  input.content_length = s->content_length;
   input.granted_by_acl = s->granted_by_acl;
   input.src_object = s->src_object.get();
   input.src_bucket_name = s->src_bucket_name;
   return log_record(driver, obj, input, op_name, etag, size, conf,
-                    dpp, y, async_completion, log_source_bucket);
+                    dpp, y, async_completion, log_source_bucket, bucket_deleted);
 }
 
 int log_record(rgw::sal::Driver* driver,
@@ -527,7 +528,8 @@ int log_record(rgw::sal::Driver* driver,
     const DoutPrefixProvider *dpp,
     optional_yield y,
     bool async_completion,
-    bool log_source_bucket) {
+    bool log_source_bucket,
+    bool bucket_deleted) {
   auto set_journal_err = [&conf, &input](const std::string& err_message) {
     if (conf.logging_type == LoggingType::Journal && input.journal_err_out) {
       *input.journal_err_out = err_message;
@@ -568,18 +570,19 @@ int log_record(rgw::sal::Driver* driver,
     return ret;
   }
 
-  // make sure that the logging source attribute is up-to-date
-  if (ret = update_bucket_logging_sources(dpp, target_bucket, input.bucket->get_key(), true, y); ret < 0) {
-    ldpp_dout(dpp, 5) << "WARNING: could not update bucket logging source '" <<
-      input.bucket->get_key() << "' in logging bucket '" << target_bucket_id << "' attribute, during record logging. ret = " << ret << dendl;
+  if (!bucket_deleted) {
+    // make sure that the logging source attribute is up-to-date if the src bucket is not being deleted
+    if (ret = update_bucket_logging_sources(dpp, target_bucket, input.bucket->get_key(), true, y); ret < 0) {
+      ldpp_dout(dpp, 5) << "WARNING: could not update bucket logging source '" <<
+        input.bucket->get_key() << "' in logging bucket '" << target_bucket_id << "' attribute, during record logging. ret = " << ret << dendl;
+    }
   }
-
   const auto region = driver->get_zone()->get_zonegroup().get_api_name();
   std::string obj_name;
   RGWObjVersionTracker objv_tracker;
   ret = target_bucket->get_logging_object_name(obj_name, conf.target_prefix, y, dpp, &objv_tracker);
   if (ret == 0) {
-    const auto time_to_commit = time_from_name(obj_name, dpp) + std::chrono::seconds(conf.obj_roll_time);
+    const auto time_to_commit = time_from_name(obj_name, dpp) + ceph::timespan{std::chrono::seconds{conf.obj_roll_time}};
     if (ceph::coarse_real_time::clock::now() > time_to_commit) {
       ldpp_dout(dpp, 20) << "INFO: logging object '" << obj_name << "' exceeded its time, will be committed to logging bucket '" <<
         target_bucket_id << "'" << dendl;
@@ -649,7 +652,7 @@ int log_record(rgw::sal::Driver* driver,
         input.request_params,
         dash_if_zero(input.http_ret),
         dash_if_empty(input.err_code),
-        dash_if_zero(input.content_length),
+        "-", // not supported - bytes sent as response.
         dash_if_zero(size),
         "-", // no total time when logging record
         input.time_elapsed,
@@ -741,8 +744,17 @@ int log_record(rgw::sal::Driver* driver,
     }
   }
 
-  ldpp_dout(dpp, 20) << "INFO: wrote logging record: '" << record
-    << "' to '" << obj_name << "'" << dendl;
+  ldpp_dout(dpp, 20) << "INFO: wrote logging record: '" << record << "' to '" << obj_name << "'" << dendl;
+
+  if (bucket_deleted) {
+    // Commit the last log record in case the src bucket is being deleted or it will never be accessible
+    if (ret = rollover_logging_object(conf, target_bucket, obj_name, dpp, region,
+                                      input.bucket, y, true, &objv_tracker, false, nullptr, &err_message); ret < 0 && ret != -ECANCELED) {
+      ldpp_dout(dpp, 5) << "WARNING: could not commit pending logging object of bucket '" <<
+        input.src_bucket_name << ", ret = " << ret << dendl;
+      return ret;
+    }
+  }
   return 0;
 }
 
@@ -761,7 +773,8 @@ int log_record(rgw::sal::Driver* driver,
     const DoutPrefixProvider *dpp,
     optional_yield y,
     bool async_completion,
-    bool log_source_bucket) {
+    bool log_source_bucket,
+    bool bucket_deleted) {
   if (!s->bucket) {
     ldpp_dout(dpp, 1) << "ERROR: only bucket operations are logged in bucket logging" << dendl;
     return -EINVAL;
@@ -789,7 +802,7 @@ int log_record(rgw::sal::Driver* driver,
     }
     ldpp_dout(dpp, 20) << "INFO: found matching logging configuration of bucket '" << s->bucket->get_key() <<
       "' configuration: " << configuration.to_json_str() << dendl;
-    if (const int ret = log_record(driver, obj, s, op_name, etag, size, configuration, dpp, y, async_completion, log_source_bucket); ret < 0) {
+    if (const int ret = log_record(driver, obj, s, op_name, etag, size, configuration, dpp, y, async_completion, log_source_bucket, bucket_deleted); ret < 0) {
       ldpp_dout(dpp, 1) << "ERROR: failed to perform logging for bucket '" << s->bucket->get_key() <<
         "'. ret=" << ret << dendl;
       return ret;
@@ -812,7 +825,8 @@ int log_record(rgw::sal::Driver* driver,
     const DoutPrefixProvider *dpp,
     optional_yield y,
     bool async_completion,
-    bool log_source_bucket) {
+    bool log_source_bucket,
+    bool bucket_deleted) {
   if (!input.bucket) {
     ldpp_dout(dpp, 1) << "ERROR: only bucket operations are logged in bucket logging" << dendl;
     return -EINVAL;
@@ -840,7 +854,7 @@ int log_record(rgw::sal::Driver* driver,
     }
     ldpp_dout(dpp, 20) << "INFO: found matching logging configuration of bucket '" << input.bucket->get_key() <<
       "' configuration: " << configuration.to_json_str() << dendl;
-    if (const int ret = log_record(driver, obj, input, op_name, etag, size, configuration, dpp, y, async_completion, log_source_bucket); ret < 0) {
+    if (const int ret = log_record(driver, obj, input, op_name, etag, size, configuration, dpp, y, async_completion, log_source_bucket, bucket_deleted); ret < 0) {
       ldpp_dout(dpp, 1) << "ERROR: failed to perform logging for bucket '" << input.bucket->get_key() <<
         "'. ret=" << ret << dendl;
       return ret;
@@ -1102,7 +1116,8 @@ int verify_target_bucket_policy(const DoutPrefixProvider* dpp,
     rgw::IAM::Environment env;
     const auto arn_it = env.emplace("aws:SourceArn", std::move(source_bucket_arn));
     const auto acct_it = env.emplace("aws:SourceAccount", std::move(source_account));
-    if (policy.eval(dpp, env, ident, rgw::IAM::s3PutObject, target_resource_arn) != rgw::IAM::Effect::Allow) {
+    boost::optional<rgw::auth::Principal> principal; // ignored
+    if (policy.eval(dpp, env, ident, rgw::IAM::s3PutObject, target_resource_arn, principal) != rgw::IAM::Effect::Allow) {
       ldpp_dout(dpp, 1) << "ERROR: logging bucket: '" << target_bucket_id <<
         "' must have a bucket policy that allows logging service principal to put objects in the following resource ARN: '" <<
         target_resource_arn.to_string() << "' from source bucket ARN: '" << arn_it->second <<
@@ -1135,6 +1150,18 @@ int verify_target_bucket_policy(const DoutPrefixProvider* dpp,
                                      err_message);
 }
 
+/*
+ * a bucket encryption config that only blocks encryption types doesn't
+ * encrypt anything, so it doesn't disqualify a logging target
+ */
+static bool has_default_encryption(const bufferlist& bl) {
+  RGWBucketEncryptionConfig conf;
+  if (decode_bl(bl, conf) < 0) {
+    return true;
+  }
+  return !conf.sse_algorithm().empty();
+}
+
 int verify_target_bucket_attributes(const DoutPrefixProvider* dpp, rgw::sal::Bucket* target_bucket, std::string* err_message) {
   const auto& target_info = target_bucket->get_info();
   if (target_info.requester_pays) {
@@ -1155,7 +1182,8 @@ int verify_target_bucket_attributes(const DoutPrefixProvider* dpp, rgw::sal::Buc
     }
     return -EINVAL;
   }
-  if (target_attrs.find(RGW_ATTR_BUCKET_ENCRYPTION_POLICY) != target_attrs.end()) {
+  if (const auto i = target_attrs.find(RGW_ATTR_BUCKET_ENCRYPTION_POLICY);
+      i != target_attrs.end() && has_default_encryption(i->second)) {
     // verify target bucket does not have encryption
     ldpp_dout(dpp, 1) << "ERROR: logging bucket '" << target_bucket->get_key() << "', is configured with encryption" << dendl;
     if (err_message) {

@@ -267,6 +267,68 @@ describe('ServiceFormComponent', () => {
         });
       });
 
+      it('should not submit metrics push options when disabled', () => {
+        component.onSubmit();
+        const spec = (cephServiceService.create as jasmine.Spy).calls.mostRecent().args[0];
+        expect(spec['metrics_push_enabled']).toBeUndefined();
+        expect(spec['metrics_push_interval']).toBeUndefined();
+        expect(spec['metrics_push_timeout']).toBeUndefined();
+      });
+
+      it('should have default metrics push values', () => {
+        expect(component.serviceForm.get('metrics_push_enabled').value).toBe(false);
+        expect(component.serviceForm.get('metrics_push_interval').value).toBe(3600);
+        expect(component.serviceForm.get('metrics_push_timeout').value).toBe(300);
+      });
+
+      it('should submit rgw with metrics push enabled and default values', () => {
+        formHelper.setValue('metrics_push_enabled', true);
+        component.onSubmit();
+        expect(cephServiceService.create).toHaveBeenCalledWith({
+          service_type: 'rgw',
+          service_id: 'svc',
+          rgw_realm: null,
+          rgw_zone: null,
+          rgw_zonegroup: null,
+          placement: {},
+          unmanaged: false,
+          ssl: false,
+          metrics_push_enabled: true,
+          metrics_push_interval: 3600,
+          metrics_push_timeout: 300
+        });
+      });
+
+      it('should submit rgw with custom metrics push values', () => {
+        formHelper.setValue('metrics_push_enabled', true);
+        formHelper.setValue('metrics_push_interval', 120);
+        formHelper.setValue('metrics_push_timeout', 60);
+        component.onSubmit();
+        expect(cephServiceService.create).toHaveBeenCalledWith({
+          service_type: 'rgw',
+          service_id: 'svc',
+          rgw_realm: null,
+          rgw_zone: null,
+          rgw_zonegroup: null,
+          placement: {},
+          unmanaged: false,
+          ssl: false,
+          metrics_push_enabled: true,
+          metrics_push_interval: 120,
+          metrics_push_timeout: 60
+        });
+      });
+
+      it('should validate metrics push minimum values only when enabled', () => {
+        formHelper.setValue('metrics_push_interval', 10);
+        formHelper.setValue('metrics_push_timeout', 10);
+        formHelper.expectValid('metrics_push_interval');
+        formHelper.expectValid('metrics_push_timeout');
+        formHelper.setValue('metrics_push_enabled', true);
+        formHelper.expectError('metrics_push_interval', 'min');
+        formHelper.expectError('metrics_push_timeout', 'min');
+      });
+
       it('should submit rgw with virtual-host style bucket access and SSL', () => {
         formHelper.setValue('virtual_host_enabled', true);
         formHelper.setValue('ssl', true);
@@ -353,6 +415,112 @@ describe('ServiceFormComponent', () => {
         formHelper.setValue('rgw_frontend_port', 'abc');
         component.onSubmit();
         formHelper.expectError('rgw_frontend_port', 'pattern');
+      });
+
+      it('should submit rgw with port, secondary port and ssl enabled', () => {
+        formHelper.setValue('rgw_frontend_port', 1234);
+        formHelper.setValue('rgw_frontend_http_port', 1235);
+        formHelper.setValue('ssl', true);
+        component.onSubmit();
+        expect(cephServiceService.create).toHaveBeenCalledWith({
+          service_type: 'rgw',
+          service_id: 'svc',
+          rgw_realm: null,
+          rgw_zone: null,
+          rgw_zonegroup: null,
+          placement: {},
+          unmanaged: false,
+          rgw_frontend_port: 1234,
+          rgw_frontend_http_port: 1235,
+          certificate_source: 'cephadm-signed',
+          ssl: true
+        });
+      });
+
+      it('should submit valid rgw http port (1)', () => {
+        formHelper.setValue('rgw_frontend_http_port', 1);
+        formHelper.setValue('ssl', true);
+        component.onSubmit();
+        formHelper.expectValid('rgw_frontend_http_port');
+      });
+
+      it('should submit valid rgw http port (2)', () => {
+        formHelper.setValue('rgw_frontend_http_port', 65535);
+        formHelper.setValue('ssl', true);
+        component.onSubmit();
+        formHelper.expectValid('rgw_frontend_http_port');
+      });
+
+      it('should submit invalid rgw http port (1)', () => {
+        formHelper.setValue('rgw_frontend_http_port', 0);
+        formHelper.setValue('ssl', true);
+        fixture.detectChanges();
+        formHelper.expectError('rgw_frontend_http_port', 'min');
+      });
+
+      it('should submit invalid rgw http port (2)', () => {
+        formHelper.setValue('rgw_frontend_http_port', 65536);
+        formHelper.setValue('ssl', true);
+        fixture.detectChanges();
+        formHelper.expectError('rgw_frontend_http_port', 'max');
+      });
+
+      it('should submit invalid rgw http port (3)', () => {
+        formHelper.setValue('rgw_frontend_http_port', 'abc');
+        formHelper.setValue('ssl', true);
+        component.onSubmit();
+        formHelper.expectError('rgw_frontend_http_port', 'pattern');
+      });
+
+      it('should submit invalid rgw secondary port 443 when ssl is enabled and rgw_frontend_port defaults to 443', () => {
+        formHelper.setValue('rgw_frontend_http_port', 443);
+        formHelper.setValue('ssl', true);
+        component.onSubmit();
+        formHelper.expectError('rgw_frontend_http_port', 'doNotMatch');
+      });
+
+      it('should not submit invalid rgw secondary port when ssl is enabled and frontend_port and http_port are the same', () => {
+        formHelper.setValue('rgw_frontend_port', 1234);
+        formHelper.setValue('rgw_frontend_http_port', 1234);
+        formHelper.setValue('ssl', true);
+        component.onSubmit();
+        formHelper.expectError('rgw_frontend_http_port', 'doNotMatch');
+      });
+
+      it('should clear rgw http port when ssl is disabled', () => {
+        formHelper.setValue('ssl', true);
+        formHelper.setValue('rgw_frontend_http_port', 8080);
+        expect(form.get('rgw_frontend_http_port').value).toBe(8080);
+
+        formHelper.setValue('ssl', false);
+        expect(form.get('rgw_frontend_http_port').value).toBeNull();
+      });
+
+      it('should not submit rgw http port when ssl is disabled', () => {
+        formHelper.setValue('ssl', true);
+        formHelper.setValue('rgw_frontend_http_port', 8080);
+        formHelper.setValue('ssl', false);
+        component.onSubmit();
+        expect(cephServiceService.create).toHaveBeenCalledWith({
+          service_type: 'rgw',
+          service_id: 'svc',
+          rgw_realm: null,
+          rgw_zone: null,
+          rgw_zonegroup: null,
+          placement: {},
+          unmanaged: false,
+          ssl: false
+        });
+      });
+
+      it('should keep rgw http port when ssl is disabled and enabled again with a new value', () => {
+        formHelper.setValue('ssl', true);
+        formHelper.setValue('rgw_frontend_http_port', 8080);
+        formHelper.setValue('ssl', false);
+        formHelper.setValue('ssl', true);
+        formHelper.setValue('rgw_frontend_http_port', 8081);
+        formHelper.expectValid('rgw_frontend_http_port');
+        expect(form.get('rgw_frontend_http_port').value).toBe(8081);
       });
 
       it('should submit rgw w/o port', () => {
@@ -855,7 +1023,7 @@ x4Ea7kGVgx9kWh5XjWz9wjZvY49UKIT5ppIAWPMbLl3UpfckiuNhTA==
         const paginate_obs = new PaginateObservable<any>(of([mockService]));
         const cephServiceSpy = spyOn(cephServiceService, 'list').and.returnValue(paginate_obs);
         component.ngOnInit();
-        expect(cephServiceSpy).toBeCalledTimes(2);
+        expect(cephServiceSpy).toHaveBeenCalledTimes(2);
         expect(component.action).toBe('Edit');
 
         // Wait for async observable to complete before checking disabled state

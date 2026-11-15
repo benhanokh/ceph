@@ -10,12 +10,12 @@ from orchestrator._interface import daemon_type_to_service
 from ceph.utils import datetime_now, http_req
 from ceph.deployment.inventory import Devices
 from ceph.deployment.service_spec import ServiceSpec, PlacementSpec, CertificateSource
-from cephadm.services.cephadmservice import CephadmDaemonDeploySpec
+from cephadm.services.cephadmservice import CephadmDaemonDeploySpec, DaemonDeployContext
 from mgr_util import test_port_allocation, PortAlreadyInUse
 from mgr_util import verify_tls_files
 import tempfile
 from cephadm.services.service_registry import service_registry
-from cephadm.services.cephadmservice import CephadmAgent
+from cephadm.services.agent import CephadmAgent
 from cephadm.tlsobject_types import TLSCredentials
 from cephadm.utils import get_node_proxy_status_value
 
@@ -111,6 +111,9 @@ class NodeProxyEndpoint:
         # self.ssl_ctx.load_verify_locations(cadata=self.ssl_root_crt)
         self.redfish_token: str = ''
         self.redfish_session_location: str = ''
+        self._cp_config = {
+            'hooks.before_handler': self._check_get_keyring,
+        }
 
     def _cp_dispatch(self, vpath: List[str]) -> "NodeProxyEndpoint":
         if len(vpath) > 1:  # /{hostname}/<endpoint>
@@ -127,6 +130,22 @@ class NodeProxyEndpoint:
                     cherrypy.request.params['id'] = _id
         # /<endpoint>
         return self
+
+    def _check_get_keyring(self) -> None:
+        """Require a node-proxy keyring on GET requests."""
+        if cherrypy.request.method != 'GET':
+            return
+        cephx: Dict[str, Any] = {}
+        name = cherrypy.request.headers.get('Cephx-Name')
+        secret = cherrypy.request.headers.get('Cephx-Secret')
+        if name is not None:
+            cephx['name'] = name
+        if secret is not None:
+            cephx['secret'] = secret
+        self.validate_node_proxy_data({'cephx': cephx})
+        hostname = cherrypy.request.params.get('hostname')
+        if hostname and cephx['name'][11:] != hostname:
+            raise cherrypy.HTTPError(403, f'Got wrong keyring from agent on host {hostname}.')
 
     @cherrypy.expose
     @cherrypy.tools.allow(methods=['POST'])
@@ -1029,7 +1048,7 @@ class CephadmAgentHelpers:
                         f'(last_deps={last_deps} -> deps={deps}); '
                         f'pushing updated config via HTTP')
                     daemon_spec = service_registry.get_service(daemon_type_to_service(
-                        daemon_spec.daemon_type)).prepare_create(daemon_spec)
+                        daemon_spec.daemon_type)).prepare_create(DaemonDeployContext(daemon_spec, spec))
                     self.mgr.agent_helpers._request_agent_acks(
                         hosts={daemon_spec.host},
                         increment=True,

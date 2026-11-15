@@ -18,6 +18,7 @@
 #include <boost/scope_exit.hpp>
 
 #include "include/stringify.h"
+#include "common/debug.h"
 #include "common/errno.h"
 #include "common/split.h"
 
@@ -152,7 +153,7 @@ bool PyModuleRegistry::handle_mgr_map(const MgrMap &mgr_map_)
     return false;
   } else {
     bool modules_changed = mgr_map_.modules != mgr_map.modules ||
-      mgr_map_.always_on_modules != mgr_map.always_on_modules ||
+      mgr_map_.get_always_on_modules() != mgr_map.get_always_on_modules() ||
       mgr_map_.force_disabled_modules != mgr_map.force_disabled_modules;
     mgr_map = mgr_map_;
 

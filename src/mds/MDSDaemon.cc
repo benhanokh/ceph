@@ -245,28 +245,33 @@ void MDSDaemon::dump_status(Formatter *f)
 {
   f->open_object_section("status");
   f->dump_stream("cluster_fsid") << monc->get_fsid();
-  if (mds_rank) {
-    f->dump_int("whoami", mds_rank->get_nodeid());
-  } else {
-    f->dump_int("whoami", MDS_RANK_NONE);
-  }
-
-  f->dump_int("id", monc->get_global_id());
-  f->dump_string("want_state", ceph_mds_state_name(beacon.get_want_state()));
-  f->dump_string("state", ceph_mds_state_name(mdsmap->get_state_gid(mds_gid_t(
-	    monc->get_global_id()))));
-  if (mds_rank) {
+  {
+    // mdsmap is swapped out by handle_mds_map() and mds_rank is
+    // created/destroyed, both under mds_lock -- hold it while
+    // reading either of them.
     std::lock_guard l(mds_lock);
-    mds_rank->dump_status(f);
-  }
+    if (mds_rank) {
+      f->dump_int("whoami", mds_rank->get_nodeid());
+    } else {
+      f->dump_int("whoami", MDS_RANK_NONE);
+    }
 
-  f->dump_unsigned("mdsmap_epoch", mdsmap->get_epoch());
-  if (mds_rank) {
-    f->dump_unsigned("osdmap_epoch", mds_rank->get_osd_epoch());
-    f->dump_unsigned("osdmap_epoch_barrier", mds_rank->get_osd_epoch_barrier());
-  } else {
-    f->dump_unsigned("osdmap_epoch", 0);
-    f->dump_unsigned("osdmap_epoch_barrier", 0);
+    f->dump_int("id", monc->get_global_id());
+    f->dump_string("want_state", ceph_mds_state_name(beacon.get_want_state()));
+    f->dump_string("state", ceph_mds_state_name(mdsmap->get_state_gid(mds_gid_t(
+	      monc->get_global_id()))));
+    if (mds_rank) {
+      mds_rank->dump_status(f);
+    }
+
+    f->dump_unsigned("mdsmap_epoch", mdsmap->get_epoch());
+    if (mds_rank) {
+      f->dump_unsigned("osdmap_epoch", mds_rank->get_osd_epoch());
+      f->dump_unsigned("osdmap_epoch_barrier", mds_rank->get_osd_epoch_barrier());
+    } else {
+      f->dump_unsigned("osdmap_epoch", 0);
+      f->dump_unsigned("osdmap_epoch_barrier", 0);
+    }
   }
 
   f->dump_float("uptime", get_uptime().count());
@@ -439,6 +444,11 @@ void MDSDaemon::set_up_admin_socket()
                                      asok_hook,
                                      "dump metadata loads");
   ceph_assert(r == 0);
+  r = admin_socket->register_command("dump phase times",
+                                     asok_hook,
+                                     "dump time spent in each upkeep phase, "
+                                     "and mds_lock utilization");
+  ceph_assert(r == 0);
   r = admin_socket->register_command("dump snaps name=server,type=CephChoices,strings=--server,req=false",
                                      asok_hook,
                                      "dump snapshots");
@@ -564,6 +574,16 @@ void MDSDaemon::set_up_admin_socket()
                                      "name=cancel,type=CephBool,req=false",
       asok_hook,
       "submit queries to the local QuiesceDbManager");
+  ceph_assert(r == 0);
+  r = admin_socket->register_command("quarantine enable "
+                                     "name=path,type=CephString,req=true",
+                                     asok_hook,
+                                     "submit queries to the QuarantineManager");
+  ceph_assert(r == 0);
+  r = admin_socket->register_command("quarantine disable "
+                                     "name=path,type=CephString,req=true",
+                                     asok_hook,
+                                     "submit queries to the QuarantineManager");
   ceph_assert(r == 0);
   r = admin_socket->register_command(
     "heap " \
@@ -761,7 +781,20 @@ void MDSDaemon::handle_command(const cref_t<MCommand> &m)
 {
   auto priv = m->get_connection()->get_priv();
   auto session = static_cast<Session *>(priv.get());
-  ceph_assert(session != NULL);
+  if (!session) {
+    // A closed tell session is cleared by ms_handle_reset() when the
+    // socket faults. That reset is dispatched ahead of an MCommand
+    // already queued on the connection, so priv is gone by the time
+    // we run. The connection is already marked down, so a reply could
+    // not be delivered anyway: drop the command. Clients abort one-shot
+    // commands on the reset (-EPIPE) and resend the others on the new
+    // session.
+    dout(1) << __func__ << " no session on "
+            << m->get_connection()->get_peer_socket_addr()
+            << ", dropping command tid " << m->get_tid()
+            << " after connection reset" << dendl;
+    return;
+  }
 
   int r = 0;
   cmdmap_t cmdmap;
@@ -1025,19 +1058,11 @@ void MDSDaemon::respawn()
   }
   new_argv[orig_argc] = NULL;
 
-  /* Determine the path to our executable, test if Linux /proc/self/exe exists.
-   * This allows us to exec the same executable even if it has since been
-   * unlinked.
+  /* Determine the path to exec. Re-executing the image we are running would
+   * pair it with libraries an upgrade has replaced.
    */
   char exe_path[PATH_MAX] = "";
-#ifdef PROCPREFIX
-  if (readlink(PROCPREFIX "/proc/self/exe", exe_path, PATH_MAX-1) != -1) {
-    dout(1) << "respawning with exe " << exe_path << dendl;
-    strcpy(exe_path, PROCPREFIX "/proc/self/exe");
-  } else {
-#else
-  {
-#endif
+  if (get_respawn_exe_path(exe_path, sizeof(exe_path)) < 0) {
     /* Print CWD for the user's interest */
     char buf[PATH_MAX];
     char *cwd = getcwd(buf, sizeof(buf));
@@ -1053,7 +1078,7 @@ void MDSDaemon::respawn()
   unblock_all_signals(NULL);
   execv(exe_path, new_argv);
 
-  dout(0) << "respawn execv " << orig_argv[0]
+  dout(0) << "respawn execv " << exe_path
 	  << " failed with " << cpp_strerror(errno) << dendl;
 
   // We have to assert out here, because suicide() returns, and callers

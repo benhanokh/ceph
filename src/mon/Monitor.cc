@@ -644,6 +644,7 @@ CompatSet Monitor::get_supported_features()
   compat.incompat.insert(CEPH_MON_FEATURE_INCOMPAT_SQUID);
   compat.incompat.insert(CEPH_MON_FEATURE_INCOMPAT_TENTACLE);
   compat.incompat.insert(CEPH_MON_FEATURE_INCOMPAT_UMBRELLA);
+  compat.incompat.insert(CEPH_MON_FEATURE_INCOMPAT_VAMPIRE);
 
   // Release-independent features
   compat.incompat.insert(CEPH_MON_FEATURE_INCOMPAT_CEPHX_AUTH_AES256K);
@@ -1319,19 +1320,11 @@ void Monitor::respawn()
   }
   new_argv[orig_argc] = NULL;
 
-  /* Determine the path to our executable, test if Linux /proc/self/exe exists.
-   * This allows us to exec the same executable even if it has since been
-   * unlinked.
+  /* Determine the path to exec. Re-executing the image we are running would
+   * pair it with libraries an upgrade has replaced.
    */
   char exe_path[PATH_MAX] = "";
-#ifdef PROCPREFIX
-  if (readlink(PROCPREFIX "/proc/self/exe", exe_path, PATH_MAX-1) != -1) {
-    dout(1) << "respawning with exe " << exe_path << dendl;
-    strcpy(exe_path, PROCPREFIX "/proc/self/exe");
-  } else {
-#else
-  {
-#endif
+  if (get_respawn_exe_path(exe_path, sizeof(exe_path)) < 0) {
     /* Print CWD for the user's interest */
     char buf[PATH_MAX];
     char *cwd = getcwd(buf, sizeof(buf));
@@ -1347,7 +1340,7 @@ void Monitor::respawn()
   unblock_all_signals(NULL);
   execv(exe_path, new_argv);
 
-  dout(0) << "respawn execv " << orig_argv[0]
+  dout(0) << "respawn execv " << exe_path
 	  << " failed with " << cpp_strerror(errno) << dendl;
 
   // We have to assert out here, because suicide() returns, and callers
@@ -2759,6 +2752,13 @@ void Monitor::apply_monmap_to_compatset_features()
     ceph_assert(HAVE_FEATURE(quorum_con_features, SERVER_UMBRELLA));
     new_features.incompat.insert(CEPH_MON_FEATURE_INCOMPAT_UMBRELLA);
   }
+  if (monmap_features.contains_all(ceph::features::mon::FEATURE_VAMPIRE)) {
+    ceph_assert(ceph::features::mon::get_persistent().contains_all(
+           ceph::features::mon::FEATURE_VAMPIRE));
+    // this feature should only ever be set if the quorum supports it.
+    ceph_assert(HAVE_FEATURE(quorum_con_features, SERVER_VAMPIRE));
+    new_features.incompat.insert(CEPH_MON_FEATURE_INCOMPAT_VAMPIRE);
+  }
 
 
   // Release-independent features
@@ -2819,6 +2819,9 @@ void Monitor::calc_quorum_requirements()
   }
   if (features.incompat.contains(CEPH_MON_FEATURE_INCOMPAT_UMBRELLA)) {
     required_features |= CEPH_FEATUREMASK_SERVER_UMBRELLA;
+  }
+  if (features.incompat.contains(CEPH_MON_FEATURE_INCOMPAT_VAMPIRE)) {
+    required_features |= CEPH_FEATUREMASK_SERVER_VAMPIRE;
   }
 
   // monmap
@@ -3338,9 +3341,6 @@ void Monitor::get_cluster_status(stringstream &ss, Formatter *f,
   } else {
     ss << "  cluster:\n";
     ss << "    id:     " << monmap->get_fsid() << "\n";
-    if (is_stretch_mode()){
-      ss << "    stretch_mode: ENABLED\n";
-    }
     string health;
     healthmon()->get_health_status(false, nullptr, &health,
 				   "\n            ", "\n            ");
@@ -3821,6 +3821,11 @@ void Monitor::handle_command(MonOpRequestRef op)
   if ((module == "mds" || module == "fs")  &&
       prefix != "fs authorize") {
     mdsmon()->dispatch(op);
+    return;
+  }
+  if (prefix == "osd pool default set" || prefix == "osd pool default get") {
+    // the pool creation defaults are configuration options
+    configmon()->dispatch(op);
     return;
   }
   if ((module == "osd" ||
@@ -4914,6 +4919,7 @@ void Monitor::dispatch_op(MonOpRequestRef op)
     case MSG_MON_GET_PURGED_SNAPS:
     case MSG_OSD_PG_READY_TO_MERGE:
     case MSG_OSD_PG_STOP_MERGE:
+    case MSG_OSD_PG_MIGRATED_POOL:
       paxos_service[PAXOS_OSDMAP]->dispatch(op);
       return;
 
@@ -6279,6 +6285,7 @@ void Monitor::tick()
   }
   backup_manager->tick();
 
+  g_ceph_context->check_debug_level_guard();
   mgr_client.update_daemon_health(get_health_metrics());
   new_tick();
 }
@@ -6312,6 +6319,12 @@ vector<DaemonHealthMetric> Monitor::get_health_metrics()
     metrics.emplace_back(daemon_metric::SLOW_OPS, slow, oldest_secs);
   } else {
     metrics.emplace_back(daemon_metric::SLOW_OPS, 0, 0);
+  }
+  {
+    auto threshold = g_conf().get_val<int64_t>("high_debug_level_threshold");
+    auto [count, max_level] = DebugLevelGuard::count_elevated(
+      g_conf()->subsys, threshold);
+    metrics.emplace_back(daemon_metric::HIGH_DEBUG_LEVEL, count, max_level);
   }
   return metrics;
 }
@@ -6936,6 +6949,7 @@ bool Monitor::ms_handle_fast_authentication(Connection *con)
   auto priv = con->get_priv();
   MonSession *s = static_cast<MonSession*>(priv.get());
   if (!s) {
+    std::lock_guard l(session_map_lock);
     // must be msgr2, otherwise dispatch would have set up the session.
     if (state == STATE_SHUTDOWN) {
       dout(10) << __func__ << " ignoring new con " << con << " (shutdown)" << dendl;
@@ -7099,13 +7113,17 @@ void Monitor::try_engage_stretch_mode()
     return;
   }
   if (osdmon()->osdmap.stretch_mode_enabled &&
-      monmap->stretch_mode_enabled) {
+    monmap->stretch_mode_enabled) {
     dout(10) << "Engaging stretch mode!" << dendl;
     stretch_mode_engaged = true;
     int32_t stretch_divider_id = osdmon()->osdmap.stretch_mode_bucket;
     stretch_bucket_divider = osdmon()->osdmap.
       crush->get_type_name(stretch_divider_id);
     disconnect_disallowed_stretch_sessions();
+    // a zone lost while stretch mode was off was not looked for, and the
+    // buckets found dead before it went off are stale
+    dead_mon_buckets.clear();
+    do_stretch_mode_election_work();
   }
 }
 struct CMonDisableStretchMode : public Context {
@@ -7140,6 +7158,7 @@ void Monitor::do_stretch_mode_election_work()
   dout(20) << __func__ << dendl;
   if (!is_stretch_mode() ||
       !is_leader()) return;
+  if (!monmap->stretch_mode_enabled) return;
   dout(20) << "checking for degraded stretch mode" << dendl;
   map<string, set<string>> old_dead_buckets;
   old_dead_buckets.swap(dead_mon_buckets);
@@ -7191,6 +7210,11 @@ void Monitor::go_recovery_stretch_mode()
 {
   dout(20) << __func__ << dendl;
   if (!is_stretch_mode()) return;
+  if (!monmap->stretch_mode_enabled) return;
+  if (!monmon()->pending_map.stretch_mode_enabled) {
+    dout(10) << __func__ << " aborting: stretch mode is pending disable" << dendl;
+    return;
+  }
   dout(20) << "is_leader(): " << is_leader() << dendl;
   if (!is_leader()) return;
   dout(20) << "is_degraded_stretch_mode(): " << is_degraded_stretch_mode() << dendl;
@@ -7231,9 +7255,19 @@ void Monitor::maybe_go_degraded_stretch_mode()
 {
   dout(20) << __func__ << dendl;
   if (!is_stretch_mode()) return;
+  if (!monmap->stretch_mode_enabled) return;
   if (is_degraded_stretch_mode()) return;
   if (!is_leader()) return;
   if (dead_mon_buckets.empty()) return;
+  // a new leader runs this before it has a pending MonMap
+  if (!monmon()->is_writeable()) {
+    monmon()->wait_for_writeable_ctx(new CMonGoDegraded(this));
+    return;
+  }
+  if (!monmon()->pending_map.stretch_mode_enabled) {
+    dout(10) << __func__ << " aborting: stretch mode is pending disable" << dendl;
+    return;
+  }
   if (!osdmon()->is_readable()) {
     osdmon()->wait_for_readable_ctx(new CMonGoDegraded(this));
     return;
@@ -7309,6 +7343,11 @@ void Monitor::trigger_healthy_stretch_mode()
 {
   dout(20) << __func__ << dendl;
   if (!is_stretch_mode()) return;
+  if (!monmap->stretch_mode_enabled) return;
+  if (!monmon()->pending_map.stretch_mode_enabled) {
+    dout(10) << __func__ << " aborting: stretch mode is pending disable" << dendl;
+    return;
+  }
   if (!is_degraded_stretch_mode()) return;
   if (!is_leader()) return;
   if (!osdmon()->is_writeable()) {

@@ -14,33 +14,39 @@
 */
 
 #ifndef CEPH_FDB_CONTENT_H
- #define CEPH_FDB_CONTENT_H
+#define CEPH_FDB_CONTENT_H
 
 #include "base.h"
 
-#include <algorithm>
-#include <compare>
-#include <cstddef>
 #include <string>
 #include <string_view>
+
+#include <algorithm>
+
+#include <cstddef>
 #include <utility>
+#include <compare>
 
 namespace ceph::libfdb::layer::content {
 
 namespace detail {
 
-// Includes the segment terminator and embedded-NUL escape bytes.
+// Includes the Tuple byte-string type code, segment terminator, and embedded-NUL
+// escape bytes.
 constexpr std::size_t encoded_string_segment_size(const std::string_view segment)
 {
  const auto embedded_nuls =
   static_cast<std::size_t>(std::ranges::count(segment, '\0'));
 
- return std::size(segment) + embedded_nuls + 1;
+ return 2 + std::size(segment) + embedded_nuls;
 }
 
-constexpr void append_encoded_string_segment(std::string& out,
-                                             const std::string_view segment)
+constexpr void append_encoded_string_segment(std::string& out, const std::string_view segment)
 {
+ // FoundationDB's Tuple-layer byte-string type code makes the NUL-FF escape
+ // distinguishable from a segment terminator followed by an FF byte:
+ out.push_back('\x01');
+
  // User-readable key segments take the common bulk-append path.
  if (!segment.contains('\0')) {
   out.append(segment);
@@ -52,21 +58,20 @@ constexpr void append_encoded_string_segment(std::string& out,
   out.push_back(c);
 
   if ('\0' == c) {
-   out.push_back(static_cast<char>(0xFF));
+   out.push_back('\xFF');
   }
  }
 
  out.push_back('\0');
 }
 
+// JFW: we should see how often this gets called in practice-- it may not "earn its keep", but we'll
+// find out.
 constexpr void require_valid_keyspace_root(const std::string_view segment)
 {
  if (segment.empty()) {
-  throw ::ceph::libfdb::libfdb_exception("content key assembly requires a non-empty keyspace root");
- }
-
- if (static_cast<char>(0xFF) == segment.front()) {
-  throw ::ceph::libfdb::libfdb_exception("content keyspace root must not start with 0xFF");
+  throw ::ceph::libfdb::libfdb_exception(std::errc::invalid_argument,
+    "content key assembly requires a non-empty keyspace root");
  }
 }
 
@@ -76,7 +81,7 @@ constexpr std::string_view segment_view(const char (&segment)[N])
  // Char array overloads model NUL-terminated string literals; raw byte arrays
  // should use std::string_view so that the intended size is explicit.
  if ('\0' != segment[N - 1]) {
-  throw ::ceph::libfdb::libfdb_exception("segment must be NUL-terminated");
+  throw ::ceph::libfdb::libfdb_exception(std::errc::invalid_argument, "segment must be NUL-terminated");
  }
 
  return std::string_view(segment, N - 1);
@@ -92,16 +97,14 @@ constexpr std::string_view first_segment_view(const auto& first, const auto&...)
  return segment_view(first);
 }
 
-constexpr void reserve_encoded_string_segments(std::string& out,
-                                               const auto& ...segments)
+constexpr void reserve_encoded_string_segments(std::string& out, const auto& ...segments)
 {
  out.reserve(out.size() +
              (encoded_string_segment_size(segment_view(segments)) +
               ... + std::size_t{0}));
 }
 
-constexpr void append_encoded_string_segments(std::string& out,
-                                              const auto& ...segments)
+constexpr void append_encoded_string_segments(std::string& out, const auto& ...segments)
 {
  (append_encoded_string_segment(out, segment_view(segments)), ...);
 }
@@ -109,9 +112,7 @@ constexpr void append_encoded_string_segments(std::string& out,
 } // namespace detail
 
 template <typename ...Segments>
-concept key_segments =
- 0 < sizeof...(Segments) &&
- (concepts::stringview_convertible<Segments> && ...);
+concept key_segments = 0 < sizeof...(Segments) && (concepts::stringview_convertible<Segments> && ...);
 
 class compiled_key;
 
@@ -121,25 +122,25 @@ constexpr compiled_key assemble(const Segments& ...segments);
 
 class compiled_key final
 {
- std::string bytes_;
+ std::string encoded_bytes;
 
  public:
  compiled_key() = delete;
 
  private:
  explicit constexpr compiled_key(std::string bytes)
-  : bytes_(std::move(bytes))
+  : encoded_bytes(std::move(bytes))
  {}
 
  public:
  constexpr std::size_t size() const noexcept
  {
-  return bytes_.size();
+  return encoded_bytes.size();
  }
 
  constexpr auto operator<=>(const compiled_key& rhs) const noexcept
  {
-  return bytes_ <=> rhs.bytes_;
+  return encoded_bytes <=> rhs.encoded_bytes;
  }
 
  constexpr bool operator==(const compiled_key& rhs) const noexcept = default;
@@ -150,15 +151,15 @@ class compiled_key final
  {
   const auto segment_bytes = detail::segment_view(segment);
 
-  detail::reserve_encoded_string_segments(lhs.bytes_, segment_bytes);
-  detail::append_encoded_string_segment(lhs.bytes_, segment_bytes);
+  detail::reserve_encoded_string_segments(lhs.encoded_bytes, segment_bytes);
+  detail::append_encoded_string_segment(lhs.encoded_bytes, segment_bytes);
 
   return lhs;
  }
 
  friend constexpr std::string_view libfdb_key_view(const compiled_key& key) noexcept
  {
-  return key.bytes_;
+  return key.encoded_bytes;
  }
 
  private:

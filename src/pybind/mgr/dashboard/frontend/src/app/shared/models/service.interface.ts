@@ -70,6 +70,7 @@ export interface CephServiceAdditionalSpec {
   api_port: number;
   api_secure: boolean;
   rgw_frontend_port: number;
+  rgw_frontend_http_port: number;
   trusted_ip_list: string[];
   virtual_ip: string;
   frontend_port: number;
@@ -94,6 +95,9 @@ export interface CephServiceAdditionalSpec {
   custom_sans?: string[];
   zonegroup_hostnames?: string[];
   wildcard_enabled?: boolean;
+  metrics_push_enabled?: boolean;
+  metrics_push_interval?: number;
+  metrics_push_timeout?: number;
   port: number;
   initial_admin_password: string;
   rgw_realm: string;

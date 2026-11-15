@@ -45,12 +45,18 @@ protected:
   bool checksum_mode{false};
   std::map<std::string, std::string> crypt_http_responses;
   int override_range_hdr(const rgw::auth::StrategyRegistry& auth_registry, optional_yield y);
+  bool rdma_active = false;
+  bool rdma_complete = false;
+  std::string rdma_descriptor;
+  void* rdma_buf = nullptr;
+  size_t rdma_buf_offset = 0;
 public:
   RGWGetObj_ObjStore_S3() {}
-  ~RGWGetObj_ObjStore_S3() override {}
+  ~RGWGetObj_ObjStore_S3() override;
 
   int verify_requester(const rgw::auth::StrategyRegistry& auth_registry, optional_yield y) override;
   int get_params(optional_yield y) override;
+  void send_response() override;
   int send_response_data_error(optional_yield y) override;
   int send_response_data(bufferlist& bl, off_t ofs, off_t len) override;
   void set_custom_http_response(int http_ret) { custom_http_ret = http_ret; }
@@ -260,6 +266,7 @@ public:
 class RGWPutObj_ObjStore_S3 : public RGWPutObj_ObjStore {
 private:
   std::map<std::string, std::string> crypt_http_responses;
+  bool rdma_active = false;
 
 public:
   RGWPutObj_ObjStore_S3() {}
@@ -518,6 +525,8 @@ public:
   ~RGWCompleteMultipart_ObjStore_S3() override {}
 
   int get_params(optional_yield y) override;
+  int verify_encryption(std::map<std::string, bufferlist>& attrs,
+                        rgw::cksum::Type cksum_type) override;
   void send_response() override;
 };
 
@@ -832,8 +841,11 @@ private:
   const bool enable_sts;
   const bool enable_iam;
   const bool enable_pubsub;
+#ifdef WITH_RADOSGW_LANCEDB
+  const bool enable_s3vector;
+#endif
 public:
-  RGWRESTMgr_S3(bool enable_s3control, bool _enable_s3website, bool _enable_sts, bool _enable_iam, bool _enable_pubsub);
+  RGWRESTMgr_S3(bool enable_s3control, bool _enable_s3website, bool _enable_sts, bool _enable_iam, bool _enable_pubsub, bool _enable_s3vector);
   ~RGWRESTMgr_S3() override;
 
   RGWHandler_REST *get_handler(rgw::sal::Driver* driver,

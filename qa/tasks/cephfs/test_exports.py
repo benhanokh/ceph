@@ -1,5 +1,6 @@
 import logging
 import random
+import signal
 import time
 from tasks.cephfs.fuse_mount import FuseMount
 from tasks.cephfs.cephfs_test_case import CephFSTestCase
@@ -48,6 +49,72 @@ class TestExports(CephFSTestCase):
         # Check if rank1 changed (standby tookover?)
         new_rank1 = self.fs.get_rank(rank=1)
         self.assertEqual(rank1['gid'], new_rank1['gid'])
+
+class TestRenameWitnessDiscover(CephFSTestCase):
+    MDSS_REQUIRED = 3
+    CLIENTS_REQUIRED = 1
+
+    def test_discover_projected_xlocked_dentry(self):
+        """
+        A rename witness must not get a replica of a dentry whose linkage
+        another rename has already projected.
+
+        Renaming over the primary link of a hard linked inode gets an
+        early reply. Renaming over another link of that inode right after
+        makes rank 0, the auth of the source inode, a witness, and its
+        rename_prep opens the old inode by discovering its primary dentry,
+        which the first rename still holds xlocked. If that discover
+        returns the pre-rename linkage, the first rename's MDentryLink
+        later fails ceph_assert(dnl->is_null()) on rank 0.
+
+        See: https://tracker.ceph.com/issues/81730
+        """
+
+        self.fs.set_max_mds(2)
+        status = self.fs.wait_for_daemons()
+        rank0 = self.fs.get_rank(rank=0, status=status)
+
+        self.mount_a.run_shell(["mkdir", "-p", "d/A", "d/B", "d/C"])
+        # an export pin only takes effect once the directory has been
+        # loaded, so give the empty /d/C an entry first
+        self.mount_a.run_shell(["touch", "d/C/.touch"])
+        self.mount_a.setfattr("d", "ceph.dir.pin", "1")
+        self.mount_a.setfattr("d/C", "ceph.dir.pin", "0")
+        self._wait_subtrees([('/d', 1), ('/d/C', 0)], status=status, rank=1,
+                            timeout=60)
+
+        # O is d/A/f with a remote link d/B/f1, created on rank 1 so that
+        # rank 0 never has it in cache; U is d/C/u on rank 0 with a remote
+        # link d/B/.stg1
+        self.mount_a.write_n_mb("d/A/f", 1)
+        self.mount_a.run_shell(["ln", "d/A/f", "d/B/f1"])
+        self.mount_a.write_n_mb("d/C/u", 1)
+        self.mount_a.run_shell(["ln", "d/C/u", "d/B/.stg1"])
+        self.mount_a.write_n_mb("d/A/T", 1)
+        ino_t = self.mount_a.path_to_ino("d/A/T")
+        ino_u = self.mount_a.path_to_ino("d/C/u")
+
+        # keep the first rename's journal entry from committing
+        self.fs.rank_asok(["config", "set", "mds_log_pause", "true"], rank=1,
+                          status=status)
+        self.mount_a.run_shell(["mv", "d/A/T", "d/A/f"])
+        p = self.mount_a.run_shell(["mv", "d/B/.stg1", "d/B/f1"], wait=False)
+        time.sleep(5)
+        # the second rename needs rank 0 as a witness and the first
+        # rename's journal entry, so it cannot have finished yet
+        self.assertFalse(p.finished)
+        self.fs.rank_asok(["config", "set", "mds_log_pause", "false"], rank=1,
+                          status=status)
+        p.wait()
+
+        # give rank 0 time to handle the first rename's MDentryLink
+        time.sleep(5)
+        self.assertTrue(self.fs.mds_is_running(rank0['name']))
+        self.assertEqual(rank0['gid'], self.fs.get_rank(rank=0)['gid'])
+
+        self.assertEqual(self.mount_a.path_to_ino("d/A/f"), ino_t)
+        self.assertEqual(self.mount_a.path_to_ino("d/B/f1"), ino_u)
+        self.assertEqual(self.mount_a.path_to_nlink("d/B/f1"), 2)
 
 class TestExportPin(CephFSTestCase):
     MDSS_REQUIRED = 3
@@ -793,24 +860,165 @@ class TestKillExports(CephFSTestCase):
             # for multiple tests
             self.mount_a.remount()
 
+    def _client_holds_cap(self, rank, ino, client_id):
+        inode = self.fs.rank_asok(['dump', 'inode', str(ino)], rank=rank, status=self.status)
+        return any(c['client_id'] == client_id for c in inode.get('client_caps', []))
+
+    def _client_addr(self, rank, client_id):
+        session = self._session_by_id(self._session_list(rank, self.status))[client_id]
+        addr = session['entity']['addr']
+        return f"{addr['addr']}/{addr['nonce']}"
+
     def test_client_eviction(self):
+        """
+        Test that the importer does not evict a client whose session it force
+        opened for an import that was later reversed.
+
+        With 'mds_kill_export_at' set to 9 or 10, the exporter dies after the
+        importer has force opened the client sessions (IMPORT_ACKING) but
+        before the client is told about them. The client never renews those
+        sessions, so unless the importer closes them in import_reverse() it
+        evicts (and blocklists) the client after 'session_autoclose' seconds.
+
+        Note that the client may legitimately open its own session with the
+        importer (e.g. a read-only request routed to a replica), so the absence
+        of a session on the importer is not what is checked here.
+        """
+
         # modify the timeout so that we don't have to wait too long
         timeout = 30
+        autoclose = timeout + 5
         self.fs.set_session_timeout(timeout)
-        self.fs.set_session_autoclose(timeout + 5)
+        self.fs.set_session_autoclose(autoclose)
 
         kill_export_at = [9, 10]
 
         exporter_rank = 0
         importer_rank = 1
 
+        client_id = self.mount_a.get_global_id()
+
         for kill in kill_export_at:
             log.info(f"kill_export_at: {kill}")
+
+            # the client must hold caps in the exported subtree so that the
+            # importer force opens a session for it
+            path = f"test/export/file_{kill}"
+            self.mount_a.write_n_mb(path, 1)
+            ino = self.mount_a.path_to_ino(path)
+            self.assertTrue(self._client_holds_cap(exporter_rank, ino, client_id))
+
+            client_addr = self._client_addr(exporter_rank, client_id)
+
             self._run_kill_export(kill, exporter_rank, importer_rank)
 
-            client_id = self.mount_a.get_global_id()
-            self.wait_until_evicted(client_id, importer_rank, timeout + 10)
-            time.sleep(1)
+            # give the importer enough time to close the forced opened session
+            time.sleep(autoclose + 10)
+
+            self.assertNotIn(client_addr, self.get_ceph_cmd_stdout("osd", "blocklist", "ls"))
+
+            # a session the client has with the importer must be one that it
+            # renews, not a leftover forced opened session
+            ls = self.fs.rank_asok(['session', 'ls'], rank=importer_rank, status=self.status)
+            session = self._session_by_id(ls).get(client_id)
+            if session is not None:
+                self.assertEqual(session['state'], 'open')
 
             # failed if buggy
-            self.mount_a.ls()
+            self.assertIn(f"file_{kill}", self.mount_a.ls("test/export"))
+
+class TestExportToStoppingRank(CephFSTestCase):
+    MDSS_REQUIRED = 3
+    CLIENTS_REQUIRED = 1
+
+    def setUp(self):
+        super().setUp()
+
+        self.fs.set_max_mds(self.MDSS_REQUIRED)
+        self.fs.set_var('balance_automate', False)
+        self.status = self.fs.wait_for_daemons()
+        self.mount_a.run_shell_payload('mkdir -p a/b && touch a/b/f')
+
+    def _export_dir(self, path, source, target):
+        self.fs.rank_asok(['export', 'dir', path, str(target)], rank=source, status=self.status)
+
+    def _traverse_discover(self, rank):
+        return self.perf_dump(rank=rank, status=self.status)['mds']['traverse_discover']
+
+    def _export_states(self, rank):
+        return self.fs.rank_asok(['dump_export_states'], rank=rank, status=self.status)
+
+    def test_importer_stops_while_discovering(self):
+        """
+        That an importer which goes up:stopping while its import is waiting
+        on a path discover from a third rank does not leak the import state
+        and stops cleanly.
+
+        Layout: rank 0 is auth for /a/b's dirfrag but the inode of 'b' lives
+        in /a's dirfrag, which rank 1 is auth for. Rank 2 has nothing below
+        the root cached, so when rank 0 exports /a/b to rank 2, rank 2 has
+        to discover 'b' from rank 1. Rank 1 is paused to hold the importer
+        in IMPORT_DISCOVERING, rank 2 is then stopped (max_mds 3 -> 2) and
+        rank 1 is resumed. The discover reply retries handle_export_discover
+        on a now non-active rank (in up:stopping).
+        """
+
+        # rank 1 auth for /a (and therefore the inode of 'b'), rank 0 auth
+        # for /a/b's dirfrag.
+        self._export_dir('/a', 0, 1)
+        self._wait_subtrees([('/a', 1)], status=self.status, rank='all', path='/a')
+        self._export_dir('/a/b', 1, 0)
+        self._wait_subtrees([('/a', 1), ('/a/b', 0)], status=self.status, rank='all', path='/a')
+
+        rank1 = self.fs.get_rank(rank=1, status=self.status)
+        rank2 = self.fs.get_rank(rank=2, status=self.status)
+        discovers = self._traverse_discover(2)
+
+        # pause rank 1 so that discovers sent to it are not replied back
+        self.fs.rank_freeze(True, rank=1)
+        self.fs.mds_signal(rank1['name'], signal.SIGSTOP)
+        try:
+            self._export_dir('/a/b', 0, 2)
+
+            # the importer must be waiting on a discover
+            self.wait_until_true(lambda: self._traverse_discover(2) > discovers, timeout=30)
+            # and hence has not acked the exporter's discover
+            time.sleep(5)
+            states = self._export_states(0)
+            self.assertEqual(len(states), 1, f'unexpected export states: {states}')
+            self.assertEqual(states[0]['path'], '/a/b')
+            self.assertEqual(states[0]['peer'], 2)
+            self.assertEqual(states[0]['state'], 'discovering')
+
+            # stop the importer while its discover is outstanding
+            self.fs.set_max_mds(2)
+            # rank 1 must still be frozen at this point
+            info = self.fs.get_rank(rank=1)
+            self.assertEqual(info['gid'], rank1['gid'], 'rank 1 was replaced while paused')
+            self.assertTrue(info['flags'] & 1, 'rank 1 is not frozen')
+            self.fs.wait_for_state('up:stopping', rank=2, timeout=60)
+        finally:
+            self.fs.mds_signal(rank1['name'], signal.SIGCONT)
+            self.wait_until_true(lambda: 'laggy_since' not in self.fs.get_rank(rank=1),
+                                 timeout=self.fs.beacon_timeout)
+            self.fs.rank_freeze(False, rank=1)
+
+        # rank 2 must finish stopping -- no crashes, not stuck in up:stopping
+        def rank2_stopped():
+            status = self.fs.status()
+            mdsmap = self.fs.get_mds_map(status=status)
+            self.assertNotIn(2, mdsmap['failed'], f"mds.{rank2['name']} crashed while stopping")
+            if 2 not in mdsmap['in']:
+                return True
+            info = self.fs.get_rank(rank=2, status=status)
+            self.assertEqual(info['gid'], rank2['gid'], f"mds.{rank2['name']} crashed while stopping")
+            self.assertTrue(self.fs.mds_is_running(rank2['name']),
+                            f"mds.{rank2['name']} crashed while stopping")
+            return False
+        self.wait_until_true(rank2_stopped, timeout=180)
+
+        # the cancelled export is gone and the stopped daemon is a standby again
+        self.wait_until_true(lambda: len(self._export_states(0)) == 0, timeout=30)
+        self.wait_until_true(lambda: rank2['name'] in self.mds_cluster.get_standby_daemons(),
+                             timeout=60)
+        self.status = self.fs.wait_for_daemons()

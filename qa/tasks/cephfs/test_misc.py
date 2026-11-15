@@ -52,6 +52,20 @@ class TestMisc(CephFSTestCase):
         else:
             self.fail("Expected EBUSY")
 
+    def test_client_dump_subvolume_metrics_aggr(self):
+        """
+        That the dump_subvolume_metrics_aggr client command does not abort
+        the client.
+        """
+
+        if not isinstance(self.mount_a, FuseMount):
+            self.skipTest("Require FUSE client")
+
+        metrics = self.mount_a.admin_socket(['dump_subvolume_metrics_aggr'])
+        self.assertIn('current_metrics', metrics)
+        self.assertIn('last_metrics', metrics)
+        self.mount_a.run_shell(["touch", "dump_subvolume_metrics_aggr"])
+
     def test_getattr_caps(self):
         """
         Check if MDS recognizes the 'mask' parameter of open request.
@@ -75,6 +89,19 @@ class TestMisc(CephFSTestCase):
         # this triggers a lookup request and an open request. The debug
         # code will check if lookup/open reply contains xattrs
         self.mount_b.run_shell(["cat", "testfile"])
+
+    def test_client_kick_stale_sessions(self):
+        """
+        That the kick_stale_sessions client command returns while the client
+        has an open session, and that the client keeps working.
+        """
+
+        if not isinstance(self.mount_a, FuseMount):
+            self.skipTest("Require FUSE client")
+
+        self.mount_a.run_shell(["touch", "kick_stale_sessions"])
+        self.mount_a.admin_socket(['kick_stale_sessions'])
+        self.mount_a.run_shell(["stat", "kick_stale_sessions"])
 
     def test_root_rctime(self):
         """
@@ -823,7 +850,11 @@ class TestNewFSCreation(CephFSTestCase):
         fs_ops = [["max_mds", "3"], ["refuse_client_session", "true"],
                   ["allow_new_snaps", "true", "max_file_size", "65536"],
                   ["session_timeout", "234", "session_autoclose",
-                   "100", "max_xattr_size", "150"]]
+                   "100", "max_xattr_size", "150"],
+                  ["allow_standby_replay", "true"],
+                  ["balance_automate", "true"],
+                  ["refuse_standby_for_another_fs", "true"],
+                  ["refuse_standby_for_another_fs", "false"]]
 
         for fs_ops_list in fs_ops:
             test_fs = None

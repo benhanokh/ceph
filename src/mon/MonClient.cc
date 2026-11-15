@@ -28,6 +28,7 @@
 #include "include/scope_guard.h"
 #include "include/stringify.h"
 
+#include "msg/Messenger.h"
 #include "messages/MMonGetMap.h"
 #include "messages/MMonGetVersion.h"
 #include "messages/MMonGetMap.h"
@@ -289,12 +290,26 @@ int MonClient::ping_monitor(const string &mon_id, string *result_reply)
   smsgr->set_auth_client(pinger);
   smsgr->start();
 
-  ConnectionRef con = smsgr->connect_to_mon(monmap.get_addrs(new_mon_id));
-  ldout(cct, 10) << __func__ << " ping mon." << new_mon_id
-                 << " " << con->get_peer_addr() << dendl;
+  ConnectionRef con;
+  {
+    // The pinger runs without monc_lock on purpose (see above), so its
+    // MonConnection is guarded by the pinger's own lock, which the AuthClient
+    // callbacks take before reaching into it.
+    //
+    // Take that lock before connecting rather than just around the assignment
+    // below: the messenger already has the pinger as its auth client, so as
+    // soon as the connection starts a msgr worker can call into those
+    // callbacks, and they dereference mc.  Holding it from here makes the
+    // worker wait for mc instead of racing with it or finding it null.
+    std::lock_guard l(pinger->lock);
+    con = smsgr->connect_to_mon(monmap.get_addrs(new_mon_id));
+    ldout(cct, 10) << __func__ << " ping mon." << new_mon_id
+                   << " " << con->get_peer_addr() << dendl;
 
-  pinger->mc.reset(new MonConnection(cct, con, 0, &auth_registry, monc_lock));
-  pinger->mc->start(monmap.get_epoch(), entity_name);
+    pinger->mc.reset(new MonConnection(cct, con, 0, &auth_registry,
+				       pinger->lock));
+    pinger->mc->start(monmap.get_epoch(), entity_name);
+  }
   con->send_message(new MPing);
 
   int ret = pinger->wait_for_reply(cct->_conf->mon_client_ping_timeout);
@@ -306,6 +321,8 @@ int MonClient::ping_monitor(const string &mon_id, string *result_reply)
 
   con->mark_down();
   pinger->mc.reset();
+  // ~AsyncConnection uses its messenger, so drop ours before deleting it
+  con.reset();
   smsgr->shutdown();
   smsgr->wait();
   delete smsgr;
@@ -781,6 +798,10 @@ void MonClient::_finish_auth(int auth_err)
 
 // ---------
 
+entity_addrvec_t MonClient::get_myaddrs() const {
+  return messenger->get_myaddrs();
+}
+
 void MonClient::send_mon_message(MessageRef m)
 {
   std::lock_guard l{monc_lock};
@@ -804,6 +825,10 @@ void MonClient::_send_mon_message(MessageRef m)
 void MonClient::_reopen_session(int rank)
 {
   ceph_assert(ceph_mutex_is_locked(monc_lock));
+  if (stopping) {
+    ldout(cct, 5) << __func__ << " dropping because stopping" << dendl;
+    return;
+  }
   ldout(cct, 10) << __func__ << " rank " << rank << dendl;
 
   active_con.reset();
@@ -1809,7 +1834,8 @@ int MonClient::handle_auth_request(
     // for some channels prior to nautilus (osd heartbeat), we
     // tolerate the lack of an authorizer.
     if (!con->get_messenger()->require_authorizer) {
-      if (handle_authentication_dispatcher->ms_handle_fast_authentication(con)) {
+      if (handle_authentication_dispatcher != nullptr &&
+          handle_authentication_dispatcher->ms_handle_fast_authentication(con)) {
         return 1;
       }
     }
@@ -1848,7 +1874,8 @@ int MonClient::handle_auth_request(
     &auth_meta->connection_secret,
     ac);
   if (isvalid) {
-    if (handle_authentication_dispatcher->ms_handle_fast_authentication(con)) {
+    if (handle_authentication_dispatcher != nullptr &&
+        handle_authentication_dispatcher->ms_handle_fast_authentication(con)) {
       return 1;
     }
     return handle_auth_failure(cct);
@@ -1881,7 +1908,7 @@ AuthAuthorizer* MonClient::build_authorizer(int service_id) const {
 MonConnection::MonConnection(
   CephContext *cct, ConnectionRef con, uint64_t global_id,
   AuthRegistry *ar, ceph::mutex& m)
-  : cct(cct), con(con), global_id(global_id), auth_registry(ar), monc_lock(m)
+  : cct(cct), con(con), global_id(global_id), auth_registry(ar), auth_lock(m)
 {}
 
 MonConnection::~MonConnection()
@@ -1939,7 +1966,7 @@ int MonConnection::get_auth_request(
   uint32_t want_keys,
   RotatingKeyRing* keyring)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(monc_lock));
+  ceph_assert(ceph_mutex_is_locked_by_me(auth_lock));
   using ceph::encode;
   // choose method
   if (auth_method < 0) {
@@ -1978,7 +2005,7 @@ int MonConnection::handle_auth_reply_more(
   const ceph::buffer::list& bl,
   ceph::buffer::list *reply)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(monc_lock));
+  ceph_assert(ceph_mutex_is_locked_by_me(auth_lock));
   ldout(cct, 10) << __func__ << " payload " << bl.length() << dendl;
   ldout(cct, 30) << __func__ << " got\n";
   bl.hexdump(*_dout);
@@ -2011,7 +2038,7 @@ int MonConnection::handle_auth_done(
   CryptoKey *session_key,
   std::string *connection_secret)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(monc_lock));
+  ceph_assert(ceph_mutex_is_locked_by_me(auth_lock));
   ldout(cct,10) << __func__ << " global_id " << new_global_id
 		<< " payload " << bl.length()
 		<< dendl;
@@ -2037,7 +2064,7 @@ int MonConnection::handle_auth_bad_method(
   const std::vector<uint32_t>& allowed_methods,
   const std::vector<uint32_t>& allowed_modes)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(monc_lock));
+  ceph_assert(ceph_mutex_is_locked_by_me(auth_lock));
   ldout(cct,10) << __func__ << " old_auth_method " << old_auth_method
 		<< " result " << cpp_strerror(result)
 		<< " allowed_methods " << allowed_methods << dendl;
@@ -2071,7 +2098,7 @@ int MonConnection::handle_auth(MAuthReply* m,
 			       uint32_t want_keys,
 			       RotatingKeyRing* keyring)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(monc_lock));
+  ceph_assert(ceph_mutex_is_locked_by_me(auth_lock));
   if (state == State::NEGOTIATING) {
     int r = _negotiate(m, entity_name, want_keys, keyring);
     if (r) {
@@ -2110,7 +2137,7 @@ int MonConnection::_init_auth(
   RotatingKeyRing* keyring,
   bool msgr2)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(monc_lock));
+  ceph_assert(ceph_mutex_is_locked_by_me(auth_lock));
   ldout(cct, 10) << __func__ << " method " << method << dendl;
   if (auth && auth->get_protocol() == (int)method) {
     ldout(cct, 10) << __func__ << " already have auth, reseting" << dendl;
@@ -2145,7 +2172,7 @@ int MonConnection::_init_auth(
 
 int MonConnection::authenticate(MAuthReply *m)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(monc_lock));
+  ceph_assert(ceph_mutex_is_locked_by_me(auth_lock));
   ceph_assert(auth);
   if (!m->global_id) {
     ldout(cct, 1) << "peer sent an invalid global_id" << dendl;

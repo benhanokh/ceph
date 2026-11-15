@@ -704,7 +704,7 @@ public:
   virtual int register_to_service_map(const DoutPrefixProvider *dpp, const std::string& daemon_type,
 				      const std::map<std::string, std::string>& meta) override { return 0; }
   virtual void get_quota(RGWQuota& quota) override { return ; }
-  virtual void get_ratelimit(RGWRateLimitInfo& bucket_ratelimit, RGWRateLimitInfo& user_ratelimit, RGWRateLimitInfo& anon_ratelimit) override { return; }
+  virtual void get_ratelimit(RGWRateLimitInfo& bucket_ratelimit, RGWRateLimitInfo& user_ratelimit, RGWRateLimitInfo& account_ratelimit, RGWRateLimitInfo& anon_ratelimit) override { return; }
   virtual int set_buckets_enabled(const DoutPrefixProvider* dpp, std::vector<rgw_bucket>& buckets, bool enabled, optional_yield y) override { return 0; } // TODO: implement
   virtual int get_sync_policy_handler(const DoutPrefixProvider* dpp,
 				      std::optional<rgw_zone_id> zone,
@@ -783,6 +783,13 @@ public:
 
   virtual const std::string& get_compression_type(const rgw_placement_rule& rule) override;
   virtual bool valid_placement(const rgw_placement_rule& rule) override { return true; } 
+  int load_vector_bucket(const DoutPrefixProvider* dpp, const rgw_bucket& b,
+                            std::unique_ptr<VectorBucket>* bucket, optional_yield y) override { return -ENOTSUP; }
+  int list_vector_buckets(const DoutPrefixProvider* dpp,
+			     const rgw_owner& owner, const std::string& ns,
+			     const std::string& marker, const std::string& end_marker,
+			     uint64_t max, BucketList& buckets,
+			     optional_yield y) override { return -ENOTSUP; }
 
   virtual void finalize(void) override;
 
@@ -1072,6 +1079,7 @@ public:
                const ceph::real_time* mod_ptr, const ceph::real_time* unmod_ptr,
                bool high_precision_time,
                const char* if_match, const char* if_nomatch,
+               const char* dest_if_match, const char* dest_if_nomatch,
                AttrsMod attrs_mod, bool copy_if_newer, Attrs& attrs,
                RGWObjCategory category, uint64_t olh_epoch,
                boost::optional<ceph::real_time> delete_at,

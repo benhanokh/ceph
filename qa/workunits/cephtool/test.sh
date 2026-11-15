@@ -1402,6 +1402,10 @@ function test_mon_osd_create_destroy()
 
   ceph osd find $id
 
+  # osd new must not return until KeyServer can serve the new entity
+  ceph auth get osd.$id >/dev/null
+  ceph auth get client.osd-lockbox.$uuid >/dev/null
+
   # validate secrets and dm-crypt are set
   k=$(ceph auth get-key osd.$id --format=json-pretty 2>/dev/null | jq '.key')
   s=$(cat $all_secrets | jq '.cephx_secret')
@@ -1419,6 +1423,7 @@ function test_mon_osd_create_destroy()
   done
 
   ceph osd find $id2
+  ceph auth get osd.$id2 >/dev/null
   k=$(ceph auth get-key osd.$id --format=json-pretty 2>/dev/null | jq '.key')
   s=$(cat $all_secrets | jq '.cephx_secret')
   [[ $k == $s ]]
@@ -1589,10 +1594,10 @@ function test_mon_osd()
 	expect_false ceph osd set $f
 	expect_false ceph osd unset $f
   done
-  ceph osd require-osd-release umbrella
+  ceph osd require-osd-release vampire
   # can't lower
+  expect_false ceph osd require-osd-release umbrella
   expect_false ceph osd require-osd-release tentacle
-  expect_false ceph osd require-osd-release squid
   # these are no-ops but should succeed.
 
   ceph osd set noup
@@ -2557,10 +2562,11 @@ function test_mon_osd_erasure_code()
 
   ceph osd erasure-code-profile set fooprofile a=b c=d
   ceph osd erasure-code-profile set fooprofile a=b c=d
-  expect_false ceph osd erasure-code-profile set fooprofile a=b c=d e=f
-  ceph osd erasure-code-profile set fooprofile a=b c=d e=f --force --yes-i-really-mean-it
+  # no pool uses fooprofile, so it changes without --yes-i-really-mean-it
   ceph osd erasure-code-profile set fooprofile a=b c=d e=f
-  expect_false ceph osd erasure-code-profile set fooprofile a=b c=d e=f g=h
+  ceph osd erasure-code-profile set fooprofile a=b c=d e=f
+  ceph osd erasure-code-profile set fooprofile a=b c=d e=f g=h
+  ceph osd erasure-code-profile get fooprofile | grep g=h
   # make sure rule-foo doesn't work anymore
   expect_false ceph osd erasure-code-profile set barprofile ruleset-failure-domain=host
   ceph osd erasure-code-profile set barprofile crush-failure-domain=host

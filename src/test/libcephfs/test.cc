@@ -14,7 +14,7 @@
  */
 
 #include "include/compat.h"
-#include "include/filepath.h"
+#include "common/filepath.h"
 #include "gtest/gtest.h"
 #include "include/cephfs/libcephfs.h"
 #include "include/ceph_fs.h"
@@ -36,6 +36,7 @@
 #endif
 
 #include "common/Clock.h"
+#include "common/ceph_json.h"
 
 #ifdef __linux__
 #include <limits.h>
@@ -59,6 +60,9 @@
 #define FSCRYPT_MAXIO_SIZE (INT_MAX & ~4095)
 #endif
 
+// we test deprecated functions
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+
 using namespace std;
 
 static std::string generate_random_string(int length = 20) {
@@ -75,6 +79,7 @@ static std::string generate_random_string(int length = 20) {
 
 static int (*do_ceph_mount)(struct ceph_mount_info *cmount, const char *root) = ceph_mount;
 static std::string dir_prefix = std::string("/");
+static bool is_encrypted = false;
 
 void libcephfs_test_set_mount_call(int (*mount_call)(struct ceph_mount_info *cmount, const char *root))
 {
@@ -84,6 +89,11 @@ void libcephfs_test_set_mount_call(int (*mount_call)(struct ceph_mount_info *cmo
 void libcephfs_test_set_dir_prefix(std::string (prefix))
 {
   dir_prefix = prefix;
+}
+
+void libcephfs_test_set_is_encrypted(bool encrypted)
+{
+  is_encrypted = encrypted;
 }
 
 TEST(LibCephFS, OpenEmptyComponent) {
@@ -553,7 +563,7 @@ TEST(LibCephFS, ManyNestedDirs) {
   const filepath mfp = filepath(many_path);
   ASSERT_EQ(ceph_mkdirs(cmount, many_path, 0755), 0);
 
-  for (auto& component : mfp) {
+  for (auto&& component : mfp) {
     struct ceph_dir_result *dirp;
     ASSERT_EQ(ceph_opendir(cmount, ".", &dirp), 0);
     struct dirent *dent = ceph_readdir(cmount, dirp);
@@ -563,13 +573,13 @@ TEST(LibCephFS, ManyNestedDirs) {
     ASSERT_TRUE(dent != NULL);
     ASSERT_STREQ(dent->d_name, "..");
     if (component == "ManyNestedDirs"sv) {
-      ASSERT_EQ(0, ceph_chdir(cmount, component.c_str()));
+      ASSERT_EQ(0, ceph_chdir(cmount, std::string(component).c_str()));
       ASSERT_EQ(ceph_closedir(cmount, dirp), 0);
       continue;
     }
     dent = ceph_readdir(cmount, dirp);
     ASSERT_TRUE(dent != NULL);
-    ASSERT_STREQ(component.c_str(), dent->d_name);
+    ASSERT_EQ(component, std::string_view(dent->d_name));
     ASSERT_EQ(ceph_chdir(cmount, dent->d_name), 0);
     ASSERT_EQ(ceph_closedir(cmount, dirp), 0);
   }
@@ -580,9 +590,9 @@ TEST(LibCephFS, ManyNestedDirs) {
   }
 
   for (auto it = mfp.rbegin(); it != mfp.rend(); ++it) {
-    auto& component = *it;
+    auto&& component = *it;
     ASSERT_EQ(ceph_chdir(cmount, ".."), 0);
-    ASSERT_EQ(ceph_rmdir(cmount, component.c_str()), 0);
+    ASSERT_EQ(ceph_rmdir(cmount, std::string(component).c_str()), 0);
   }
 
   ASSERT_STREQ(ceph_getcwd(cmount), "/");
@@ -599,11 +609,11 @@ TEST(LibCephFS, ManyNestedDirsCaseInsensitive) {
 
   static const char many_path[] = "/ManyNestedDirsCaseInsensitive/A/a/a/a/a/b/B/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/Aa";
   const filepath mfp = filepath(many_path);
-  ASSERT_EQ(0, ceph_mkdir(cmount, mfp[0].c_str(), 0755));
-  ASSERT_EQ(0, ceph_setxattr(cmount, mfp[0].c_str(), "ceph.dir.casesensitive", (void *) "0", 1, XATTR_CREATE));
+  ASSERT_EQ(0, ceph_mkdir(cmount, std::string(mfp[0]).c_str(), 0755));
+  ASSERT_EQ(0, ceph_setxattr(cmount, std::string(mfp[0]).c_str(), "ceph.dir.casesensitive", (void *) "0", 1, XATTR_CREATE));
   ASSERT_EQ(ceph_mkdirs(cmount, many_path, 0755), 0);
 
-  for (auto& component : mfp) {
+  for (auto&& component : mfp) {
     struct ceph_dir_result *dirp;
     ASSERT_EQ(ceph_opendir(cmount, ".", &dirp), 0);
     struct dirent *dent = ceph_readdir(cmount, dirp);
@@ -613,13 +623,13 @@ TEST(LibCephFS, ManyNestedDirsCaseInsensitive) {
     ASSERT_TRUE(dent != NULL);
     ASSERT_STREQ(dent->d_name, "..");
     if (component == "ManyNestedDirsCaseInsensitive"sv) {
-      ASSERT_EQ(0, ceph_chdir(cmount, component.c_str()));
+      ASSERT_EQ(0, ceph_chdir(cmount, std::string(component).c_str()));
       ASSERT_EQ(ceph_closedir(cmount, dirp), 0);
       continue;
     }
     dent = ceph_readdir(cmount, dirp);
     ASSERT_TRUE(dent != NULL);
-    ASSERT_STREQ(component.c_str(), dent->d_name);
+    ASSERT_EQ(component, std::string_view(dent->d_name));
     ASSERT_EQ(ceph_chdir(cmount, dent->d_name), 0);
     ASSERT_EQ(ceph_closedir(cmount, dirp), 0);
   }
@@ -630,9 +640,9 @@ TEST(LibCephFS, ManyNestedDirsCaseInsensitive) {
   }
 
   for (auto it = mfp.rbegin(); it != mfp.rend(); ++it) {
-    auto& component = *it;
+    auto&& component = *it;
     ASSERT_EQ(ceph_chdir(cmount, ".."), 0);
-    ASSERT_EQ(ceph_rmdir(cmount, component.c_str()), 0);
+    ASSERT_EQ(ceph_rmdir(cmount, component.data()), 0);
   }
 
   ASSERT_STREQ(ceph_getcwd(cmount), "/");
@@ -2926,6 +2936,44 @@ TEST(LibCephFS, SnapMdCreateUpdates) {
   ceph_shutdown(cmount);
 }
 
+// Test UPDATE-only snap metadata op: update existing key, reject missing key.
+TEST(LibCephFS, SnapMdOpUpdateOnly) {
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_parse_env(cmount, NULL), 0);
+  ASSERT_EQ(do_ceph_mount(cmount, NULL), 0);
+
+  char dir_path[64];
+  char snap_name[64];
+  char snap_path[PATH_MAX];
+  sprintf(dir_path, "/dir0_%d-update", getpid());
+  sprintf(snap_name, "snap_%d_update", getpid());
+  sprintf(snap_path, "%s/.snap/%s", dir_path, snap_name);
+
+  ASSERT_EQ(0, ceph_mkdir(cmount, dir_path, 0755));
+  struct snap_metadata snap_meta[] = {{"foo", "bar"}};
+  ASSERT_EQ(0, ceph_mksnap(cmount, dir_path, snap_name, 0755, snap_meta,
+                           std::size(snap_meta)));
+
+  ASSERT_EQ(0, ceph_do_snap_md_op(cmount, snap_path, "foo", "bar2",
+                                  CEPH_SNAP_MD_OP_UPDATE));
+
+  struct snap_info info;
+  ASSERT_EQ(0, ceph_get_snap_info(cmount, snap_path, &info));
+  ASSERT_EQ(info.nr_snap_metadata, 1);
+  ASSERT_STREQ(info.snap_metadata[0].key, "foo");
+  ASSERT_STREQ(info.snap_metadata[0].value, "bar2");
+  ceph_free_snap_info_buffer(&info);
+
+  ASSERT_EQ(-EINVAL, ceph_do_snap_md_op(cmount, snap_path, "missing", "val",
+                                        CEPH_SNAP_MD_OP_UPDATE));
+
+  ASSERT_EQ(0, ceph_rmsnap(cmount, dir_path, snap_name));
+  ASSERT_EQ(0, ceph_rmdir(cmount, dir_path));
+  ceph_shutdown(cmount);
+}
+
 
 // Test that k-v pair is added successfully by ceph_do_snap_md_op() in
 // EXCL mode.
@@ -4480,6 +4528,86 @@ TEST(LibCephFS, SnapDirLookup) {
   ceph_shutdown(cmount);
 }
 
+static uint64_t get_client_mdops(struct ceph_mount_info *cmount) {
+  char *perf_dump = nullptr;
+  int len = ceph_get_perf_counters(cmount, &perf_dump);
+  ceph_assert(len > 0);
+
+  JSONParser jp;
+  ceph_assert(jp.parse(perf_dump, len));
+  uint64_t mdops = 0;
+  JSONDecoder::decode_json("mdops", mdops, jp.find_obj("client"));
+  free(perf_dump);
+  return mdops;
+}
+
+static void readdir_all(struct ceph_mount_info *cmount, const char *path) {
+  struct ceph_dir_result *cdr = nullptr;
+  ASSERT_EQ(0, ceph_opendir(cmount, path, &cdr));
+  while (ceph_readdir(cmount, cdr)) {
+    continue;
+  }
+  ASSERT_EQ(0, ceph_closedir(cmount, cdr));
+}
+
+/*
+ * A full readdir marks a directory I_COMPLETE.  In a head directory the
+ * client may then answer a lookup of a missing name with ENOENT without
+ * asking the MDS, but in a snapped directory it must still send the
+ * lookup to the MDS (https://tracker.ceph.com/issues/78555).
+ */
+TEST(LibCephFS, SnapDirLookupMissingNameAfterReaddir) {
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(0, ceph_mount(cmount, NULL));
+
+  auto top = generate_random_string();
+  ASSERT_EQ(ceph_mkdir(cmount, top.c_str(), 0777), 0);
+  ASSERT_EQ(0, ceph_chdir(cmount, top.c_str()));
+
+  ASSERT_EQ(ceph_mkdir(cmount, "foo", 0777), 0);
+  int fd = ceph_open(cmount, "foo/bar", O_CREAT|O_WRONLY, 0644);
+  ASSERT_LE(0, fd);
+  ASSERT_EQ(0, ceph_close(cmount, fd));
+  ASSERT_EQ(ceph_mkdir(cmount, "foo/.snap/snap", 0777), 0);
+
+  // start from an empty cache
+  ASSERT_EQ(0, ceph_unmount(cmount));
+  ASSERT_EQ(0, ceph_mount(cmount, NULL));
+  ASSERT_EQ(0, ceph_chdir(cmount, top.c_str()));
+
+  struct stat buf;
+  uint64_t mdops;
+
+  // head directory: ENOENT is concluded locally
+  ASSERT_EQ(0, ceph_chdir(cmount, "foo"));
+  readdir_all(cmount, ".");
+  mdops = get_client_mdops(cmount);
+  ASSERT_EQ(-ENOENT, ceph_stat(cmount, "missing", &buf));
+  ASSERT_EQ(mdops, get_client_mdops(cmount));
+
+  // snapped directory: the lookup goes to the MDS
+  ASSERT_EQ(0, ceph_chdir(cmount, ".snap/snap"));
+  readdir_all(cmount, ".");
+  mdops = get_client_mdops(cmount);
+  ASSERT_EQ(-ENOENT, ceph_stat(cmount, "missing", &buf));
+  ASSERT_LT(mdops, get_client_mdops(cmount));
+  ASSERT_EQ(0, ceph_stat(cmount, "bar", &buf));
+
+  ASSERT_EQ(0, ceph_chdir(cmount, "/"));
+  ASSERT_EQ(0, ceph_chdir(cmount, top.c_str()));
+  ASSERT_EQ(ceph_rmdir(cmount, "foo/.snap/snap"), 0);
+  ASSERT_EQ(ceph_unlink(cmount, "foo/bar"), 0);
+  ASSERT_EQ(ceph_rmdir(cmount, "foo"), 0);
+  ASSERT_EQ(0, ceph_chdir(cmount, "/"));
+  ASSERT_EQ(ceph_rmdir(cmount, top.c_str()), 0);
+
+  ASSERT_EQ(0, ceph_unmount(cmount));
+  ceph_shutdown(cmount);
+}
+
 TEST(LibCephFS, SnapdirAttrsOnSnapCreate) {
   struct ceph_mount_info *cmount;
   ASSERT_EQ(ceph_create(&cmount, NULL), 0);
@@ -5199,5 +5327,43 @@ TEST(LibCephFS, BuffersOverLimit) {
   ASSERT_EQ(ceph_read(cmount, fd, in_buf.get(), BUFSIZE, 0), READ_WRITE_LIMIT); 
   ASSERT_EQ(0, ceph_close(cmount, fd));
 
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, SymlinkLongTarget) {
+  pid_t mypid = getpid();
+
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(do_ceph_mount(cmount, "/"), 0);
+
+  char dir_name[128];
+  char dir_path[256];
+  sprintf(dir_name, "dir_%d", mypid);
+  sprintf(dir_path, "/%s", dir_name);
+  ASSERT_EQ(ceph_mkdir(cmount, dir_path, 0777), 0);
+
+
+  int max_path = PATH_MAX - 1;
+
+  if(is_encrypted) {
+    max_path = PATH_MAX - 3;
+  }
+
+  char rel_file_path[PATH_MAX];
+  memset(rel_file_path, 'b', max_path);
+  rel_file_path[max_path] = '\0';
+
+  char link_path[PATH_MAX];
+  char rel_link_path[1024];
+  sprintf(rel_link_path, "./linkfile_%d", mypid);
+  sprintf(link_path, "%s/%s", dir_path, rel_link_path);
+  ASSERT_EQ(0, ceph_symlink(cmount, rel_file_path, link_path));
+
+  ASSERT_EQ(0, ceph_chdir(cmount, dir_path));
+  ASSERT_EQ(0, ceph_unlink(cmount, link_path));
+  ASSERT_EQ(0, ceph_rmdir(cmount, dir_path));
   ceph_shutdown(cmount);
 }

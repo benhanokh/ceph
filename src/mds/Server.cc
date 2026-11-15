@@ -41,6 +41,7 @@
 #include "MetricsHandler.h"
 #include "cephfs_features.h"
 #include "MDSContext.h"
+#include "QuarantineManager.h"
 
 #include "messages/MClientReconnect.h"
 #include "messages/MClientReply.h"
@@ -63,10 +64,11 @@
 #include "events/EPurged.h"
 
 #include "include/stringify.h"
-#include "include/filepath.h"
+#include "common/filepath.h"
 #include "common/strescape.h"
 #include "common/ceph_json.h"
 #include "common/debug.h"
+#include "common/errno.h" // for cpp_strerror()
 #include "common/Timer.h"
 #include "common/perf_counters.h"
 #include "include/compat.h"
@@ -3499,19 +3501,64 @@ bool Server::check_access(const MDRequestRef& mdr, CInode *in, unsigned mask)
 {
   if (mdr->session) {
     std::string_view fs_name = mds->mdsmap->get_fs_name();
+    bool check_qtine = in->is_under_quarantine()
+                       && mdr->session->info.has_feature(CEPHFS_FEATURE_QUARANTINE);
     int r = mdr->session->check_access(
       fs_name, in, mask,
       mdr->client_request->get_caller_uid(),
       mdr->client_request->get_caller_gid(),
       &mdr->client_request->get_caller_gid_list(),
       mdr->client_request->head.args.setattr.uid,
-      mdr->client_request->head.args.setattr.gid);
+      mdr->client_request->head.args.setattr.gid,
+      check_qtine);
     if (r < 0) {
       respond_to_request(mdr, r);
       return false;
     }
   }
   return true;
+}
+
+/**
+ * Block client requests from non-quarantine-aware clients when the target
+ * inode is under quarantine. Drops the request's locks and adds a waiter on
+ * the subvolume root inode so the request will be retried when quarantine
+ * is lifted.
+ *
+ * Returns true if the request was blocked (caller should return nullptr).
+ */
+bool Server::check_quarantine_block(const MDRequestRef& mdr, CInode *in)
+{
+  if (!mdr->client_request || !mdr->session)
+    return false;
+
+  if (mdr->session->info.has_feature(CEPHFS_FEATURE_QUARANTINE))
+    return false;
+
+  if (!in->is_under_quarantine())
+    return false;
+
+  auto snaprealm = in->find_snaprealm();
+  while (snaprealm) {
+    inodeno_t subvol_ino = snaprealm->get_subvolume_ino();
+    auto *subvol_in = mdcache->get_inode(subvol_ino);
+    if (subvol_in &&
+        (subvol_in->is_being_quarantined() || subvol_in->has_quarantined())) {
+      dout(10) << __func__ << " blocking request from old client "
+               << mdr->get_client() << " on quarantined inode " << *in
+               << " (subvol root " << subvol_ino << ")" << dendl;
+      // Drop the locks taken during path traversal (and auth pins) before
+      // waiting: they include snaplock rdlocks on the subvolume root, which
+      // the in-progress quarantine operation needs to xlock -- holding them
+      // here deadlocks quarantine enable. The request re-traverses on retry.
+      subvol_in->add_waiter(CInode::WAIT_QUARANTINE,
+                            CF_MDS_RetryRequestFactory(mdcache, mdr, true).build());
+      return true;
+    }
+    snaprealm = snaprealm->parent;
+  }
+
+  return false;
 }
 
 /**
@@ -3557,8 +3604,20 @@ CDentry* Server::prepare_stray_dentry(const MDRequestRef& mdr, CInode *in)
 
   CDentry *straydn = mdr->straydn;
   if (straydn) {
-    ceph_assert(straydn->get_name() == straydname);
-    return straydn;
+    if (straydn->get_name() == straydname)
+      return straydn;
+
+    /*
+     * The victim inode changed since the stray dentry was prepared
+     * (e.g. a concurrent rename replaced the target inode while this
+     * request was deferred with its locks dropped), so the cached
+     * stray dentry no longer matches this request.  Drop it and
+     * prepare a fresh one for the current victim.
+     */
+    dout(10) << __func__ << ": cached stray dentry " << *straydn
+             << " no longer matches " << *in << dendl;
+    mdr->unpin(straydn);
+    mdr->straydn = nullptr;
   }
   CDir *straydir = mdcache->get_stray_dir(in);
 
@@ -3879,6 +3938,9 @@ CInode* Server::rdlock_path_pin_ref(const MDRequestRef& mdr,
   CInode *ref = mdr->in[0];
   dout(10) << "ref is " << *ref << dendl;
 
+  if (check_quarantine_block(mdr, ref))
+    return nullptr;
+
   if (want_auth) {
     // auth_pin?
     //   do NOT proceed if freezing, as cap release may defer in that case, and
@@ -3973,6 +4035,9 @@ CDentry* Server::rdlock_path_xlock_dentry(const MDRequestRef& mdr,
   CDentry *dn = mdr->dn[0].back();
   CDir *dir = dn->get_dir();
   CInode *diri = dir->get_inode();
+
+  if (check_quarantine_block(mdr, diri))
+    return nullptr;
 
   if (!mdr->reqid.name.is_mds()) {
     if (diri->is_system() && !diri->is_root() &&
@@ -4075,6 +4140,10 @@ Server::rdlock_two_paths_xlock_destdn(const MDRequestRef& mdr, bool xlock_srcdn)
   CDir *srcdir = srcdn->get_dir();
   CDentry *destdn = mdr->dn[0].back();
   CDir *destdir = destdn->get_dir();
+
+  if (check_quarantine_block(mdr, srcdir->get_inode()) ||
+      check_quarantine_block(mdr, destdir->get_inode()))
+    return std::make_pair(nullptr, nullptr);
 
   if (!mdr->reqid.name.is_mds()) {
     if ((srcdir->get_inode()->is_system() && !srcdir->get_inode()->is_root()) ||
@@ -4410,6 +4479,9 @@ void Server::handle_client_lookup_ino(const MDRequestRef& mdr,
     return;
   }
 
+  if (check_quarantine_block(mdr, in))
+    return;
+
   // check for nothing (not read or write); this still applies the
   // path check.
   if (!check_access(mdr, in, 0))
@@ -4509,6 +4581,9 @@ void Server::_lookup_snap_ino(const MDRequestRef& mdr)
   }
 
   if (in) {
+    if (!check_access(mdr, in, MAY_READ))
+      return;
+
     dout(10) << "reply to lookup_snap_ino " << *in << dendl;
     mdr->snapid = vino.snapid;
     mdr->tracei = in;
@@ -5075,7 +5150,7 @@ void Server::handle_client_readdir(const MDRequestRef& mdr)
   // which frag?
   frag_t fg = (__u32)req->head.args.readdir.frag;
   unsigned req_flags = (__u32)req->head.args.readdir.flags;
-  string offset_str = req->get_path2();
+  auto offset_str = std::string(req->get_string2());
 
   __u32 offset_hash = 0;
   if (!offset_str.empty())
@@ -5166,8 +5241,11 @@ void Server::handle_client_readdir(const MDRequestRef& mdr)
   __u32 numfiles = 0;
   bool start = !offset_hash && offset_str.empty();
   // skip all dns < dentry_key_t(snapid, offset_str, offset_hash)
-  dentry_key_t skip_key(snapid, offset_str.c_str(), offset_hash);
+  dentry_key_t skip_key(snapid, offset_str, offset_hash);
   auto it = start ? dir->begin() : dir->lower_bound(skip_key);
+  // Whether the client may hold dentry leases here at all depends only on
+  // the directory, and nothing below changes that, so ask once.
+  const bool dir_leasable = mds->locker->can_lease_dentries_in(diri, mdr);
   bool end = (it == dir->end());
   for (; !end && numfiles < max; end = (it == dir->end())) {
     CDentry *dn = it->second;
@@ -5191,7 +5269,7 @@ void Server::handle_client_readdir(const MDRequestRef& mdr)
     }
 
     if (!start) {
-      dentry_key_t offset_key(dn->last, offset_str.c_str(), offset_hash);
+      dentry_key_t offset_key(dn->last, offset_str, offset_hash);
       if (!(offset_key < dn->key()))
 	continue;
     }
@@ -5243,7 +5321,7 @@ void Server::handle_client_readdir(const MDRequestRef& mdr)
     // dentry
     dout(12) << "including    dn " << *dn << dendl;
     encode(dn->get_name(), dnbl);
-    mds->locker->issue_client_lease(dn, in, mdr, now, dnbl);
+    mds->locker->issue_client_lease(dn, in, mdr, now, dnbl, dir_leasable);
 
     // inode
     dout(12) << "including inode in " << *in << " snap " << snapid << dendl;
@@ -5276,6 +5354,26 @@ void Server::handle_client_readdir(const MDRequestRef& mdr)
 // INODE UPDATES
 
 
+/*
+ * alternate_name on a remote dentry does not touch the inode. The
+ * inode's auth may be another MDS, and journal_dirty_inode would cow
+ * the primary link there.
+ */
+class C_MDS_remote_dentry_update_finish : public ServerLogContext {
+  CDentry *dn;
+  version_t pv;
+public:
+  C_MDS_remote_dentry_update_finish(Server *s, const MDRequestRef& r,
+                                    CDentry *d, version_t v) :
+    ServerLogContext(s, r), dn(d), pv(v) {}
+  void finish(int r) override {
+    ceph_assert(r == 0);
+    dn->mark_dirty(pv, mdr->ls);
+    mdr->apply();
+    server->respond_to_request(mdr, 0);
+  }
+};
+
 /* 
  * finisher for basic inode updates
  */
@@ -5292,6 +5390,7 @@ public:
 
     int snap_op = (in->snaprealm ? CEPH_SNAP_OP_UPDATE : CEPH_SNAP_OP_SPLIT);
 
+    in->mark_dirty_parent(mdr->ls, true);
     // apply
     mdr->apply();
 
@@ -5316,6 +5415,46 @@ public:
       get_mds()->locker->share_inode_max_size(in);
   }
 };
+
+
+class C_MDS_quarantine_inode_update_finish : public C_MDS_inode_update_finish {
+  QtineMgr qtine_mgr;
+  inodeno_t qtine_root_ino;
+  public:
+  C_MDS_quarantine_inode_update_finish(Server *s, const MDRequestRef& r, CInode *i, QtineMgr qm, inodeno_t ino) :
+    C_MDS_inode_update_finish(s, r, i), qtine_mgr(qm), qtine_root_ino(ino) { }
+
+  void finish(int r) override {
+    C_MDS_inode_update_finish::finish(r);
+
+    auto mds = get_mds();
+
+    dout(20) << " C_MDS_quarantine_inode_update_finish" << dendl;
+    if (auto *root = mds->mdcache->get_inode(qtine_root_ino); root) {
+      root->clear_being_quarantined();
+    }
+    // caps should have been revoked by now
+    // so we declare the inode as quarantined
+    qtine_mgr->work_done();
+    dout(20) << __PRETTY_FUNCTION__ << " PUT" << dendl;
+    qtine_mgr->put();
+  }
+};
+
+void Server::journal_quarantine_inode(MDRequestRef const& mdr, CInode *cur, unsigned qtine_op, QtineMgr qtine_mgr)
+{
+  // log + wait
+  std::string op_str = (qtine_op == QUARANTINE_ADD ? "add" : "del");
+  mdr->ls = mdlog->get_current_segment();
+  EUpdate *le = new EUpdate(mdlog, ("quarantine flag " + op_str));
+  mdcache->predirty_journal_parents(mdr, &le->metablob, cur, 0, PREDIRTY_PRIMARY);
+  mdcache->journal_dirty_inode(mdr.get(), &le->metablob, cur);
+
+  journal_and_reply(mdr, cur, 0, le,
+                    new C_MDS_quarantine_inode_update_finish(this, mdr, cur,
+                                                             qtine_mgr,
+                                                             mdr->qtine_root_ino));
+}
 
 void Server::handle_client_file_setlock(const MDRequestRef& mdr)
 {
@@ -5376,17 +5515,20 @@ void Server::handle_client_file_setlock(const MDRequestRef& mdr)
 
   dout(10) << " state prior to lock change: " << *lock_state << dendl;
   if (CEPH_LOCK_UNLOCK == set_lock.type) {
-    list<ceph_filelock> activated_locks;
     MDSContext::vec waiters;
+    bool changed = false;
     if (lock_state->is_waiting(set_lock)) {
       dout(10) << " unlock removing waiting lock " << set_lock << dendl;
       lock_state->remove_waiting(set_lock);
-      cur->take_waiting(CInode::WAIT_FLOCK, waiters);
-    } else if (!interrupt) {
-      dout(10) << " unlock attempt on " << set_lock << dendl;
-      lock_state->remove_lock(set_lock, activated_locks);
-      cur->take_waiting(CInode::WAIT_FLOCK, waiters);
+      changed = true;
     }
+    if (!interrupt) {
+      dout(10) << " unlock attempt on " << set_lock << dendl;
+      lock_state->remove_lock(set_lock);
+      changed = true;
+    }
+    if (changed)
+      cur->take_waiting(CInode::WAIT_FLOCK, waiters);
     mds->queue_waiters(waiters);
 
     respond_to_request(mdr, 0);
@@ -6242,14 +6384,16 @@ void Server::handle_client_setvxattr(const MDRequestRef& mdr, CInode *cur)
   const cref_t<MClientRequest> &req = mdr->client_request;
   bool is_rmxattr = (req->get_op() == CEPH_MDS_OP_RMXATTR);
   MutationImpl::LockOpVec lov;
-  string name(req->get_path2());
+  auto name = std::string(req->get_string2());
   bufferlist bl = req->get_data();
   string value (bl.c_str(), bl.length());
+
   dout(10) << "handle_client_setvxattr " << name
            << " val " << value.length()
            << " bytes on " << *cur
            << dendl;
 
+  CDentry *dn = 0;
   CInode::mempool_inode *pip = nullptr;
   string rest;
 
@@ -6676,6 +6820,9 @@ void Server::handle_client_setvxattr(const MDRequestRef& mdr, CInode *cur)
       respond_to_request(mdr, -EDOM);
       return;
     } else if (mdcache->export_ephemeral_random_max < val) {
+      dout(10) << "value " << val << " for " << name << " exceeds "
+	       << "mds_export_ephemeral_random_max ("
+	       << mdcache->export_ephemeral_random_max << ")" << dendl;
       respond_to_request(mdr, -EINVAL);
       return;
     }
@@ -6833,6 +6980,63 @@ void Server::handle_client_setvxattr(const MDRequestRef& mdr, CInode *cur)
       c.set_encoding(c.get_default_encoding());
     }
     dout(20) << "set encoding: " << c << dendl;
+  } else if (name == "ceph.alternate_name"sv) {
+    if (value == ""sv) {
+      respond_to_request(mdr, -EINVAL);
+      return;
+    }
+    if (!mdr->dn[0].empty()) {
+      dn = mdr->dn[0].back();
+    } else {
+      dn = cur->get_projected_parent_dn();
+    }
+
+    if (!dn) {
+      respond_to_request(mdr, -EINVAL);
+      return;
+    }
+
+    if (value.size() > alternate_name_max) {
+      dout(10) << " alternate_name longer than " << alternate_name_max << dendl;
+      respond_to_request(mdr, -ENAMETOOLONG);
+      return;
+    }
+
+    if (dn->get_alternate_name() == value) {
+      // name is already set with same value, this is a noop.
+      respond_to_request(mdr, 0);
+      return;
+    }
+
+    if (dn->get_alternate_name().size()) {
+      respond_to_request(mdr, -EPERM);
+      return;
+    }
+
+    if (dn->get_projected_linkage()->is_remote()) {
+      // The named link is not the inode's primary. Journal this dentry
+      // only; cowing the primary would target a different link.
+      mdr->ls = mdlog->get_current_segment();
+      EUpdate *le = new EUpdate(mdlog, "set vxattr alternate_name");
+      le->metablob.add_client_req(req->get_reqid(), req->get_oldest_client_tid());
+
+      CDir *dir = dn->get_dir();
+      auto pf = dir->project_fnode(mdr);
+      mdcache->journal_cow_dentry(mdr.get(), &le->metablob, dn);
+      dn->set_alternate_name(value);
+      version_t pv = dn->pre_dirty();
+      pf->version = pv;
+      le->metablob.add_dir_context(dir);
+      le->metablob.add_dir(dir, true);
+      le->metablob.add_remote_dentry(dn, true);
+
+      journal_and_reply(mdr, cur, dn, le,
+                        new C_MDS_remote_dentry_update_finish(this, mdr, dn, pv));
+      return;
+    }
+
+    auto pi = cur->project_inode(mdr);
+    pip = pi.inode.get();
   } else {
     dout(10) << " unknown vxattr " << name << dendl;
     respond_to_request(mdr, -EINVAL);
@@ -6851,11 +7055,19 @@ void Server::handle_client_setvxattr(const MDRequestRef& mdr, CInode *cur)
   mdr->ls = mdlog->get_current_segment();
   EUpdate *le = new EUpdate(mdlog, "set vxattr layout");
   le->metablob.add_client_req(req->get_reqid(), req->get_oldest_client_tid());
-  mdcache->predirty_journal_parents(mdr, &le->metablob, cur, 0, PREDIRTY_PRIMARY);
-  mdcache->journal_dirty_inode(mdr.get(), &le->metablob, cur);
 
-  journal_and_reply(mdr, cur, 0, le, new C_MDS_inode_update_finish(this, mdr, cur,
-								   false, false, adjust_realm));
+  CDir *dn_dir = 0;
+  if (dn)
+    dn_dir = dn->get_dir();
+
+  mdcache->predirty_journal_parents(mdr, &le->metablob, cur, dn_dir, PREDIRTY_PRIMARY);
+  if (dn && name == "ceph.alternate_name"sv) {
+    mdcache->journal_cow_dentry(mdr.get(), &le->metablob, dn);
+    dn->set_alternate_name(value);
+  }
+  mdcache->journal_dirty_inode(mdr.get(), &le->metablob, cur);
+  auto* c = new C_MDS_inode_update_finish(this, mdr, cur, false, false, adjust_realm);
+  journal_and_reply(mdr, cur, dn, le, c);
   return;
 }
 
@@ -7045,10 +7257,25 @@ void Server::mirror_info_removexattr_handler(CInode *cur, InodeStoreBase::xattr_
 void Server::handle_client_setxattr(const MDRequestRef& mdr)
 {
   const cref_t<MClientRequest> &req = mdr->client_request;
-  string name(req->get_path2());
+  auto name = std::string(req->get_string2());
 
   // is a ceph virtual xattr?
   if (is_ceph_vxattr(name)) {
+    if (name == "ceph.alternate_name"sv) {
+      // Per-dentry field. Lock the link the client named.
+      CDentry *dn = rdlock_path_xlock_dentry(mdr, false, true, false);
+      if (!dn)
+        return;
+
+      CInode *cur = dn->get_projected_linkage()->get_inode();
+      if (!cur) {
+        respond_to_request(mdr, -ESTALE);
+        return;
+      }
+      handle_client_setvxattr(mdr, cur);
+      return;
+    }
+
     // can't use rdlock_path_pin_ref because we need to xlock snaplock/policylock
     CInode *cur = try_get_auth_inode(mdr, req->get_filepath().get_ino());
     if (!cur)
@@ -7142,7 +7369,7 @@ void Server::handle_client_setxattr(const MDRequestRef& mdr)
 void Server::handle_client_removexattr(const MDRequestRef& mdr)
 {
   const cref_t<MClientRequest> &req = mdr->client_request;
-  std::string name(req->get_path2());
+  auto name = std::string(req->get_string2());
 
   // is a ceph virtual xattr?
   if (is_ceph_vxattr(name)) {
@@ -7211,7 +7438,7 @@ void Server::handle_client_removexattr(const MDRequestRef& mdr)
 void Server::handle_client_getvxattr(const MDRequestRef& mdr)
 {
   const auto& req = mdr->client_request;
-  string xattr_name{req->get_path2()};
+  auto xattr_name = std::string(req->get_string2());
 
   // is a ceph virtual xattr?
   if (!is_ceph_vxattr(xattr_name)) {
@@ -7722,7 +7949,7 @@ void Server::handle_client_symlink(const MDRequestRef& mdr)
   // it's a symlink
   dn->push_projected_linkage(newi);
 
-  newi->symlink = req->get_path2();
+  newi->symlink = std::string(req->get_string2());
   auto _inode = newi->_get_inode();
   _inode->version = dn->pre_dirty();
   _inode->size = newi->symlink.length();
@@ -8766,18 +8993,43 @@ void Server::_unlink_local_finish(const MDRequestRef& mdr,
   // bump pop
   mds->balancer->hit_dir(dn->get_dir(), META_POP_IWR);
 
-  // reply
-  respond_to_request(mdr, 0);
-  
-  // removing a new dn?
-  dn->get_dir()->try_remove_unlinked_dn(dn);
-
   // clean up ?
-  // respond_to_request() drops locks. So stray reintegration can race with us.
+  // evaluate stray before dropping locks to avoid racing with
+  // concurrent link/unlink requests that may modify nlink.
   if (straydn && !straydn->get_projected_linkage()->is_null()) {
     // Tip off the MDCache that this dentry is a stray that
     // might be elegible for purge.
     mdcache->notify_stray(straydn);
+  }
+
+  // reply
+  respond_to_request(mdr, 0);
+
+  // removing a new dn?
+  dn->get_dir()->try_remove_unlinked_dn(dn);
+
+  // Dev config injection point: crash the MDS after the unlink journal
+  // callback has committed nlink and moved the inode to the stray dir,
+  // but before CDir::commit has written the directory omap to RADOS.
+  // This reproduces the stale remote dentry crash in _eval_stray_remote
+  // on recovery (tracker 62663).
+  //
+  // Test procedure (hardlink scenario):
+  //   1. set mds_kill_after_unlink_finish = true
+  //   2. create a file with primary + remote hardlinks (nlink >= 2)
+  //   3. unlink the primary → nlink drops to 1, MDS crashes
+  //   4. restart MDS → journal replay restores nlink=1 + stray location,
+  //      stale type-'L' remote dentry on disk triggers eval_remote →
+  //      _eval_stray_remote(nlink=1) → reintegrates; FS is healthy
+  //   5. set mds_kill_after_unlink_finish = true again
+  //   6. unlink the remaining primary link → nlink drops to 0, MDS crashes
+  //   7. restart MDS → nlink=0 stray is purged; verify FS functional
+  if (unlikely(g_conf()->mds_kill_after_unlink_finish)) {
+    ceph_abort_msg(
+        "mds_kill_after_unlink_finish is set; "
+        "the nlink==0 commit was applied and the MDS will now crash. "
+        "On recovery, any stale remote dentries still on disk will "
+        "trigger the _eval_stray_remote path to verify the fix.");
   }
 }
 
@@ -9692,17 +9944,18 @@ void Server::_rename_finish(const MDRequestRef& mdr, CDentry *srcdn, CDentry *de
 
   ceph_assert(g_conf()->mds_kill_rename_at != 7);
 
+  // clean up?
+  // evaluate stray before dropping locks to avoid racing with
+  // concurrent link/unlink requests that may modify nlink.
+  if (straydn && !straydn->get_projected_linkage()->is_null()) {
+    mdcache->notify_stray(straydn);
+  }
+
   // reply
   respond_to_request(mdr, 0);
 
   if (need_eval)
     mds->locker->eval(in, CEPH_CAP_LOCKS, true);
-
-  // clean up?
-  // respond_to_request() drops locks. So stray reintegration can race with us.
-  if (straydn && !straydn->get_projected_linkage()->is_null()) {
-    mdcache->notify_stray(straydn);
-  }
 }
 
 
@@ -11374,6 +11627,10 @@ void Server::handle_client_lssnap(const MDRequestRef& mdr)
   CInode *diri = try_get_auth_inode(mdr, req->get_filepath().get_ino());
   if (!diri)
     return;
+  // looked up by ino (not via a path helper), so do the quarantine block
+  // check here for clients that can't be refused via check_access()
+  if (check_quarantine_block(mdr, diri))
+    return;
 
   if (!diri->is_dir()) {
     respond_to_request(mdr, -ENOTDIR);
@@ -11401,7 +11658,7 @@ void Server::handle_client_lssnap(const MDRequestRef& mdr)
     max_bytes = (512 << 10) + mds->mdsmap->get_max_xattr_size();
 
   __u64 last_snapid = 0;
-  string offset_str = req->get_path2();
+  auto offset_str = std::string(req->get_string2());
   if (!offset_str.empty())
     last_snapid = realm->resolve_snapname(offset_str, diri->ino());
 
@@ -11492,6 +11749,10 @@ void Server::handle_client_mksnap(const MDRequestRef& mdr)
 
   CInode *diri = try_get_auth_inode(mdr, req->get_filepath().get_ino());
   if (!diri)
+    return;
+  // looked up by ino (not via a path helper), so do the quarantine block
+  // check here for clients that can't be refused via check_access()
+  if (check_quarantine_block(mdr, diri))
     return;
 
   // dir only
@@ -11678,6 +11939,10 @@ void Server::handle_client_rmsnap(const MDRequestRef& mdr)
   CInode *diri = try_get_auth_inode(mdr, req->get_filepath().get_ino());
   if (!diri)
     return;
+  // looked up by ino (not via a path helper), so do the quarantine block
+  // check here for clients that can't be refused via check_access()
+  if (check_quarantine_block(mdr, diri))
+    return;
 
   if (!diri->is_dir()) {
     respond_to_request(mdr, -ENOTDIR);
@@ -11811,6 +12076,10 @@ void Server::handle_client_renamesnap(const MDRequestRef& mdr)
   CInode *diri = try_get_auth_inode(mdr, req->get_filepath().get_ino());
   if (!diri)
     return;
+  // looked up by ino (not via a path helper), so do the quarantine block
+  // check here for clients that can't be refused via check_access()
+  if (check_quarantine_block(mdr, diri))
+    return;
 
   if (!diri->is_dir()) { // dir only
     respond_to_request(mdr, -ENOTDIR);
@@ -11935,7 +12204,7 @@ void Server::handle_client_snap_md_op(const MDRequestRef& mdr)
 {
   const cref_t<MClientRequest> &req = mdr->client_request;
 
-  CInode* diri = rdlock_path_pin_ref(mdr, false, true);
+  CInode* diri = rdlock_path_pin_ref(mdr, true, false);
   if (!diri)
     return;
 
@@ -12075,16 +12344,33 @@ void Server::handle_client_file_blockdiff(const MDRequestRef& mdr)
 
   dout(10) << __func__ << dendl;
 
-  // no real need to rdlock_path_pin_ref() since the caller holds an
-  // open ref, but we need the snapped inode.
   const filepath& refpath1 = mdr->get_filepath();
+  const filepath& refpath2 = mdr->get_filepath2();
+  if (!refpath1.is_last_snap() || !refpath2.is_last_snap()) {
+    dout(10) << __func__ << ": not a snapshot path: " << refpath1
+	     << " vs " << refpath2 << " req=" << req << dendl;
+    respond_to_request(mdr, -EINVAL);
+    return;
+  }
+  // Only in2 decides where the request runs. The two snapshot versions can
+  // have different auth ranks (e.g. a snapped inode left in the file's old
+  // parent directory), so requiring auth for both could forward the request
+  // back and forth. MDCache::file_blockdiff() handles a non-auth in1.
   CInode* in1 = rdlock_path_pin_ref(mdr, refpath1, false, true);
   if (!in1) {
     return;
   }
-  const filepath& refpath2 = mdr->get_filepath2();
-  CInode* in2 = rdlock_path_pin_ref(mdr, refpath2, false, true);
+  snapid_t snapid1 = mdr->snapid;
+  CInode* in2 = rdlock_path_pin_ref(mdr, refpath2, true, false);
   if (!in2) {
+    return;
+  }
+  snapid_t snapid2 = mdr->snapid;
+
+  if (in1->is_ambiguous_auth()) {
+    dout(10) << __func__ << ": waiting for single auth on " << *in1 << dendl;
+    CF_MDS_RetryRequestFactory cf(mdcache, mdr, true);
+    in1->add_waiter(CInode::WAIT_SINGLEAUTH, cf.build());
     return;
   }
 
@@ -12094,24 +12380,33 @@ void Server::handle_client_file_blockdiff(const MDRequestRef& mdr)
     return;
   }
 
-  dout(20) << __func__ << ": in1=" << *in1 << dendl;
-  dout(20) << __func__ << ": in2=" << *in2 << dendl;
+  // Snapshots must be supplied oldest first. The paths come from the
+  // client, so reject the request rather than trip the assertion in
+  // MDCache::file_blockdiff().
+  if (snapid1 > snapid2) {
+    dout(10) << __func__ << ": snapshots out of order: snapid1=" << snapid1
+	     << " snapid2=" << snapid2 << " req=" << req << dendl;
+    respond_to_request(mdr, -EINVAL);
+    return;
+  }
+
+  dout(20) << __func__ << ": snapid1=" << snapid1 << " in1=" << *in1
+           << " snapid2=" << snapid2 << " in2=" << *in2 << dendl;
 
   auto scan_idx = (uint64_t)req->head.args.blockdiff.scan_idx;
   auto max_objects = (uint32_t)req->head.args.blockdiff.max_objects;
 
   C_MDS_file_blockdiff_finish *ctx = new C_MDS_file_blockdiff_finish(this, mdr, in2, scan_idx);
 
-  if (in1 == in2) {
-    // does not matter if the inodes are snapped or refer to the head
-    // version -- both snaps are same.
+  if (in1 == in2 && snapid1 == snapid2) {
     dout(10) << __func__ << ": no diffs between snaps" << dendl;
     handle_file_blockdiff_finish(mdr, in2, ctx->block_diff, 0);
     delete ctx;
     return;
   }
 
-  mdcache->file_blockdiff(in1, in2, &(ctx->block_diff), max_objects, ctx);
+  mdcache->file_blockdiff(in1, snapid1, in2, snapid2,
+                          &(ctx->block_diff), max_objects, ctx);
 }
 
 void Server::handle_file_blockdiff_finish(const MDRequestRef& mdr, CInode *in, const BlockDiff &block_diff,
@@ -12173,7 +12468,7 @@ void Server::handle_client_readdir_snapdiff(const MDRequestRef& mdr)
   frag_t fg = (__u32)req->head.args.snapdiff.frag;
   unsigned req_flags = (__u32)req->head.args.snapdiff.flags;
   unsigned diff_mask = (__u32)req->head.args.snapdiff.mask;
-  string offset_str = req->get_path2();
+  auto offset_str = std::string(req->get_string2());
 
   __u32 offset_hash = 0;
   if (!offset_str.empty()) {
@@ -12344,7 +12639,7 @@ void Server::_readdir_diff(
   }
   bool from_the_beginning = !offset_hash && offset_str.empty();
   // skip all dns <= dentry_key_t(*, offset_str, offset_hash)
-  dentry_key_t skip_key(CEPH_NOSNAP, offset_str.c_str(), offset_hash);
+  dentry_key_t skip_key(CEPH_NOSNAP, offset_str, offset_hash);
 
   // We need to rollback all the entries with the same name
   // when some entries with this name don't fit into the same fragment.
@@ -12356,6 +12651,7 @@ void Server::_readdir_diff(
   size_t rollback_pos = 0;
   size_t rollback_num = 0;
 
+  bool waiting = false;
   bool end = build_snap_diff(
     mdr,
     dir,
@@ -12366,13 +12662,11 @@ void Server::_readdir_diff(
     diff_mask,
     dnbl,
     [&](CDentry* dn, CInode* in, bool exists) {
-      string name;
       snapid_t effective_snapid;
-      const auto& dn_name = dn->get_name();
+      const auto name = dn->get_name();
       // provide the first snapid for removed entries and
       // the last one for existent ones
       effective_snapid = exists ? snapid : snapid_prev;
-      name.append(dn_name);
       if ((int)(dnbl.length() + name.length() + sizeof(__u32) + sizeof(LeaseStat)) > bytes_left) {
 	dout(10) << " ran out of room for name, stopping at " << dnbl.length() << " < " << bytes_left << dendl;
         if (name == last_name) {
@@ -12387,12 +12681,11 @@ void Server::_readdir_diff(
 	return false;
       }
 
-      auto diri = dir->get_inode();
-      auto hash = ceph_frag_value(diri->hash_dentry_name(dn_name));
       unsigned start_len = dnbl.length();
       dout(10) << "inc dn " << *dn << " as " << name
-               << std::hex << " hash 0x" << hash << std::dec
-               << " " << effective_snapid
+               << std::hex << " hash 0x"
+               << ceph_frag_value(dir->get_inode()->hash_dentry_name(name))
+               << std::dec << " " << effective_snapid
                << dendl;
       encode(name, dnbl);
       mds->locker->issue_client_lease(dn, in, mdr, now, dnbl);
@@ -12427,7 +12720,11 @@ void Server::_readdir_diff(
       mdcache->lru.lru_touch(dn);
       ++numfiles;
       return true;
-    });
+    },
+    &waiting);
+
+  if (waiting)
+    return;
 
   __u16 flags = 0;
   if (req_flags & CEPH_READDIR_REPLY_BITFLAGS) {
@@ -12449,7 +12746,8 @@ bool Server::build_snap_diff(
   snapid_t snapid,
   unsigned diff_mask,
   const bufferlist& dnbl,
-  std::function<bool (CDentry*, CInode*, bool)> add_result_cb)
+  std::function<bool (CDentry*, CInode*, bool)> add_result_cb,
+  bool *waiting)
 {
   struct EntryInfo {
     CDentry* dn = nullptr;
@@ -12464,36 +12762,72 @@ bool Server::build_snap_diff(
     bool valid() const {
       return in != nullptr && dn != nullptr;
     }
-    bool meta_differs(const CInode* _in, unsigned mask, unsigned& res_mask) const {
-      ceph_assert(in);
-      ceph_assert(_in);
 
-      auto my = in->get_inode();
-      auto oth = _in->get_inode();
-      ceph_assert(my);
-      ceph_assert(oth);
+    static bool meta_differs(const CInode::mempool_inode& my,
+                             const CInode::mempool_inode& oth,
+                             unsigned mask,
+                             unsigned& res_mask) {
       res_mask = 0;
-      if ((mask & CEPH_SNAPDIFF_MODE) && (my->mode != oth->mode))
+      if ((mask & CEPH_SNAPDIFF_MODE) && (my.mode != oth.mode))
 	res_mask |= CEPH_SNAPDIFF_MODE;
-      if ((mask & CEPH_SNAPDIFF_UID) && (my->uid != oth->uid))
+      if ((mask & CEPH_SNAPDIFF_UID) && (my.uid != oth.uid))
 	res_mask |= CEPH_SNAPDIFF_UID;
-      if ((mask & CEPH_SNAPDIFF_GID) && (my->gid != oth->gid))
+      if ((mask & CEPH_SNAPDIFF_GID) && (my.gid != oth.gid))
 	res_mask |= CEPH_SNAPDIFF_GID;
-      if ((mask & CEPH_SNAPDIFF_SIZE) && (my->size != oth->size))
+      if ((mask & CEPH_SNAPDIFF_SIZE) && (my.size != oth.size))
 	res_mask |= CEPH_SNAPDIFF_SIZE;
-      if ((mask & CEPH_SNAPDIFF_NLINK) && (my->nlink != oth->nlink))
+      if ((mask & CEPH_SNAPDIFF_NLINK) && (my.nlink != oth.nlink))
 	res_mask |= CEPH_SNAPDIFF_NLINK;
-      if ((mask & CEPH_SNAPDIFF_MTIME) && (my->mtime != oth->mtime))
+      if ((mask & CEPH_SNAPDIFF_MTIME) && (my.mtime != oth.mtime))
 	res_mask |= CEPH_SNAPDIFF_MTIME;
-      if ((mask & CEPH_SNAPDIFF_ATIME) && (my->atime != oth->atime))
+      if ((mask & CEPH_SNAPDIFF_ATIME) && (my.atime != oth.atime))
 	res_mask |= CEPH_SNAPDIFF_ATIME;
-      if ((mask & CEPH_SNAPDIFF_CTIME) && (my->ctime != oth->ctime))
+      if ((mask & CEPH_SNAPDIFF_CTIME) && (my.ctime != oth.ctime))
 	res_mask |= CEPH_SNAPDIFF_CTIME;
-      if ((mask & CEPH_SNAPDIFF_BTIME) && (my->btime != oth->btime))
+      if ((mask & CEPH_SNAPDIFF_BTIME) && (my.btime != oth.btime))
 	res_mask |= CEPH_SNAPDIFF_BTIME;
       return res_mask != 0;
     }
+
+    bool meta_differs(const CInode* _in,
+                      unsigned mask,
+                      unsigned& res_mask) const {
+      ceph_assert(in);
+      ceph_assert(_in);
+      return meta_differs(*in->get_inode(), *_in->get_inode(),
+                          mask, res_mask);
+    }
   } before;
+
+  auto snapflush_pending = [&](CInode *in) -> bool {
+    if (!in->is_head() && !in->client_snap_caps.empty())
+      return true;
+    CInode *head = in->is_head() ? in : mdcache->get_inode(in->ino());
+    if (!head)
+      return true;
+    for (const auto& p : head->client_need_snapflush) {
+      if (p.first >= snapid_prev && p.first <= snapid && !p.second.empty())
+	return true;
+    }
+    return false;
+  };
+
+  // rdlock filelock so pending snapflush completes before metadata is read.
+  auto rdlock_file_start = [&](CInode *in) -> bool {
+    if (!mds->locker->rdlock_start(&in->filelock, mdr)) {
+      dout(10) << __func__ << " waiting for snapflush, deferring readdir_snapdiff on "
+           << *in << " snap " << snapid_prev << " vs. " << snapid << dendl;
+      if (waiting)
+        *waiting = true;
+      return false;
+    }
+    return true;
+  };
+  auto rdlock_file_finish = [&](CInode *in) {
+    auto lit = mdr->locks.find(&in->filelock);
+    ceph_assert(lit != mdr->locks.end());
+    mds->locker->rdlock_finish(lit, mdr.get(), nullptr);
+  };
 
   auto insert_deleted = [&](EntryInfo& ei) {
     dout(20) << "build_snap_diff deleted file " << ei.dn->get_name() << " "
@@ -12503,6 +12837,27 @@ bool Server::build_snap_diff(
     return r;
   };
   client_t client = mdr->client_request->get_source().num();
+
+  // Return the inode metadata visible at @snapid. Multiversion inodes keep
+  // their historical versions in old_inodes, keyed by the version's last
+  // snapshot.
+  auto inode_at_snap = [](const CInode* head, snapid_t snapid)
+      -> const CInode::mempool_inode* {
+    ceph_assert(head->is_head());
+
+    if (snapid >= head->first)
+      return head->get_inode().get();
+
+    snapid_t old_last = head->pick_old_inode(snapid);
+    if (!old_last)
+      return nullptr;
+
+    const auto& old_inodes = head->get_old_inodes();
+    ceph_assert(old_inodes);
+    auto it = old_inodes->find(old_last);
+    ceph_assert(it != old_inodes->end());
+    return &it->second.inode;
+  };
 
   auto it = !skip_key ? dir->begin() : dir->upper_bound(*skip_key);
 
@@ -12590,9 +12945,83 @@ bool Server::build_snap_diff(
       }
     } else {
       if (snapid_prev >= dn->first && snapid <= dn->last) {
-	dout(20) << __func__ << " skipping unchanged " << dn->get_name() << " "
-	  << dn->first << "/" << dn->last << dendl;
-	continue;
+        // A multiversion inode can be COWed without COWing its dentry.
+        // Do not infer that the inode is unchanged solely because this
+        // dentry spans both snapshots.
+        CInode* head = in->is_head() ? in : mdcache->get_inode(in->ino());
+
+        bool locked = false;
+        if (snapflush_pending(in)) {
+          if (before.valid() && !insert_deleted(before))
+            break;
+          if (!rdlock_file_start(in))
+            return false;
+          locked = true;
+        }
+
+        // A replica's first can lag the inode auth MDS, so only use the
+        // range as a fast path when it is authoritative.
+        const bool inode_state_authoritative = head && head->is_auth();
+        bool inode_spans_both =
+          inode_state_authoritative &&
+          snapid_prev >= in->first && snapid <= in->last;
+
+        unsigned res_mask = 0;
+        bool attrs_known = false;
+        bool attrs_changed = true;
+
+        // old_inodes is authoritative only on the inode auth MDS. If this
+        // rank has only a replica, report the entry conservatively rather
+        // than silently losing an update.
+        if (inode_state_authoritative) {
+          const auto* prev_inode = inode_at_snap(head, snapid_prev);
+          const auto* snap_inode = inode_at_snap(head, snapid);
+          if (prev_inode && snap_inode) {
+            attrs_known = true;
+            attrs_changed = EntryInfo::meta_differs(
+              *prev_inode, *snap_inode, diff_mask, res_mask);
+          }
+        }
+
+        if (locked)
+          rdlock_file_finish(in);
+
+        if (inode_spans_both) {
+          dout(20) << __func__ << " skipping unchanged " << dn->get_name() << " "
+            << dn->first << "/" << dn->last << dendl;
+          continue;
+        }
+
+        if (attrs_known && !attrs_changed) {
+          dout(20) << __func__
+            << " skipping unchanged hardlink inode attrs "
+            << dn->get_name() << " " << dn->first << "/" << dn->last
+            << dendl;
+          continue;
+        }
+
+        // Preserve hash/name ordering if a deleted entry is pending.
+        if (before.valid() && !insert_deleted(before))
+          break;
+
+        if (attrs_known) {
+          dout(20) << __func__
+            << " inode attrs changed behind unchanged hardlink dentry "
+            << dn->get_name() << " dn " << dn->first << "/" << dn->last
+            << " inode " << in->first << "/" << in->last
+            << " result mask: 0x" << std::hex << res_mask << std::dec
+            << dendl;
+        } else {
+          dout(10) << __func__
+            << " reporting unchanged-span hardlink conservatively "
+            << dn->get_name() << " dn " << dn->first << "/" << dn->last
+            << " inode " << in->first << "/" << in->last
+            << dendl;
+        }
+
+        if (!add_result_cb(dn, in, true))
+          break;
+        continue;
       } else if (snapid_prev < dn->first && snapid > dn->last) {
 	dout(20) << __func__ << " skipping inner modification " << dn->get_name() << " "
 	  << dn->first << "/" << dn->last << dendl;
@@ -12622,17 +13051,40 @@ bool Server::build_snap_diff(
 	  } else {
 	    unsigned res_mask = 0;
 	    if (before.meta_differs(in, diff_mask, res_mask) ) {
-	      dout(0) << __func__ << " attrs changed " << dn->get_name() << " "
+	      dout(30) << __func__ << " attrs changed " << dn->get_name() << " "
 		<< dn->first << "/" << dn->last
 		<< " result mask: 0x" << std::hex << res_mask << std::dec
 		<< dendl;
 	      before.reset();
-	    } else {
-	      dout(0) << __func__ << " attrs not changed " << dn->get_name() << " "
-		<< dn->first << "/" << dn->last
-		<< dendl;
-	      before.reset();
-	      continue;
+        } else if (!snapflush_pending(in)) {
+          dout(30) << __func__ << " attrs not changed " << dn->get_name() << " "
+          << dn->first << "/" << dn->last
+          << dendl;
+          before.reset();
+          continue;
+        } else {
+          /* attrs match but snapflush is pending; rdlock so metadata is
+           * read after writeback completes.
+           */
+          if (!rdlock_file_start(in))
+            return false;
+          bool differs = before.meta_differs(in, diff_mask, res_mask);
+          rdlock_file_finish(in);
+          if (differs) {
+            dout(30) << __func__ << " attrs changed " << dn->get_name() << " "
+            << dn->first << "/" << dn->last
+            << " result mask: 0x" << std::hex << res_mask << std::dec
+            << " (after snapflush)"
+            << dendl;
+            before.reset();
+          } else {
+            dout(30) << __func__ << " attrs not changed " << dn->get_name() << " "
+            << dn->first << "/" << dn->last
+            << " (after snapflush)"
+            << dendl;
+            before.reset();
+            continue;
+          }
 	    }
 	  }
 	}

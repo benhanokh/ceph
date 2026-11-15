@@ -23,6 +23,7 @@
 #include "CInode.h"
 #include "Mutation.h"
 
+#include "MDSContext.h"
 #include "MDSMap.h"
 #include "MDSRank.h"
 #include "MDCache.h"
@@ -32,6 +33,8 @@
 #include "MDBalancer.h"
 #include "SnapClient.h"
 #include "SnapRealm.h"
+#include "cephfs_features.h" // for CEPHFS_FEATURE_REPLY_ENCODING
+
 #include "events/EMetaBlob.h"
 
 #include "common/bloom_filter.hpp"
@@ -1447,7 +1450,19 @@ void CDir::mark_dirty(LogSegmentRef const& ls, version_t pv)
   ceph_assert(is_auth());
 
   if (pv) {
-    ceph_assert(get_version() < pv);
+    if (unlikely(get_version() >= pv)) {
+      // When multiple mutations project the same directory and
+      // their journal commits complete out of order, a later
+      // projection may already have advanced get_version() past
+      // the pv of an earlier one.  This is harmless: the dir is
+      // already dirty at a newer version, and the dentry/inode
+      // versions are already set by their own mark_dirty before
+      // reaching here.  Skip the stale version mark.
+      dout(10) << __func__ << " version already advanced, "
+               << "get_version()=" << get_version() << " pv=" << pv
+               << " " << *this << dendl;
+      return;
+    }
     ceph_assert(pv <= projected_version);
     ceph_assert(!projected_fnode.empty() &&
 	        pv <= projected_fnode.front()->version);
@@ -1583,10 +1598,39 @@ void CDir::fetch(std::string_view dname, snapid_t last,
 
   // FIXME: to fetch a snap dentry, we need to get omap key in range
   //       [(name, last), (name, CEPH_NOSNAP))
-  if (!dname.empty() && last == CEPH_NOSNAP && !g_conf().get_val<bool>("mds_dir_prefetch")) {
+  if (!dname.empty() && last == CEPH_NOSNAP) {
     dentry_key_t key(last, dname, inode->hash_dentry_name(dname));
-    fetch_keys({key}, c);
-    return;
+
+    if (!g_conf().get_val<bool>("mds_dir_prefetch")) {
+      // prefetch disabled: only fetch the requested key
+      fetch_keys({key}, c);
+
+      // backend mode: launch background full fetch only after
+      // mds_dir_prefetch_backend_hit_threshold accesses.
+      // avoids wasted omap reads for directories hit only once.
+      // (throttled by mds_dir_prefetch_backend_max)
+      // saturated increment: avoid uint8_t wrap-around on hot dirfrags
+      auto threshold = g_conf().get_val<uint64_t>("mds_dir_prefetch_backend_hit_threshold");
+      if (backend_hit_count < threshold) {
+        ++backend_hit_count;
+      }
+      if (g_conf().get_val<bool>("mds_dir_prefetch_backend") &&
+	  !state_test(CDir::STATE_FETCHING) &&
+	  backend_hit_count >= threshold &&
+	  mdcache->num_backend_fetching < g_conf().get_val<uint64_t>("mds_dir_prefetch_backend_max")) {
+	auth_pin(this);
+	state_set(CDir::STATE_FETCHING);
+	state_set(CDir::STATE_BACKEND_FETCH);
+	++mdcache->num_backend_fetching;
+	_omap_fetch(nullptr, nullptr);
+
+	if (mdcache->mds->logger)
+	  mdcache->mds->logger->inc(l_mds_dir_fetch_background);
+	mdcache->mds->balancer->hit_dir(this, META_POP_FETCH);
+      }
+      return;
+    }
+    // prefetch enabled, backend has no effect — fall through to full fetch
   }
 
   if (c)
@@ -1603,8 +1647,6 @@ void CDir::fetch(std::string_view dname, snapid_t last,
 
   _omap_fetch(nullptr, nullptr);
 
-  if (mdcache->mds->logger)
-    mdcache->mds->logger->inc(l_mds_dir_fetch_complete);
   mdcache->mds->balancer->hit_dir(this, META_POP_FETCH);
 }
 
@@ -1658,7 +1700,7 @@ void CDir::fetch_keys(const std::vector<dentry_key_t>& keys, MDSContext *c)
     }
   }
 
-  if (state_test(CDir::STATE_FETCHING)) {
+  if (state_test(CDir::STATE_FETCHING) && !state_test(CDir::STATE_BACKEND_FETCH)) {
     dout(7) << "fetch keys, waiting for full fetch" << dendl;
     if (c)
       add_waiter(WAIT_COMPLETE, c);
@@ -1878,7 +1920,12 @@ CDentry *CDir::_load_dentry(
 
       // link to inode?
       CInode *in = mdcache->get_inode(ino);   // we may or may not have it.
-      if (in) {
+      if (in && in->state_test(CInode::STATE_PURGING)) {
+        // Nothing may take a new reference on a purging inode. Leave the
+        // dentry unlinked, as if we did not have the inode in cache.
+        dout(10) << "_fetched  got remote link " << ino << " to purging " << *in
+                 << ", not linking" << dendl;
+      } else if (in) {
         dn->link_remote(dn->get_linkage(), in);
         dout(12) << "_fetched  got remote link " << ino << " which we have " << *in << dendl;
       } else {
@@ -2073,7 +2120,9 @@ void CDir::_omap_fetched(bufferlist& hdrbl, map<string, bufferlist>& omap,
     dout(10) << " snap_purged_thru " << fnode->snap_purged_thru
 	     << " < " << realm->get_last_destroyed()
 	     << ", snap purge based on " << *snaps << dendl;
-    if (get_num_snap_items() == 0) {
+    // a partial fetch should not advance the marker otherwise a later
+    // fetch will skip the stale check for snap dentries it never saw.
+    if (complete && get_num_snap_items() == 0) {
       const_cast<snapid_t&>(fnode->snap_purged_thru) = realm->get_last_destroyed();
       force_dirty = true;
     }
@@ -2229,8 +2278,16 @@ void CDir::_omap_fetched(bufferlist& hdrbl, map<string, bufferlist>& omap,
 
   // mark complete, !fetching
   if (complete) {
+    if (mdcache->mds->logger)
+      mdcache->mds->logger->inc(l_mds_dir_fetch_complete);
     mark_complete();
     state_clear(STATE_FETCHING);
+
+    if (state_test(STATE_BACKEND_FETCH)) {
+      state_clear(STATE_BACKEND_FETCH);
+      --mdcache->num_backend_fetching;
+    }
+
     take_waiting(WAIT_COMPLETE, finished);
   }
 
@@ -2284,7 +2341,7 @@ void CDir::go_bad(bool complete)
     if (get_version() == 0) {
       auto _fnode = allocate_fnode();
       _fnode->version = 1;
-      reset_fnode(std::move(_fnode));
+      set_fresh_fnode(std::move(_fnode));
     }
     
     state_set(STATE_BADFRAG);
@@ -2293,7 +2350,15 @@ void CDir::go_bad(bool complete)
 
   state_clear(STATE_FETCHING);
   auth_unpin(this);
-  finish_waiting(WAIT_COMPLETE, -EIO);
+  /*
+   * fetch_keys() parks its completion contexts in waiting_on_dentry
+   * rather than in the IO callback chain.  If the dirfrag object is
+   * missing/corrupt, complete them with -EIO too, otherwise callers
+   * such as MDCache::open_ino_traverse_dir() wait forever and (during
+   * rejoin) OpenFileTable::_prefetch_inodes() never finishes,
+   * wedging the MDS in up:rejoin.
+   */
+  finish_waiting(WAIT_COMPLETE | WAIT_DENTRY, -EIO);
 }
 
 // -----------------------

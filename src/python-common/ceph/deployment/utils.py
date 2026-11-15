@@ -1,29 +1,11 @@
 import ipaddress
+import posixpath
 import socket
 from typing import Tuple, Optional, Any, List
 from urllib.parse import urlparse
 from ceph.deployment.hostspec import SpecValidationError
 from ceph.utils import with_units_to_int
 from numbers import Number
-
-
-def parse_combined_pem_file(pem_data: str) -> Tuple[Optional[str], Optional[str]]:
-
-    # Extract the certificate
-    cert_start = "-----BEGIN CERTIFICATE-----"
-    cert_end = "-----END CERTIFICATE-----"
-    cert = None
-    if cert_start in pem_data and cert_end in pem_data:
-        cert = pem_data[pem_data.index(cert_start):pem_data.index(cert_end) + len(cert_end)]
-
-    # Extract the private key
-    key_start = "-----BEGIN PRIVATE KEY-----"
-    key_end = "-----END PRIVATE KEY-----"
-    private_key = None
-    if key_start in pem_data and key_end in pem_data:
-        private_key = pem_data[pem_data.index(key_start):pem_data.index(key_end) + len(key_end)]
-
-    return cert, private_key
 
 
 def unwrap_ipv6(address):
@@ -156,7 +138,7 @@ def verify_size_with_units(field: Any, field_name: str) -> Optional[int]:
         return None
     try:
         size = with_units_to_int(str(field))
-    except (ValueError, TypeError, IndexError, UnboundLocalError):
+    except (ValueError, TypeError):
         raise SpecValidationError(f'{field_name}: invalid size {field!r}')
     if size < 0:
         raise SpecValidationError(f"{field_name} can't be negative")
@@ -216,3 +198,42 @@ def verify_non_empty_string(field: Any, field_name: str) -> None:
     # isinstance first so we never call .strip() on None or non-str
     if not isinstance(field, str) or not field.strip():
         raise SpecValidationError(f"Invalid {field_name}: Must be a non-empty string.")
+
+
+def validate_ip(ip_addr: Optional[str]) -> None:
+    if ip_addr is None:
+        return
+    try:
+        ipaddress.ip_address(unwrap_ipv6(ip_addr))
+    except ValueError:
+        raise SpecValidationError(
+            f"Invalid virtual_ip: {ip_addr}. Must be a valid IP address."
+        )
+
+
+def verify_dir_path(field: Any, field_name: str) -> None:
+    """
+    Validate an absolute filesystem path string
+    """
+    if field is None:
+        return
+    verify_non_empty_string(field, field_name)
+    if not field.startswith('/'):
+        raise SpecValidationError(
+            f'{field_name} must be an absolute path starting with /, got {field!r}')
+    if '..' in field.split('/'):
+        raise SpecValidationError(
+            f"{field_name} must not contain '..' path components, got {field!r}")
+    normalized = '/' + posixpath.normpath(field).lstrip('/')
+    if normalized == '/':
+        raise SpecValidationError(
+            f'{field_name} must not be the filesystem root (/), got {field!r}')
+    protected_dirs = frozenset([
+        '/bin', '/boot', '/dev', '/etc', '/home', '/lib', '/lib32', '/lib64',
+        '/libx32', '/log', '/media', '/mnt', '/opt', '/proc', '/root', '/run',
+        '/sbin', '/srv', '/sys', '/tmp', '/usr', '/var',
+    ])
+    if normalized in protected_dirs:
+        raise SpecValidationError(
+            f'{field_name} must not be a protected system directory, '
+            f'got {field!r}. Use a subdirectory of it instead.')

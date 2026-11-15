@@ -108,14 +108,24 @@ int main(int argc, char *argv[])
   DoutPrefix dp(cct.get(), dout_subsys, "rgw main: ");
   rgw::AppMain main(&dp);
 
-  LinuxKeyringSecret::initialize_process_keyring();
-
-  main.init_frontends1(false /* nfs */);
+  main.init_frontends1(rgw::InstanceType::Daemon, rgw::ProtocolType::HTTP_S3);
   main.init_numa();
 
   if (g_conf()->daemonize) {
     global_init_daemonize(g_ceph_context);
   }
+
+#if defined(__linux__)
+  // defined in keyring.cc under the same guard
+  if (const auto ec = LinuxKeyringSecret::initialize_process_keyring(); ec) {
+    ldpp_dout(&dp, 0) << "failed to install the process keyring: "
+                      << ec.message() << dendl;
+  }
+#else
+  ldpp_dout(&dp, 0) << "the Linux kernel keyring is not available on this "
+		    << "platform, so the SSE-KMS key cache is disabled" << dendl;
+#endif
+
   ceph::mutex mutex = ceph::make_mutex("main");
   SafeTimer init_timer(g_ceph_context, mutex);
   init_timer.init();
@@ -141,6 +151,7 @@ int main(int argc, char *argv[])
   sighandler_alrm = signal(SIGALRM, godown_alarm);
 
   main.init_perfcounters();
+  main.init_heap_release();
   main.init_http_clients();
 
   r = main.init_storage();
@@ -166,6 +177,9 @@ int main(int argc, char *argv[])
   main.init_tracepoints();
   main.init_lua();
   main.init_kms_cache();
+#ifdef WITH_RADOSGW_LANCEDB
+  main.init_s3vector();
+#endif
 #ifdef WITH_RADOSGW_RADOS
   main.init_dedup();
 #endif

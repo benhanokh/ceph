@@ -460,6 +460,41 @@ options:
   - mds
   flags:
   - runtime
+- name: mds_dir_prefetch_backend
+  type: bool
+  level: advanced
+  desc: When mds_dir_prefetch is false, additionally launch a full background
+    dirfrag fetch to warm the cache while the operation completes via keyed fetch
+  default: false
+  services:
+  - mds
+  flags:
+  - runtime
+- name: mds_dir_prefetch_backend_max
+  type: uint
+  level: advanced
+  desc: Maximum number of concurrent background dirfrag prefetches when
+    mds_dir_prefetch_backend is enabled
+  default: 1
+  services:
+  - mds
+  flags:
+  - runtime
+- name: mds_dir_prefetch_backend_hit_threshold
+  type: uint
+  level: advanced
+  desc: Number of keyed-fetch hits on a dirfrag before a background full
+    prefetch is triggered. Low values (2-4) warm caches aggressively for
+    mixed workloads; high values (16+) eliminate bg fetches for scattered
+    access patterns, behaving like prefetch_false.
+    Effective maximum is 255 due to the uint8_t per-dirfrag hit counter.
+  max: 255
+  min: 1
+  default: 16
+  services:
+  - mds
+  flags:
+  - runtime
 - name: mds_tick_interval
   type: float
   level: advanced
@@ -1233,6 +1268,19 @@ options:
     are flushed to the pool.
     (for testing only).
   with_legacy: true
+- name: mds_kill_after_unlink_finish
+  type: bool
+  level: dev
+  default: false
+  services:
+  - mds
+  fmt_desc: MDS will crash after _unlink_local_finish commits the unlink but
+    before CDir::commit has written the directory omap to RADOS.
+    This reproduces the crash in _eval_stray_remote when a stale remote
+    dentry on disk is loaded after MDS recovery and triggers reintegration
+    of an nlink==0 stray inode (tracker 62663).
+    (for developers only).
+  with_legacy: true
 - name: mds_inject_skip_replaying_inotable
   type: bool
   level: dev
@@ -1285,6 +1333,26 @@ options:
   services:
   - mds
   with_legacy: true
+- name: mds_enable_phase_tracker
+  type: bool
+  level: advanced
+  desc: account for the time mds_lock is held by each kind of upkeep work
+  long_desc: Charge wall time to a phase (client requests, cache trim, client
+    recall, subtree export, log trim, ...) so that "ceph tell mds.X perf dump
+    mds_phase" and "ceph tell mds.X dump phase times" show where a rank spends
+    its time, and how much of the wall clock it spends holding mds_lock. Off by
+    default because the accounting is not free -- two monotonic clock reads per
+    instrumented scope and three per mds_lock acquisition. A client request
+    passes through two of each, so a few hundred nanoseconds of serialized work
+    per request where clock_gettime is a vDSO read, or one to two percent of a
+    rank serving 50k requests per second. It costs considerably more on a host
+    without a usable TSC clocksource. Enable it at runtime when investigating
+    where a rank spends its time.
+  default: false
+  services:
+  - mds
+  flags:
+  - runtime
 # Max number of completed ops to track
 - name: mds_op_history_size
   type: uint
@@ -1767,6 +1835,16 @@ options:
   desc: Delay the journal replay to verify the replay time estimate
   long_desc: Jorunal replay warning is activated if the mds has been in replay state for more than 30 seconds. This config delays replay for validating the replay warning in tests.
   default: 0
+  flags:
+  - runtime
+- name: mds_defer_rejoin_send_for_testing
+  type: bool
+  level: dev
+  desc: Defer cache rejoin messages until this option is cleared
+  long_desc: While set, rejoin_send_rejoins() records rejoins_pending and returns without sending. Clearing it retries the send from a rank that is still in rejoin. Used to reproduce https://tracker.ceph.com/issues/54840.
+  default: false
+  services:
+  - mds
   flags:
   - runtime
 - name: mds_server_dispatch_killpoint_random

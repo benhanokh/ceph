@@ -42,7 +42,8 @@ class WebTokenEngine : public rgw::auth::Engine {
 
   int load_provider(const DoutPrefixProvider *dpp, optional_yield y,
                     const std::string& role_arn, const std::string& iss,
-                    RGWOIDCProviderInfo& info) const;
+                    RGWOIDCProviderInfo& info,
+                    bool& is_global_oidc) const;
 
   std::string get_role_tenant(const std::string& role_arn) const;
 
@@ -50,7 +51,7 @@ class WebTokenEngine : public rgw::auth::Engine {
 
   std::string get_cert_url(const std::string& iss, const DoutPrefixProvider *dpp,optional_yield y) const;
 
-  std::tuple<boost::optional<WebTokenEngine::token_t>, boost::optional<WebTokenEngine::principal_tags_t>>
+  std::tuple<boost::optional<WebTokenEngine::token_t>, boost::optional<WebTokenEngine::principal_tags_t>, bool>
   get_from_jwt(const DoutPrefixProvider* dpp, const std::string& token, const req_state* const s, optional_yield y) const;
 
  bool validate_signature_using_n_e(const DoutPrefixProvider* dpp, const jwt::decoded_jwt& decoded, const std::string &algorithm, const std::string& n, const std::string& e) const;
@@ -67,7 +68,6 @@ class WebTokenEngine : public rgw::auth::Engine {
 
   int create_connection(const DoutPrefixProvider* dpp, const std::string& hostname, int port) const;
   std::string connect_to_host_get_cert_chain(const DoutPrefixProvider* dpp, const std::string& hostname, int port = 443) const;
-  std::string get_top_level_domain_from_host(const DoutPrefixProvider* dpp, const std::string& hostname) const;
   std::string extract_last_certificate(const DoutPrefixProvider* dpp, const std::string& pem_chain) const;
   bool verify_oidc_thumbprint(const DoutPrefixProvider* dpp, const std::string& cert_url,
       const std::vector<std::string>& thumbprints) const;
@@ -117,11 +117,13 @@ class DefaultStrategy : public rgw::auth::Strategy,
                                     const std::unordered_multimap<std::string, std::string>& token,
                                     boost::optional<std::multimap<std::string, std::string>> role_tags,
                                     boost::optional<std::set<std::pair<std::string, std::string>>> principal_tags,
-                                    std::optional<RGWAccountInfo> account) const override {
+                                    std::optional<RGWAccountInfo> account,
+                                    bool is_global_oidc) const override {
     auto apl = rgw::auth::add_sysreq(cct, driver, s,
       rgw::auth::WebIdentityApplier(cct, driver, role_id, role_session,
                                     role_tenant, token, role_tags,
-                                    principal_tags, std::move(account)));
+                                    principal_tags, std::move(account),
+                                    is_global_oidc));
     return aplptr_t(new decltype(apl)(std::move(apl)));
   }
 
@@ -152,7 +154,6 @@ protected:
   STS::STSService sts;
 public:
   RGWREST_STS() = default;
-  int verify_permission(optional_yield y) override;
   void send_response() override;
 };
 
@@ -168,6 +169,7 @@ protected:
   std::string iss;
 public:
   RGWSTSAssumeRoleWithWebIdentity() = default;
+  int verify_permission(optional_yield y) override;
   void execute(optional_yield y) override;
   int get_params();
   const char* name() const override { return "assume_role_web_identity"; }
@@ -185,6 +187,7 @@ protected:
   std::string tokenCode;
 public:
   RGWSTSAssumeRole() = default;
+  int verify_permission(optional_yield y) override;
   void execute(optional_yield y) override;
   int get_params();
   const char* name() const override { return "assume_role"; }
@@ -257,4 +260,3 @@ public:
                                const rgw::auth::StrategyRegistry&,
                                const std::string&) override;
 };
-

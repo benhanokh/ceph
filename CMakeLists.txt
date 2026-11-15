@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.22.1)
 
 project(ceph
-  VERSION 21.0.0
+  VERSION 22.0.0
   LANGUAGES CXX C ASM)
 
 foreach(policy CMP0127 CMP0135
@@ -103,6 +103,9 @@ if(WITH_CCACHE)
     set(CMAKE_CXX_COMPILER_LAUNCHER ${CCACHE_EXECUTABLE})
   endif()
 endif(WITH_CCACHE)
+
+set(CEPH_VENDOR_RELEASE "" CACHE STRING
+  "Vendor release string appended to the ceph version string")
 
 option(WITH_SCCACHE "Build with sccache.")
 if(WITH_SCCACHE)
@@ -294,7 +297,7 @@ if(WITH_RBD AND LINUX)
 endif()
 
 # libnbd
-if(WITH_RBD AND NOT WIN32)
+if(WITH_RBD AND NOT WIN32 AND NOT APPLE AND NOT FREEBSD)
   find_package(libnbd 1.0 REQUIRED)
   set(HAVE_LIBNBD ${LIBNBD_FOUND})
 endif()
@@ -324,14 +327,8 @@ CMAKE_DEPENDENT_OPTION(WITH_RBD_MIGRATION_FORMAT_QCOW_V1
   "Enable librbd QCOW v1 migration format support" ON
   "WITH_RBD" OFF)
 
-CMAKE_DEPENDENT_OPTION(WITH_RBD_RWL "Enable librbd persistent write back cache" OFF
-  "WITH_RBD" OFF)
-
 CMAKE_DEPENDENT_OPTION(WITH_RBD_SSD_CACHE "Enable librbd persistent write back cache for SSDs" OFF
     "WITH_RBD" OFF)
-
-CMAKE_DEPENDENT_OPTION(WITH_SYSTEM_PMDK "Require and build with system PMDK" OFF
-  "WITH_RBD_RWL" OFF)
 
 CMAKE_DEPENDENT_OPTION(WITH_RBD_UBBD "Enable ubbd support for rbd device utility" OFF
     "WITH_RBD" OFF)
@@ -343,19 +340,26 @@ endif()
 
 CMAKE_DEPENDENT_OPTION(WITH_SPDK "Enable SPDK" OFF
   "CMAKE_SYSTEM_PROCESSOR MATCHES i386|i686|amd64|x86_64|AMD64|aarch64|riscv64" OFF)
+CMAKE_DEPENDENT_OPTION(WITH_CRIMSON_SPDK "Enable SPDK for crimson SeaStore" ON
+  "WITH_CRIMSON;CMAKE_SYSTEM_PROCESSOR MATCHES amd64|x86_64|AMD64|aarch64" OFF)
 option(WITH_SYSTEM_SPDK "Require a system SPDK instead of building bundled src/spdk" OFF)
-if(WITH_SPDK)
-  if(NOT WITH_BLUESTORE)
-    message(SEND_ERROR "Please enable WITH_BLUESTORE for using SPDK")
-  endif()
+if(WITH_SPDK AND NOT WITH_BLUESTORE)
+  message(SEND_ERROR "Please enable WITH_BLUESTORE for using WITH_SPDK")
+endif()
+if(WITH_SPDK OR WITH_CRIMSON_SPDK)
   if(WITH_SYSTEM_SPDK)
     find_package(spdk REQUIRED)
   else()
     include(BuildSPDK)
     build_spdk()
   endif()
+endif()
+if(WITH_SPDK)
   set(HAVE_SPDK TRUE)
-endif(WITH_SPDK)
+endif()
+if(WITH_CRIMSON_SPDK)
+  set(HAVE_CRIMSON_SPDK TRUE)
+endif()
 
 if(WITH_BLUESTORE)
   if(NOT AIO_FOUND AND NOT HAVE_POSIXAIO AND NOT WITH_SPDK)
@@ -366,6 +370,15 @@ if(WITH_BLUESTORE)
 endif()
 
 option(WITH_BLUEFS "libbluefs library" OFF)
+
+option(WITH_SYSTEM_ZSTD "use prebuilt libzstd in system" OFF)
+
+if(WITH_SYSTEM_ZSTD)
+  find_package(Zstd 1.4.4 REQUIRED)
+else()
+  include(BuildZstd)
+  build_Zstd()
+endif()
 
 CMAKE_DEPENDENT_OPTION(WITH_QATLIB "Enable QAT with qatlib" ON
   "CMAKE_SYSTEM_PROCESSOR MATCHES amd64|x86_64|AMD64" OFF)
@@ -387,6 +400,7 @@ elseif(WITH_QATLIB)
   if(NOT WITH_SYSTEM_QATLIB)
     add_dependencies(QAT::qat qatlib_ext)
     add_dependencies(QAT::usdm qatlib_ext)
+    target_link_libraries(QAT::qat INTERFACE numa)
   endif()
   set(HAVE_QAT TRUE)
 endif()
@@ -404,6 +418,7 @@ if(WITH_QATZIP)
   find_package(QATzip REQUIRED)
   if(NOT WITH_SYSTEM_QATZIP)
     add_dependencies(QAT::zip qatzip_ext)
+    target_link_libraries(QAT::zip INTERFACE Zstd::Zstd numa)
   endif()
   set(HAVE_QATZIP TRUE)
 endif(WITH_QATZIP)
@@ -526,11 +541,7 @@ set(CRYPTO_LIBS OpenSSL::Crypto)
 
 option(WITH_DPDK "Enable DPDK messaging" OFF)
 if(WITH_DPDK)
-  find_package(DPDK)
-  if(NOT DPDK_FOUND)
-    include(BuildDPDK)
-    build_dpdk(${CMAKE_BINARY_DIR}/src/dpdk)
-  endif()
+  find_package(DPDK REQUIRED)
   set(HAVE_DPDK TRUE)
 endif()
 
@@ -552,18 +563,19 @@ option(WITH_CATCH2 "Enable Catch2 unit tests" ON)
 option(WITH_SYSTEM_CATCH2 "Enable Catch2 unit tests (require system packages)" OFF)
 
 if(WITH_CATCH2)
-  # Save pre-existing definitions (if any):
-  set(ORIG_CPM_LOCAL_PACKAGES_ONLY ${CPM_USE_LOCAL_PACKAGES_ONLY})
+  include(CPM)
 
-    if(WITH_SYSTEM_CATCH2)
-   set(CPM_LOCAL_PACKAGES_ONLY ON)
+  # Save pre-existing definitions (if any):
+  set(ORIG_CPM_LOCAL_PACKAGES_ONLY ${CPM_LOCAL_PACKAGES_ONLY})
+
+  if(WITH_SYSTEM_CATCH2)
+    set(CPM_LOCAL_PACKAGES_ONLY ON)
   endif()
 
-  include(${CMAKE_MODULE_PATH}/CPM.cmake)
   CPMAddPackage("gh:catchorg/Catch2@3.8.1")
 
   # Restore the original CPM settings in case someone else wants to use the module:
-  set(CPM_USE_LOCAL_PACKAGES_ONLY, ${ORIG_CPM_USE_LOCAL_PACKAGES_ONLY})
+  set(CPM_LOCAL_PACKAGES_ONLY ${ORIG_CPM_LOCAL_PACKAGES_ONLY})
 
   # CPM skips the fetch silently if downloads are disabled,
   # e.g. with FETCHCONTENT_FULLY_DISCONNECTED=ON on deb builds
@@ -593,8 +605,10 @@ option(WITH_SYSTEM_RDKAFKA "build against system librdkafka instead of the bundl
 option(WITH_RADOSGW_LUA_PACKAGES "RADOS Gateway's support for dynamically adding lua packagess" ON)
 option(WITH_RADOSGW_FDB "FoundationDB support for RADOS Gateway (experimental)" OFF)
 option(WITH_RADOSGW_DBSTORE "DBStore backend for RADOS Gateway" ON)
-option(WITH_RADOSGW_MOTR "CORTX-Motr backend for RADOS Gateway" OFF)
 option(WITH_RADOSGW_DAOS "DAOS backend for RADOS Gateway" OFF)
+if(WITH_RADOSGW_DAOS)
+    message(WARNING "The DAOS SAL has been unmaintained and does not compile against DAOS libraries.")
+endif(WITH_RADOSGW_DAOS)
 option(WITH_RADOSGW_D4N "D4N wrapper for RADOS Gateway" ON)
 option(WITH_RADOSGW_POSIX "POSIX backend for RADOS Gateway" ON)
 cmake_dependent_option(WITH_RADOSGW_STANDALONE "Standalone RADOS Gateway" ON WITH_RADOSGW_POSIX OFF)
@@ -602,6 +616,12 @@ option(WITH_RADOSGW_RADOS "RADOS backend for Rados Gateway" ON)
 option(WITH_RADOSGW_SELECT_PARQUET "Support for s3 select on parquet objects" ON)
 option(WITH_RADOSGW_ARROW_FLIGHT "Build arrow flight when not using system-provided arrow" OFF)
 option(WITH_RADOSGW_BACKTRACE_LOGGING "Enable backtraces in rgw logs" OFF)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64|aarch64|arm64|ARM64|loongarch64)$")
+  set(WITH_RADOSGW_LANCEDB_DEFAULT ON)
+else()
+  set(WITH_RADOSGW_LANCEDB_DEFAULT OFF)
+endif()
+option(WITH_RADOSGW_LANCEDB "Enable lancedb support in RADOS Gateway" ${WITH_RADOSGW_LANCEDB_DEFAULT})
 
 option(WITH_SYSTEM_ARROW "Use system-provided arrow" OFF)
 option(WITH_SYSTEM_UTF8PROC "Use system-provided utf8proc" OFF)
@@ -660,22 +680,21 @@ if(WITH_RADOSGW)
   endif()
   message(STATUS "ssl soname: ${LIBSSL_SONAME}")
   message(STATUS "crypto soname: ${LIBCRYPTO_SONAME}")
+  if(WITH_RADOSGW_LANCEDB)
+    find_package(Cargo 1.91)
+    if(NOT Cargo_FOUND)
+      message(FATAL_ERROR "lancedb requires cargo >= 1.91. run install-deps.sh to install it, "
+        "or build with -DWITH_RADOSGW_LANCEDB=OFF")
+    endif()
+  endif(WITH_RADOSGW_LANCEDB)
 endif (WITH_RADOSGW)
 
 if(WITH_RADOSGW_FDB)
- include(${CMAKE_MODULE_PATH}/CPM.cmake)
+ find_package(FoundationDB REQUIRED)
+ include(CPM)
 
  CPMAddPackage("gh:eyalz800/zpp_bits@4.5.1")
  message("-- enabled zpp_bits")
-
-# JFW: sadly, I'm having trouble getting FoundationDB to build, but this is VERY close
-# to "just working". But, how would we install the RPMs, etc.? This will need looking at
-# before this can be non-experimental:
-# CPMAddPackage("gh:apple/foundationdb@7.3.63")
- message("FoundationDB support is EXPERIMENTAL and requires manual setup:")
- message(" wget https://github.com/apple/foundationdb/releases/download/7.3.63/foundationdb-clients-7.3.63-1.el7.x86_64.rpm")
- message(" wget https://github.com/apple/foundationdb/releases/download/7.3.63/foundationdb-server-7.3.63-1.el7.x86_64.rpm")
- message("-- enabled FoundationDB (whether its there or not)")
 
 endif()
 
@@ -795,6 +814,31 @@ if(sanitizers)
   string(APPEND CMAKE_SHARED_LINKER_FLAGS " ${sanitiers_compile_flags}")
 endif()
 
+# Frame pointers: cheap and reliable stack walking for profilers (perf, eBPF)
+# and debuggers. Off by default for release build types, to keep production
+# packages unchanged; CI/QA package builds enable it explicitly.
+# (crimson always builds with frame pointers; see src/crimson/CMakeLists.txt)
+if(CMAKE_BUILD_TYPE STREQUAL Debug)
+  set(frame_pointers_default ON)
+else()
+  set(frame_pointers_default OFF)
+endif()
+option(WITH_FRAME_POINTERS "build with -fno-omit-frame-pointer"
+  ${frame_pointers_default})
+include(CheckCXXCompilerFlag)
+check_cxx_compiler_flag("-mno-omit-leaf-frame-pointer"
+  HAS_NO_OMIT_LEAF_FRAME_POINTER)
+set(FRAME_POINTER_COMPILE_OPTIONS
+  $<$<COMPILE_LANGUAGE:C,CXX>:-fno-omit-frame-pointer>)
+if(HAS_NO_OMIT_LEAF_FRAME_POINTER)
+  list(APPEND FRAME_POINTER_COMPILE_OPTIONS
+    $<$<COMPILE_LANGUAGE:C,CXX>:-mno-omit-leaf-frame-pointer>)
+endif()
+if(WITH_FRAME_POINTERS)
+  add_compile_options(${FRAME_POINTER_COMPILE_OPTIONS})
+endif()
+message(STATUS "frame pointers: ${WITH_FRAME_POINTERS}")
+
 # Jerasure & GF-Complete
 option(WITH_SYSTEM_JERASURE "require and build with system jerasure and gf-complete" OFF)
 if(WITH_SYSTEM_JERASURE)
@@ -804,7 +848,17 @@ endif()
 # Rocksdb
 option(WITH_SYSTEM_ROCKSDB "require and build with system rocksdb" OFF)
 if (WITH_SYSTEM_ROCKSDB)
-  find_package(RocksDB 5.14 REQUIRED)
+  find_package(RocksDB 9.10 REQUIRED)
+else()
+  # westmere is the oldest microarchitecture with the SSE4.2 and PCLMULQDQ
+  # that RocksDB's CRC32C needs. set to ON to target the x86-64 baseline.
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+    set(ROCKSDB_PORTABLE "westmere" CACHE STRING
+      "oldest CPU microarchitecture targeted by the bundled RocksDB")
+  else()
+    set(ROCKSDB_PORTABLE "ON" CACHE STRING
+      "oldest CPU microarchitecture targeted by the bundled RocksDB")
+  endif()
 endif()
 
 # Boost
@@ -824,17 +878,9 @@ if(WITH_CRIMSON)
   list(APPEND BOOST_COMPONENTS timer)
 endif()
 
-if(WITH_RADOSGW AND WITH_RADOSGW_LUA_PACKAGES)
-  list(APPEND BOOST_COMPONENTS filesystem)
-endif()
-
 if(WITH_LIBCEPHFS OR WITH_FUSE)
   find_package(ICU REQUIRED COMPONENTS uc i18n)
   list(APPEND BOOST_COMPONENTS locale)
-endif()
-
-if(WITH_CEPHFS)
-  list(APPEND BOOST_COMPONENTS filesystem)
 endif()
 
 set(Boost_USE_MULTITHREADED ON)
@@ -874,6 +920,9 @@ else()
     add_compile_definitions(BOOST_USE_ASAN BOOST_USE_UCONTEXT)
   endif()
 endif()
+# Set tree-wide: the macro changes the type of bp::filesystem::path in inline
+# code, so a binary mixing both settings would be an ODR violation.
+add_compile_definitions(BOOST_PROCESS_USE_STD_FS)
 include_directories(BEFORE SYSTEM ${Boost_INCLUDE_DIRS})
 if(WIN32 AND WITH_CATCH2)
   foreach(catch2_target Catch2 Catch2WithMain)
@@ -894,7 +943,9 @@ endif()
 
 # dashboard angular2 frontend
 option(WITH_MGR_DASHBOARD_FRONTEND "Build the mgr/dashboard frontend using `npm`" ON)
-option(WITH_SYSTEM_NPM "Assume that dashboard build tools already installed through packages" OFF)
+CMAKE_DEPENDENT_OPTION(WITH_SYSTEM_NPM
+  "Assume that dashboard build tools already installed through packages" OFF
+  "WITH_MGR_DASHBOARD_FRONTEND" OFF)
 if(WITH_SYSTEM_NPM)
   find_program(NPM_EXECUTABLE npm
     REQUIRED)
@@ -908,7 +959,6 @@ CMAKE_DEPENDENT_OPTION(WITH_MGR_ROOK_CLIENT "Enable the mgr's Rook support" ON
 include_directories(SYSTEM ${PROJECT_BINARY_DIR}/include)
 
 find_package(Threads REQUIRED)
-find_package(StdFilesystem REQUIRED)
 
 option(WITH_SELINUX "build SELinux policy" OFF)
 if(WITH_SELINUX)

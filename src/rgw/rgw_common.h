@@ -72,6 +72,7 @@ struct RGWProcessEnv;
 using ceph::crypto::MD5;
 
 #define RGW_ATTR_PREFIX  "user.rgw."
+#define RGW_ATTR_S3VECTOR_STORAGE RGW_ATTR_PREFIX "s3vector-storage"
 
 #define RGW_HTTP_RGWX_ATTR_PREFIX "RGWX_ATTR_"
 #define RGW_HTTP_RGWX_ATTR_PREFIX_OUT "Rgwx-Attr-"
@@ -1090,6 +1091,7 @@ enum RGWBucketFlags {
   BUCKET_MFA_ENABLED = 0X10,
   BUCKET_OBJ_LOCK_ENABLED = 0X20,
   BUCKET_DELETED = 0X40,
+  BUCKET_VECTOR = 0X80,
 };
 
 class RGWSI_Zone;
@@ -1151,6 +1153,7 @@ struct RGWBucketInfo {
   bool obj_lock_enabled() const { return (flags & BUCKET_OBJ_LOCK_ENABLED) != 0; }
   bool bucket_suspended() const { return (flags & BUCKET_SUSPENDED) != 0; }
   bool bucket_deleted() const { return (flags & BUCKET_DELETED) != 0; }
+  bool is_vector() const { return (flags & BUCKET_VECTOR) != 0; }
 
   bool has_swift_versioning() const {
     /* A bucket may be versioned through one mechanism only. */
@@ -1320,6 +1323,7 @@ struct req_state : DoutPrefixProvider {
   std::shared_ptr<RateLimiter> ratelimit_data;
   RGWRateLimitInfo user_ratelimit;
   RGWRateLimitInfo bucket_ratelimit;
+  RGWRateLimitInfo account_ratelimit;
   int64_t ratelimit_retry_after{0};
   std::string ratelimit_bucket_marker;
   std::string ratelimit_user_name;
@@ -1334,6 +1338,7 @@ struct req_state : DoutPrefixProvider {
   rgw_err err;
   bool expect_cont{false};
   uint64_t obj_size{0};
+  uint64_t rdma_bytes_transferred{0};
   bool enable_ops_log;
   bool enable_usage_log;
   rgw_s3select_usage_data s3select_usage;
@@ -1795,6 +1800,26 @@ struct perm_state : public perm_state_base {
   }
 };
 
+/* A Keystone identity whose role tier caps its implicit permissions
+ * (a project reader or an implicit-deny role). The identity-type check
+ * matters: Swift read-only subusers of local users also carry a reduced
+ * perm_mask but must not be treated as capped Keystone identities. */
+bool is_capped_keystone_identity(uint32_t perm_mask,
+                                 const rgw::auth::Identity& identity);
+
+/* Can this owner perform this operation?
+ *
+ * Returns true when the identity owns the resource and its permission mask
+ * allows the requested permission. A normal owner has full control, so
+ * anything passes. A capped identity (a Keystone reader or implicit-deny
+ * role) is limited to what its mask allows: reads pass, writes do not.
+ *
+ * This is the one place an owner grant checks the cap. A policy that allows
+ * the user runs earlier and can still grant more. */
+bool verify_owner_permission(const rgw::auth::Identity& identity,
+                             uint32_t perm_mask,
+                             const rgw_owner& owner, uint32_t perm);
+
 /** Check if the req_state's user has the necessary permissions
  * to do the requested action  */
 bool verify_bucket_permission_no_policy(
@@ -1822,10 +1847,13 @@ rgw::IAM::Effect evaluate_iam_policies(
     const DoutPrefixProvider* dpp,
     const rgw::IAM::Environment& env,
     const rgw::auth::Identity& identity,
-    bool account_root, uint64_t op, const rgw::ARN& arn,
+    bool account_root, uint64_t op,
+    const rgw::ARN& identity_arn,
+    boost::optional<const rgw::ARN&> resource_arn,
     const boost::optional<rgw::IAM::Policy>& resource_policy,
     const std::vector<rgw::IAM::Policy>& identity_policies,
-    const std::vector<rgw::IAM::Policy>& session_policies);
+    const std::vector<rgw::IAM::Policy>& session_policies,
+    bool cross_account);
 
 bool verify_user_permission(const DoutPrefixProvider* dpp,
                             req_state * const s,
@@ -1835,6 +1863,34 @@ bool verify_user_permission(const DoutPrefixProvider* dpp,
 bool verify_user_permission_no_policy(const DoutPrefixProvider* dpp,
                                       req_state * const s,
                                       int perm);
+// evaluate permissions on a non-s3 resource like a notification topic
+// or role trust policy
+rgw::IAM::Effect evaluate_resource_permission(
+    const DoutPrefixProvider* dpp,
+    const rgw::IAM::Environment& env,
+    const rgw::auth::Identity& identity,
+    uint64_t op,
+    const rgw::ARN& identity_arn,
+    boost::optional<const rgw::ARN&> resource_arn,
+    const rgw_owner& resource_owner,
+    const boost::optional<rgw::IAM::Policy>& resource_policy,
+    const std::vector<rgw::IAM::Policy>& identity_policies,
+    const std::vector<rgw::IAM::Policy>& session_policies);
+
+// verify permissions on a non-s3 resource like a notification topic
+// or role trust policy
+bool verify_resource_permission(
+    const DoutPrefixProvider* dpp,
+    const rgw::IAM::Environment& env,
+    const rgw::auth::Identity& identity,
+    uint64_t op,
+    const rgw::ARN& identity_arn,
+    boost::optional<const rgw::ARN&> resource_arn,
+    const rgw_owner& resource_owner,
+    const boost::optional<rgw::IAM::Policy>& resource_policy,
+    const std::vector<rgw::IAM::Policy>& identity_policies,
+    const std::vector<rgw::IAM::Policy>& session_policies);
+
 bool verify_bucket_permission(const DoutPrefixProvider* dpp,
                               const perm_state_base * const s,
                               const rgw::ARN& arn,
@@ -1844,7 +1900,9 @@ bool verify_bucket_permission(const DoutPrefixProvider* dpp,
 			      const boost::optional<rgw::IAM::Policy>& bucket_policy,
                               const std::vector<rgw::IAM::Policy>& identity_policies,
                               const std::vector<rgw::IAM::Policy>& session_policies,
-                              const uint64_t op, bool *granted_by_acl = nullptr);
+                              const uint64_t op,
+                              bool cross_account,
+                              bool *granted_by_acl = nullptr);
 bool verify_bucket_permission(
   const DoutPrefixProvider* dpp,
   req_state * const s,
@@ -2237,7 +2295,7 @@ static inline std::string rgw_bl_str(const ceph::buffer::list& bl)
 }
 
 template <typename T>
-int decode_bl(bufferlist& bl, T& t)
+int decode_bl(const bufferlist& bl, T& t)
 {
   auto iter = bl.cbegin();
   try {

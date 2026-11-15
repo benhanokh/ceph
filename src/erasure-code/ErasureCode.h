@@ -37,10 +37,10 @@ class ErasureCode : public ErasureCodeInterface {
 
   // for CRUSH rule
   std::string rule_root;
-  std::string rule_failure_domain;
+  std::string rule_osd_failure_domain;
   std::string rule_device_class;
   int rule_osds_per_failure_domain = -1;
-  int rule_num_failure_domains = -1;
+  int rule_num_osd_failure_domains = -1;
 
   ~ErasureCode() override {
   }
@@ -51,7 +51,13 @@ class ErasureCode : public ErasureCodeInterface {
     return _profile;
   }
 
+  using ErasureCodeInterface::create_rule;
   int create_rule(const std::string &name,
+                  int num_zones,
+                  const std::string &root,
+                  const std::string &zone_failure_domain,
+                  const std::string &osd_failure_domain,
+                  const std::optional<std::string> &device_class,
                   CrushWrapper &crush,
                   std::ostream *ss) const override;
 
@@ -83,8 +89,7 @@ class ErasureCode : public ErasureCodeInterface {
 
   int minimum_to_decode(const shard_id_set &want_to_read,
                         const shard_id_set &available,
-                        shard_id_set &minimum_set,
-                        mini_flat_map<shard_id_t, std::vector<std::pair<int, int>>> *minimum_sub_chunks) override;
+                        shard_id_set &minimum_set) override;
 
   [[deprecated]]
   int minimum_to_decode_with_cost(const std::set<int> &want_to_read,

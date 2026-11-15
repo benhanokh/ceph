@@ -34,12 +34,11 @@
 
 #include "include/btree_map.h"
 #include "include/common_fwd.h"
+#include "common/Formatter.h"
 #include "include/fs_types.h" // for struct file_layout_t
 #include "include/types.h"
 #include "common/ceph_releases.h"
 #include "osd_types.h"
-
-#include "crush/CrushWrapper.h"
 
 #ifdef WITH_CRIMSON
 #include <boost/smart_ptr/local_shared_ptr.hpp>
@@ -119,47 +118,11 @@ struct PGTempMap {
   typedef btree::btree_map<pg_t,ceph_le32*> map_t;
   map_t map;
 
-  void encode(ceph::buffer::list& bl) const {
-    using ceph::encode;
-    uint32_t n = map.size();
-    encode(n, bl);
-    for (auto &p : map) {
-      encode(p.first, bl);
-      bl.append((char*)p.second, (*p.second + 1) * sizeof(ceph_le32));
-    }
-  }
-  void decode(ceph::buffer::list::const_iterator& p) {
-    using ceph::decode;
-    data.clear();
-    map.clear();
-    uint32_t n;
-    decode(n, p);
-    if (!n)
-      return;
-    auto pstart = p;
-    size_t start_off = pstart.get_off();
-    std::vector<std::pair<pg_t,size_t>> offsets;
-    offsets.resize(n);
-    for (unsigned i=0; i<n; ++i) {
-      pg_t pgid;
-      decode(pgid, p);
-      offsets[i].first = pgid;
-      offsets[i].second = p.get_off() - start_off;
-      uint32_t vn;
-      decode(vn, p);
-      p += vn * sizeof(int32_t);
-    }
-    size_t len = p.get_off() - start_off;
-    pstart.copy(len, data);
-    if (data.get_num_buffers() > 1) {
-      data.rebuild();
-    }
-    //map.reserve(n);
-    char *start = data.c_str();
-    for (auto i : offsets) {
-      map.insert(map.end(), std::make_pair(i.first, (ceph_le32*)(start + i.second)));
-    }
-  }
+  PGTempMap();
+  ~PGTempMap();
+
+  void encode(ceph::buffer::list& bl) const;
+  void decode(ceph::buffer::list::const_iterator& p);
   void rebuild() {
     ceph::buffer::list bl;
     encode(bl);
@@ -242,27 +205,8 @@ struct PGTempMap {
     map.clear();
     data.clear();
   }
-  void set(pg_t pgid, const mempool::osdmap::vector<int32_t>& v) {
-    using ceph::encode;
-    size_t need = sizeof(ceph_le32) * (1 + v.size());
-    if (need < data.get_append_buffer_unused_tail_length()) {
-      ceph::buffer::ptr z(data.get_append_buffer_unused_tail_length());
-      z.zero();
-      data.append(z.c_str(), z.length());
-    }
-    encode(v, data);
-    map[pgid] = (ceph_le32*)(data.back().end_c_str()) - (1 + v.size());
-  }
-  mempool::osdmap::vector<int32_t> get(pg_t pgid) {
-    mempool::osdmap::vector<int32_t> v;
-    ceph_le32 *p = map[pgid];
-    size_t n = *p++;
-    v.resize(n);
-    for (size_t i = 0; i < n; ++i, ++p) {
-      v[i] = *p;
-    }
-    return v;
-  }
+  void set(pg_t pgid, const mempool::osdmap::vector<int32_t>& v);
+  mempool::osdmap::vector<int32_t> get(pg_t pgid);
 #else
   // trivial implementation
   mempool::osdmap::map<pg_t,mempool::osdmap::vector<int32_t> > pg_temp;
@@ -458,18 +402,11 @@ public:
     void dump(ceph::Formatter *f) const;
     static std::list<Incremental> generate_test_instances();
 
-    explicit Incremental(epoch_t e=0) :
-      encode_features(0),
-      epoch(e), new_pool_max(-1), new_flags(-1), new_max_osd(-1),
-      have_crc(false), full_crc(0), inc_crc(0) {
-    }
-    explicit Incremental(ceph::buffer::list &bl) {
-      auto p = std::cbegin(bl);
-      decode(p);
-    }
-    explicit Incremental(ceph::buffer::list::const_iterator &p) {
-      decode(p);
-    }
+    explicit Incremental(epoch_t e=0);
+    explicit Incremental(ceph::buffer::list &bl);
+    explicit Incremental(ceph::buffer::list::const_iterator &p);
+
+    ~Incremental();
 
     pg_pool_t *get_new_pool(int64_t pool, const pg_pool_t *orig) {
       if (new_pools.count(pool) == 0)
@@ -580,7 +517,9 @@ private:
     CEPH_FEATUREMASK_SERVER_OCTOPUS |
     CEPH_FEATUREMASK_SERVER_REEF |
     CEPH_FEATUREMASK_SERVER_TENTACLE |
-    CEPH_FEATUREMASK_SERVER_UMBRELLA;
+    CEPH_FEATUREMASK_SERVER_UMBRELLA |
+    CEPH_FEATUREMASK_SERVER_VAMPIRE |
+    CEPH_FEATUREMASK_OSD_STRETCH_ZONES;
 
   struct addrs_s {
     mempool::osdmap::vector<std::shared_ptr<entity_addrvec_t> > client_addrs;
@@ -686,27 +625,12 @@ private:
   friend class OSDMonitor;
 
  public:
-  OSDMap() : epoch(0), 
-	     pool_max(0),
-	     flags(0),
-	     num_osd(0), num_up_osd(0), num_in_osd(0),
-	     max_osd(0),
-	     osd_addrs(std::make_shared<addrs_s>()),
-	     pg_temp(std::make_shared<PGTempMap>()),
-	     primary_temp(std::make_shared<mempool::osdmap::map<pg_t,int32_t>>()),
-	     osd_uuid(std::make_shared<mempool::osdmap::vector<uuid_d>>()),
-	     cluster_snapshot_epoch(0),
-	     new_blocklist_entries(false),
-	     cached_up_osd_features(0),
-	     crc_defined(false), crc(0),
-	     crush(std::make_shared<CrushWrapper>()),
-	     stretch_mode_enabled(false), stretch_bucket_count(0),
-	     degraded_stretch_mode(0), recovering_stretch_mode(0), stretch_mode_bucket(0) {
-  }
+  OSDMap();
+  ~OSDMap();
 
 private:
-  OSDMap(const OSDMap& other) = default;
-  OSDMap& operator=(const OSDMap& other) = default;
+  OSDMap(const OSDMap& other);
+  OSDMap& operator=(const OSDMap& other);
 public:
 
   /// return feature mask subset that is relevant to OSDMap encoding
@@ -722,21 +646,7 @@ public:
 
   uint64_t get_encoding_features() const;
 
-  void deepish_copy_from(const OSDMap& o) {
-    *this = o;
-    primary_temp.reset(new mempool::osdmap::map<pg_t,int32_t>(*o.primary_temp));
-    pg_temp.reset(new PGTempMap(*o.pg_temp));
-    osd_uuid.reset(new mempool::osdmap::vector<uuid_d>(*o.osd_uuid));
-
-    if (o.osd_primary_affinity)
-      osd_primary_affinity.reset(new mempool::osdmap::vector<__u32>(*o.osd_primary_affinity));
-
-    // NOTE: this still references shared entity_addrvec_t's.
-    osd_addrs.reset(new addrs_s(*o.osd_addrs));
-
-    // NOTE: we do not copy crush.  note that apply_incremental will
-    // allocate a new CrushWrapper, though.
-  }
+  void deepish_copy_from(const OSDMap& o);
 
   // map info
   const uuid_d& get_fsid() const { return fsid; }
@@ -814,6 +724,9 @@ public:
 
   int get_flags() const { return flags; }
   bool test_flag(int f) const { return flags & f; }
+  /// the upgrade to pools over zones is committed: stretch pools follow
+  /// this release's peering rules, and every OSD has OSD_STRETCH_ZONES
+  bool stretch_zones() const { return test_flag(CEPH_OSDMAP_STRETCH_ZONES); }
   void set_flag(int f) { flags |= f; }
   void clear_flag(int f) { flags &= ~f; }
 
@@ -957,63 +870,33 @@ public:
     return exists(osd) && (osd_state[osd] & CEPH_OSD_NOOUT);
   }
 
-  bool is_noup(int osd) const {
-    if (test_flag(CEPH_OSDMAP_NOUP)) // global?
-      return true;
-    if (is_noup_by_osd(osd)) // by osd?
-      return true;
-    if (get_osd_crush_node_flags(osd) & CEPH_OSD_NOUP) // by crush-node?
-      return true;
-    if (auto class_id = crush->get_item_class_id(osd); class_id >= 0 &&
-        get_device_class_flags(class_id) & CEPH_OSD_NOUP) // by device-class?
-      return true;
-    return false;
-  }
-
-  bool is_nodown(int osd) const {
-    if (test_flag(CEPH_OSDMAP_NODOWN))
-      return true;
-    if (is_nodown_by_osd(osd))
-      return true;
-    if (get_osd_crush_node_flags(osd) & CEPH_OSD_NODOWN)
-      return true;
-    if (auto class_id = crush->get_item_class_id(osd); class_id >= 0 &&
-        get_device_class_flags(class_id) & CEPH_OSD_NODOWN)
-      return true;
-    return false;
-  }
-
-  bool is_noin(int osd) const {
-    if (test_flag(CEPH_OSDMAP_NOIN))
-      return true;
-    if (is_noin_by_osd(osd))
-      return true;
-    if (get_osd_crush_node_flags(osd) & CEPH_OSD_NOIN)
-      return true;
-    if (auto class_id = crush->get_item_class_id(osd); class_id >= 0 &&
-        get_device_class_flags(class_id) & CEPH_OSD_NOIN)
-      return true;
-    return false;
-  }
-
-  bool is_noout(int osd) const {
-    if (test_flag(CEPH_OSDMAP_NOOUT))
-      return true;
-    if (is_noout_by_osd(osd))
-      return true;
-    if (get_osd_crush_node_flags(osd) & CEPH_OSD_NOOUT)
-      return true;
-    if (auto class_id = crush->get_item_class_id(osd); class_id >= 0 &&
-        get_device_class_flags(class_id) & CEPH_OSD_NOOUT)
-      return true;
-    return false;
-  }
+  bool is_noup(int osd) const;
+  bool is_nodown(int osd) const;
+  bool is_noin(int osd) const;
+  bool is_noout(int osd) const;
 
   /**
    * check if an entire crush subtree is down
    */
   bool subtree_is_down(int id, std::set<int> *down_cache) const;
   bool containing_subtree_is_down(CephContext *cct, int osd, int subtree_type, std::set<int> *down_cache) const;
+
+  void get_stretch_zones(const pg_pool_t& pool,
+                         std::map<int, std::set<int>>* zone_osds) const;
+  /// How many OSDs acting lacks to reach min_size: in each zone of a
+  /// stretch pool, or else in the whole set.
+  unsigned num_acting_below_min_size(const pg_pool_t& pool, const std::vector<int>& acting) const;
+
+  /// Whether a PG of pool with this acting set can go active and serve
+  /// writes: it lacks no OSD to min_size, and a stretch pool's set can peer.
+  bool acting_set_writeable(const pg_pool_t& pool,
+                            const std::vector<int>& acting,
+                            std::ostream *out = nullptr) const;
+
+  /// Whether up keeps each zone block of an erasure coded pool over zones in
+  /// one zone of its own, as peering needs.
+  bool keeps_zone_blocks(const pg_pool_t& pool, int crush_rule,
+                         const std::vector<int>& up) const;
 
   bool subtree_type_is_down(CephContext *cct, int id, int subtree_type, std::set<int> *down_in_osds, std::set<int> *up_in_osds,
                             std::set<int> *subtree_up, std::unordered_map<int, std::set<int> > *subtree_type_down) const;
@@ -1326,46 +1209,8 @@ public:
     ceph_assert(i != pools.end());
     return i->second.is_erasure();
   }
-  bool get_primary_shard(const pg_t& pgid, spg_t *out) const {
-    auto i = get_pools().find(pgid.pool());
-    if (i == get_pools().end()) {
-      return false;
-    }
-    if (!i->second.is_erasure()) {
-      *out = spg_t(pgid);
-      return true;
-    }
-    int primary;
-    std::vector<int> acting;
-    pg_to_acting_osds(pgid, &acting, &primary);
-    for (uint8_t i = 0; i < acting.size(); ++i) {
-      if (acting[i] == primary) {
-        *out = spg_t(pgid, shard_id_t(i));
-        return true;
-      }
-    }
-    return false;
-  }
-  bool get_primary_shard(const pg_t& pgid, int *primary, spg_t *out) const {
-    auto poolit = get_pools().find(pgid.pool());
-    if (poolit == get_pools().end()) {
-      return false;
-    }
-    std::vector<int> acting;
-    pg_to_acting_osds(pgid, &acting, primary);
-    if (poolit->second.is_erasure()) {
-      for (uint8_t i = 0; i < acting.size(); ++i) {
-	if (acting[i] == *primary) {
-	  *out = spg_t(pgid, shard_id_t(i));
-	  return true;
-	}
-      }
-    } else {
-      *out = spg_t(pgid);
-      return true;
-    }
-    return false;
-  }
+  bool get_primary_shard(const pg_t& pgid, spg_t *out) const;
+  bool get_primary_shard(const pg_t& pgid, int *primary, spg_t *out) const;
 
   bool has_pgtemp(const pg_t pg) const {
     return (pg_temp->find(pg) != pg_temp->end());
@@ -1375,12 +1220,19 @@ public:
   const std::vector<int> pgtemp_undo_primaryfirst(const pg_pool_t& pool,
 			   const pg_t pg,
 			   const std::vector<int>& acting) const;
-  const shard_id_t pgtemp_primaryfirst(const pg_pool_t& pool,
-				       const pg_t pg,
-				       const shard_id_t shard) const;
   shard_id_t pgtemp_undo_primaryfirst(const pg_pool_t& pool,
 					    const pg_t pg,
 					    const shard_id_t shard) const;
+  /// Correct the shard that a pre-Tentacle client gives an op to an
+  /// optimized EC pool with pg_temp: its position in primary-first order.
+  /// The client's map can be older than this one: false if the pool or
+  /// the shard is not in this map.
+  bool undo_pre_tentacle_primaryfirst(spg_t *pgid) const;
+  /// Correct the shard that a client without OSD_STRETCH_ZONES gives an op
+  /// to an optimized EC pool over zones with pg_temp: it computes it from the
+  /// position in primary-first order as if the pool had one zone. False as
+  /// undo_pre_tentacle_primaryfirst().
+  bool undo_pre_stretch_zones_primaryfirst(spg_t *pgid) const;
 
   bool in_removed_snaps_queue(int64_t pool, snapid_t snap) const {
     auto p = removed_snaps_queue.find(pool);
@@ -1403,12 +1255,7 @@ public:
     return new_purged_snaps;
   }
 
-  int64_t lookup_pg_pool_name(std::string_view name) const {
-    auto p = name_pool.find(name);
-    if (p == name_pool.end())
-      return -ENOENT;
-    return p->second;
-  }
+  int64_t lookup_pg_pool_name(std::string_view name) const;
 
   int64_t get_pool_max() const {
     return pool_max;
@@ -1419,14 +1266,7 @@ public:
   mempool::osdmap::map<int64_t,pg_pool_t>& get_pools() {
     return pools;
   }
-  void get_pool_ids_by_rule(int rule_id, std::set<int64_t> *pool_ids) const {
-    ceph_assert(pool_ids);
-    for (auto &p: pools) {
-      if (p.second.get_crush_rule() == rule_id) {
-        pool_ids->insert(p.first);
-      }
-    }
-  }
+  void get_pool_ids_by_rule(int rule_id, std::set<int64_t> *pool_ids) const;
   void get_pool_ids_by_osd(CephContext *cct,
                            int osd,
                            std::set<int64_t> *pool_ids) const;
@@ -1441,6 +1281,31 @@ public:
   bool have_pg_pool(int64_t p) const {
     return pools.count(p);
   }
+  /// true if pool is current target, covering in-progress and complete migration
+  bool is_pool_migration_target(int64_t pid) const {
+    const pg_pool_t *p = get_pg_pool(pid);
+    return p && p->migration_root.has_value();
+  }
+  /// gets original root source pool from the current target
+  int64_t get_pool_migration_root_from_target(int64_t pid) const {
+    const pg_pool_t *p = get_pg_pool(pid);
+    return (p && p->migration_root) ? *p->migration_root : -1;
+  }
+  /// gets original root source pool from any pool in the chain
+  int64_t get_pool_migration_root(int64_t pid) const {
+    const pg_pool_t *p = get_pg_pool(pid);
+    if (!p)
+      return -1;
+    if (p->migration_root) // this is current target, get root
+      return *p->migration_root;
+    if (p->migration_target) { // this is a source stub, get root from our target
+      const pg_pool_t *tip = get_pg_pool(*p->migration_target);
+      if (tip && tip->migration_root)
+        return *tip->migration_root;
+    }
+    return -1;
+  }
+
   const pg_pool_t* get_pg_pool(int64_t p) const {
     auto i = pools.find(p);
     if (i != pools.end())
@@ -1481,16 +1346,7 @@ public:
   /*
    * check whether an spg_t maps to a particular osd
    */
-  bool is_up_acting_osd_shard(spg_t pg, int osd) const {
-    std::vector<int> up, acting;
-    _pg_to_up_acting_osds(pg.pgid, &up, NULL, &acting, NULL, false);
-    if (calc_pg_role(pg_shard_t(osd, pg.shard), acting) >= 0 ||
-	calc_pg_role(pg_shard_t(osd, pg.shard), up) >= 0) {
-      return true;
-    }
-    return false;
-  }
-
+  bool is_up_acting_osd_shard(spg_t pg, int osd) const;
 
   static int calc_pg_role_broken(int osd, const std::vector<int>& acting, int nrep=0);
   static int calc_pg_role(pg_shard_t who, const std::vector<int>& acting);
@@ -1501,11 +1357,7 @@ public:
     const std::vector<int> &newacting);
   
   /* rank is -1 (stray), 0 (primary), 1,2,3,... (replica) */
-  int get_pg_acting_role(spg_t pg, int osd) const {
-    std::vector<int> group;
-    pg_to_acting_osds(pg.pgid, group);
-    return calc_pg_role(pg_shard_t(osd, pg.shard), group);
-  }
+  int get_pg_acting_role(spg_t pg, int osd) const;
 
   bool try_pg_upmap(
     CephContext *cct,
@@ -1599,7 +1451,7 @@ private: // Bunch of internal functions used only by calc_pg_upmaps (result of c
     float pgs_per_weight,
     std::map<int,float>& osd_deviation,
     std::multimap<float,int>& deviation_osd,
-    float& stddev
+    double& bal_score
   );  // return current max deviation
 
   void fill_overfull_underfull (
@@ -1751,9 +1603,9 @@ private:
     int64_t pool_id,
     float total_w_pa,
     float pa_sum,
-    int num_osds,
     int osd_pa_count,
     float total_osd_weight,
+    uint num_pgs,
     uint max_prims_per_osd,
     uint max_acting_prims_per_osd,
     float avg_prims_per_osd,
@@ -1832,7 +1684,8 @@ public:
   void print(CephContext *cct, std::ostream& out) const;
   void print_osd(int id, std::ostream& out) const;
   void print_osds(std::ostream& out) const;
-  void print_pools(CephContext *cct, std::ostream& out) const;
+  void print_pools(CephContext *cct, std::ostream& out,
+                   bool show_rule_names = false, bool show_all = false) const;
   void print_summary(ceph::Formatter *f, std::ostream& out,
 		     const std::string& prefix, bool extra=false) const;
   void print_oneline_summary(std::ostream& out) const;
@@ -1858,10 +1711,12 @@ public:
   static void dump_erasure_code_profiles(
     const mempool::osdmap::map<std::string,std::map<std::string,std::string> > &profiles,
     ceph::Formatter *f);
-  void dump(ceph::Formatter *f, CephContext *cct = nullptr) const;
+  void dump(ceph::Formatter *f, CephContext *cct = nullptr,
+	    bool with_read_balance = true) const;
   void dump_osd(int id, ceph::Formatter *f) const;
   void dump_osds(ceph::Formatter *f) const;
-  void dump_pool(CephContext *cct, int64_t pid, const pg_pool_t &pdata, ceph::Formatter *f) const;
+  void dump_pool(CephContext *cct, int64_t pid, const pg_pool_t &pdata, ceph::Formatter *f,
+		 bool with_read_balance) const;
   void dump_read_balance_score(CephContext *cct, int64_t pid, const pg_pool_t &pdata, ceph::Formatter *f) const;
   static std::list<OSDMap> generate_test_instances();
   bool check_new_blocklist_entries() const { return new_blocklist_entries; }

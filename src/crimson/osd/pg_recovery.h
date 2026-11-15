@@ -39,6 +39,10 @@ public:
     size_t max_to_start);
   void on_activate_complete();
   void on_backfill_reserved();
+  void on_pool_migration_source_suspended();
+  void on_pool_migration_source_reserved();
+  void on_pool_migration_target_suspended(bool toofull);
+  void on_pool_migration_target_reserved();
   void dispatch_backfill_event(
     boost::intrusive_ptr<const boost::statechart::event_base> evt);
   void backfill_target_finished() {
@@ -51,6 +55,7 @@ public:
     const hobject_t& obj,
     const eversion_t& v,
     const std::vector<pg_shard_t> &peers) final;
+  void cancel_backfill();  // called from PG::on_change()
 private:
   PGRecoveryListener* pg;
   size_t start_primary_recovery_ops(
@@ -163,6 +168,7 @@ private:
   void backfilled() final;
   void request_backfill();
   void all_replicas_recovered();
+  void reset_backfill_state();  // common reset logic
 
   friend crimson::osd::BackfillState::PGFacade;
   friend crimson::osd::PG;

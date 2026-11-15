@@ -128,6 +128,74 @@ describe('RgwBucketService', () => {
     expect(req.request.method).toBe('PUT');
   });
 
+  describe('bucket details cache for tenanted buckets', () => {
+    const updateBucket = (bucket: string) =>
+      service
+        .update(
+          bucket,
+          'bar',
+          '',
+          'Suspended',
+          false,
+          null,
+          null,
+          'Disabled',
+          '',
+          '',
+          'COMPLIANCE',
+          '0',
+          '',
+          '{}',
+          'private',
+          'false',
+          '{}'
+        )
+        .subscribe();
+
+    it('should drop the cached details after update', () => {
+      service.get('kenny/testing-bucket').subscribe();
+      const first = httpTesting.expectOne(
+        `api/rgw/bucket/kenny%2Ftesting-bucket?${RgwHelper.DAEMON_QUERY_PARAM}`
+      );
+      first.flush({ versioning: 'Enabled' });
+
+      // Served from the cache, no new request.
+      service.get('kenny/testing-bucket').subscribe();
+      httpTesting.expectNone(
+        `api/rgw/bucket/kenny%2Ftesting-bucket?${RgwHelper.DAEMON_QUERY_PARAM}`
+      );
+
+      updateBucket('kenny/testing-bucket');
+      httpTesting
+        .expectOne(
+          (req) => req.method === 'PUT' && req.url === 'api/rgw/bucket/kenny%2Ftesting-bucket'
+        )
+        .flush({});
+
+      // The stale entry must be gone, so the details are fetched again.
+      service.get('kenny/testing-bucket').subscribe();
+      const second = httpTesting.expectOne(
+        `api/rgw/bucket/kenny%2Ftesting-bucket?${RgwHelper.DAEMON_QUERY_PARAM}`
+      );
+      second.flush({ versioning: 'Suspended' });
+    });
+
+    it('should drop the cached details after setLifecycle', () => {
+      service.get('kenny/testing-bucket').subscribe();
+      httpTesting
+        .expectOne(`api/rgw/bucket/kenny%2Ftesting-bucket?${RgwHelper.DAEMON_QUERY_PARAM}`)
+        .flush({});
+
+      service.setLifecycle('testing-bucket', '{}', 'owner', 'kenny').subscribe();
+      httpTesting.expectOne((req) => req.method === 'PUT').flush({});
+
+      service.get('kenny/testing-bucket').subscribe();
+      httpTesting
+        .expectOne(`api/rgw/bucket/kenny%2Ftesting-bucket?${RgwHelper.DAEMON_QUERY_PARAM}`)
+        .flush({});
+    });
+  });
+
   it('should call delete', () => {
     service.delete('foo').subscribe();
     const req = httpTesting.expectOne(`api/rgw/bucket/foo?${RgwHelper.DAEMON_QUERY_PARAM}`);
@@ -143,6 +211,16 @@ describe('RgwBucketService', () => {
     expect(req.request.method).toBe('GET');
     req.flush(['foo', 'bar']);
     expect(result).toBe(true);
+  });
+
+  it('should return false when bucket does not exist', () => {
+    let result;
+    service.exists('missing').subscribe((resp) => {
+      result = resp;
+    });
+    const req = httpTesting.expectOne(`api/rgw/bucket/missing?${RgwHelper.DAEMON_QUERY_PARAM}`);
+    req.flush({ detail: 'NoSuchBucket' }, { status: 404, statusText: 'Not Found' });
+    expect(result).toBe(false);
   });
 
   it('should convert lock retention period to days', () => {

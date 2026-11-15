@@ -49,6 +49,7 @@ if(NOT WIN32)
   if(WITH_RADOSGW)
     add_subdirectory(cls_rgw)
     add_subdirectory(cls_rgw_gc)
+    add_subdirectory(cls_timeindex)
     add_subdirectory(cls_user)
   endif(WITH_RADOSGW)
   add_subdirectory(cls_refcount)
@@ -137,6 +138,8 @@ target_link_libraries(test_build_libcommon ceph-common pthread ${CRYPTO_LIBS} ${
 if(WITH_RADOSGW)
   add_executable(test_build_librgw buildtest_skeleton.cc)
   target_link_libraries(test_build_librgw rgw_a pthread ${CRYPTO_LIBS} ${EXTRALIBS})
+  set_target_properties(test_build_librgw PROPERTIES
+    JOB_POOL_LINK heavy_link_job_pool)
 endif(WITH_RADOSGW)
 
 if(WITH_LIBCEPHFS)
@@ -158,10 +161,8 @@ set(bench_log_srcs
 add_executable(ceph_bench_log
   ${bench_log_srcs}
   )
-target_link_libraries(ceph_bench_log global pthread ${BLKID_LIBRARIES} ${CMAKE_DL_LIBS})
-if(NOT WIN32)
-  target_link_libraries(ceph_bench_log rt)
-endif()
+target_link_libraries(ceph_bench_log global pthread ${BLKID_LIBRARIES} ${CMAKE_DL_LIBS}
+  ${RT_LIBRARY})
 
 if(WITH_SYSTEMD)
   add_executable(ceph_bench_journald_logger
@@ -299,6 +300,9 @@ if(${WITH_RADOSGW})
     ${EXTRALIBS}
     ${CRYPTO_LIBS}
     )
+  set_target_properties(test_cors ceph_test_cls_rgw_admin_account_quota_set
+    ceph_test_cls_rgw_meta ceph_test_cls_rgw_log PROPERTIES
+    JOB_POOL_LINK heavy_link_job_pool)
 
 # ceph_test_librgw_file (nfs-like RGW interface)
 add_executable(ceph_test_librgw_file
@@ -321,7 +325,8 @@ add_dependencies(ceph_test_librgw_file
   ceph_test_librgw_file_rename
   ceph_test_librgw_file_nfsns
   ceph_test_librgw_file_aw
-  ceph_test_librgw_file_marker)
+  ceph_test_librgw_file_marker
+  ceph_test_librgw_file_create)
 
 # ceph_test_librgw_file_cd (just the rgw_file create-delete bucket ops)
 add_executable(ceph_test_librgw_file_cd
@@ -451,6 +456,20 @@ target_link_libraries(ceph_test_librgw_file_rename
   )
 install(TARGETS ceph_test_librgw_file_rename DESTINATION ${CMAKE_INSTALL_BINDIR})
 
+# ceph_test_librgw_file_create (librgw_create() single-call semantics test)
+add_executable(ceph_test_librgw_file_create
+  librgw_file_create.cc
+  )
+target_link_libraries(ceph_test_librgw_file_create
+  rgw
+  librados
+  ceph-common
+  ${UNITTEST_LIBS}
+  ${EXTRALIBS}
+  ${ALLOC_LIBS}
+  )
+install(TARGETS ceph_test_librgw_file_create DESTINATION ${CMAKE_INSTALL_BINDIR})
+
 # ceph_test_rgw_token
 add_executable(ceph_test_rgw_token
   test_rgw_token.cc
@@ -530,6 +549,14 @@ target_link_libraries(ceph_test_snap_mapper osd global ${BLKID_LIBRARIES} ${UNIT
 install(TARGETS
   ceph_test_snap_mapper
   DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+# unittest_scrubber_run
+add_executable(unittest_scrubber_run
+  test_scrubber_run.cc
+  $<TARGET_OBJECTS:unit-main>
+  )
+add_ceph_unittest(unittest_scrubber_run)
+target_link_libraries(unittest_scrubber_run osd global ${BLKID_LIBRARIES})
 endif(NOT WIN32)
 
 add_executable(ceph_test_stress_watch
@@ -597,17 +624,15 @@ endif(HAVE_BLKID OR FREEBSD)
 
 # ceph_test_admin_socket_output
 
-if(StdFilesystem_FOUND)
-  add_executable(ceph_test_admin_socket_output
-    test_admin_socket_output.cc
-    admin_socket_output.cc
-    admin_socket_output_tests.cc)
-  target_link_libraries(ceph_test_admin_socket_output
-    ceph-common StdFilesystem::filesystem)
-  install(TARGETS
-    ceph_test_admin_socket_output
-    DESTINATION ${CMAKE_INSTALL_BINDIR})
-endif()
+add_executable(ceph_test_admin_socket_output
+  test_admin_socket_output.cc
+  admin_socket_output.cc
+  admin_socket_output_tests.cc)
+target_link_libraries(ceph_test_admin_socket_output
+  ceph-common)
+install(TARGETS
+  ceph_test_admin_socket_output
+  DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 #make check starts here
 
@@ -689,6 +714,12 @@ add_ceph_test(run-cli-tests ${CMAKE_CURRENT_SOURCE_DIR}/run-cli-tests)
 #add_ceph_test(test_pidfile.sh ${CMAKE_CURRENT_SOURCE_DIR}/test_pidfile.sh)
 
 add_ceph_test(smoke.sh ${CMAKE_CURRENT_SOURCE_DIR}/smoke.sh)
+
+if(NOT WIN32)
+  # ceph-crash.in imports grp and pwd
+  add_ceph_test(test_ceph_crash.py
+    ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_ceph_crash.py)
+endif()
 
 # unittest_admin_socket
 add_executable(unittest_admin_socket
@@ -995,6 +1026,12 @@ target_link_libraries(unittest_rbd_replay
   ${BLKID_LIBRARIES}
   )
 endif(WITH_RBD)
+
+# unittest_filepath
+add_executable(unittest_filepath
+  test_filepath.cc)
+add_ceph_unittest(unittest_filepath)
+target_link_libraries(unittest_filepath ceph-common)
 
 # unittest_ipaddr
 add_executable(unittest_ipaddr

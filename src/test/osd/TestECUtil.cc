@@ -1630,3 +1630,478 @@ TEST(ECUtil, erase_after_ro_offset_single_byte)
   // Shard 1 should be empty
   ASSERT_FALSE(semap.contains_shard(shard_id_t(1)));
 }
+
+// Every constructor populates get_all_shards() with 0..k+m-1.
+TEST(ECUtil, get_all_shards_every_constructor)
+{
+  pg_pool_t pool;
+  shard_id_set all;
+  all.insert_range(shard_id_t(0), 3);
+  EXPECT_EQ(all, stripe_info_t(2, 1, 4096 * 2).get_all_shards());
+  EXPECT_EQ(all, stripe_info_t(2, 1, 4096 * 2, std::vector<shard_id_t>())
+                     .get_all_shards());
+  EXPECT_EQ(all, stripe_info_t(2, 1, 4096 * 2, &pool).get_all_shards());
+  EXPECT_EQ(all, stripe_info_t(2, 1, 4096 * 2, &pool,
+                               std::vector<shard_id_t>()).get_all_shards());
+}
+
+/* Two extents of a shard in the same page, with a gap between them, must
+ * both survive padding to whole pages, with zeros in the gap. Extents in
+ * different pages are padded separately.
+ */
+TEST(ECUtil, pad_and_rebuild_to_ec_align_extents_in_same_page)
+{
+  stripe_info_t sinfo(2, 1, 2*4096);
+  shard_extent_map_t sem(&sinfo);
+
+  buffer::list a, b, c;
+  a.append(std::string(1, 'a'));
+  b.append(std::string(50, 'b'));
+  c.append(std::string(10, 'c'));
+
+  sem.insert_in_shard(shard_id_t(0), 0, a);
+  sem.insert_in_shard(shard_id_t(0), 8, b);
+  sem.insert_in_shard(shard_id_t(1), 100, c);
+  sem.insert_in_shard(shard_id_t(1), 2*4096 + 100, c);
+
+  sem.pad_and_rebuild_to_ec_align();
+
+  extent_set ref0;
+  ref0.insert(0, 4096);
+  ASSERT_EQ(ref0, sem.get_extent_set(shard_id_t(0)));
+
+  buffer::list expected, got;
+  expected.append(a);
+  expected.append_zero(7);
+  expected.append(b);
+  expected.append_zero(4096 - 58);
+  sem.get_buffer(shard_id_t(0), 0, 4096, got);
+  ASSERT_TRUE(expected.contents_equal(got));
+
+  extent_set ref1;
+  ref1.insert(0, 4096);
+  ref1.insert(2*4096, 4096);
+  ASSERT_EQ(ref1, sem.get_extent_set(shard_id_t(1)));
+
+  verify_offset_cache(sem);
+}
+
+/* ---------------------------------------------------------------------------
+ * pad_and_rebuild_to_ec_align() unit tests.
+ *
+ * Contract:
+ *  - Every extent in every shard is widened to EC_ALIGN_SIZE boundaries; any
+ *    newly-covered bytes are zero.
+ *  - Existing data is never altered or lost, including when two extents are
+ *    widened into the same (or overlapping) aligned range.
+ *  - Every resulting buffer is a single EC_ALIGN_SIZE-aligned, contiguous
+ *    region (what the EC plugins require).
+ *  - The cached ro/shard offsets stay consistent with the extent maps.
+ * ------------------------------------------------------------------------- */
+namespace {
+
+// A buffer of `len` bytes, each byte = (seed + i) with 0 avoided so zero
+// padding can be told apart from data.
+bufferlist pattern_bl(uint64_t len, uint8_t seed)
+{
+  bufferlist bl;
+  bufferptr p = buffer::create(len);
+  for (uint64_t i = 0; i < len; ++i) {
+    uint8_t v = uint8_t(seed + i);
+    p.c_str()[i] = v ? v : 1;
+  }
+  bl.append(p);
+  return bl;
+}
+
+// Same content as pattern_bl, but deliberately split into several nodes with
+// a misaligned start address.
+bufferlist fragmented_pattern_bl(uint64_t len, uint8_t seed)
+{
+  bufferlist src = pattern_bl(len, seed);
+  bufferlist out;
+  uint64_t off = 0;
+  uint64_t piece = 100;
+  while (off < len) {
+    uint64_t n = std::min(piece, len - off);
+    bufferptr raw = buffer::create_aligned(n + 1, EC_ALIGN_SIZE);
+    bufferptr p(raw, 1, n);  // force a misaligned address
+    src.begin(off).copy(n, p.c_str());
+    out.append(p);
+    off += n;
+    piece = piece * 3 + 7;
+  }
+  return out;
+}
+
+bool is_single_aligned_buffer(const bufferlist &bl)
+{
+  return bl.get_num_buffers() == 1 &&
+    ((uintptr_t)bl.front().c_str() & (EC_ALIGN_SIZE - 1)) == 0 &&
+    (bl.length() % EC_ALIGN_SIZE) == 0;
+}
+
+// Flatten one shard's map into (off -> byte) so results can be compared
+// independently of how the extents are split.
+std::map<uint64_t, char> shard_bytes(const shard_extent_map_t &sem,
+                                     shard_id_t shard)
+{
+  std::map<uint64_t, char> out;
+  if (!sem.contains_shard(shard)) {
+    return out;
+  }
+  for (auto &&i : sem.get_extent_map(shard)) {
+    bufferlist bl = i.get_val();
+    const char *c = bl.c_str();
+    for (uint64_t j = 0; j < i.get_len(); ++j) {
+      out[i.get_off() + j] = c[j];
+    }
+  }
+  return out;
+}
+
+// Check the contract for one shard: every original byte is preserved, every
+// other covered byte is zero, and coverage is exactly the aligned union.
+void check_shard_after_pad(const shard_extent_map_t &before,
+                           const shard_extent_map_t &after,
+                           shard_id_t shard)
+{
+  if (!before.contains_shard(shard)) {
+    ASSERT_FALSE(after.contains_shard(shard));
+    return;
+  }
+  auto orig = shard_bytes(before, shard);
+
+  extent_set expected_cover;
+  for (auto &&i : before.get_extent_map(shard)) {
+    uint64_t s = align_prev(i.get_off());
+    uint64_t e = align_next(i.get_off() + i.get_len());
+    expected_cover.union_insert(s, e - s);
+  }
+  extent_set actual_cover;
+  after.get_extent_map(shard).to_interval_set(actual_cover);
+  ASSERT_EQ(expected_cover, actual_cover);
+
+  for (auto &&i : after.get_extent_map(shard)) {
+    ASSERT_TRUE(is_single_aligned_buffer(i.get_val()))
+      << "shard " << shard << " extent " << i.get_off() << "~" << i.get_len();
+  }
+
+  auto now = shard_bytes(after, shard);
+  for (auto &&[off, c] : now) {
+    auto it = orig.find(off);
+    if (it != orig.end()) {
+      ASSERT_EQ(it->second, c) << "data changed at shard " << shard
+                               << " offset " << off;
+    } else {
+      ASSERT_EQ(0, c) << "padding not zero at shard " << shard
+                      << " offset " << off;
+    }
+  }
+}
+
+void pad_and_check(shard_extent_map_t &sem)
+{
+  shard_extent_map_t before(sem.sinfo);
+  before.deep_copy(sem);
+
+  sem.pad_and_rebuild_to_ec_align();
+
+  for (auto &&shard : sem.sinfo->get_all_shards()) {
+    check_shard_after_pad(before, sem, shard);
+  }
+  verify_offset_cache(sem);
+}
+
+} // anonymous namespace
+
+TEST(ECUtil, pad_and_rebuild_empty)
+{
+  stripe_info_t sinfo(2, 1, 2 * 4096);
+  shard_extent_map_t sem(&sinfo);
+  sem.pad_and_rebuild_to_ec_align();
+  ASSERT_TRUE(sem.empty());
+}
+
+TEST(ECUtil, pad_and_rebuild_already_aligned_is_noop)
+{
+  stripe_info_t sinfo(2, 1, 2 * 4096);
+  shard_extent_map_t sem(&sinfo);
+  bufferlist bl;
+  bl.push_back(buffer::create_aligned(2 * 4096, EC_ALIGN_SIZE));
+  bl.begin().copy_in(2 * 4096, pattern_bl(2 * 4096, 7).c_str());
+  sem.insert_in_shard(shard_id_t(0), 4096, bl);
+  const char *before_ptr = sem.get_extent_map(shard_id_t(0)).begin().get_val().front().c_str();
+
+  shard_extent_map_t copy = sem;
+  pad_and_check(sem);
+  ASSERT_EQ(copy, sem);
+  // No reallocation should occur for an already-aligned buffer.
+  ASSERT_EQ(before_ptr,
+            sem.get_extent_map(shard_id_t(0)).begin().get_val().front().c_str());
+}
+
+TEST(ECUtil, pad_and_rebuild_aligned_offsets_unaligned_memory)
+{
+  stripe_info_t sinfo(2, 1, 2 * 4096);
+  shard_extent_map_t sem(&sinfo);
+  sem.insert_in_shard(shard_id_t(1), 4096, fragmented_pattern_bl(3 * 4096, 3));
+  ASSERT_FALSE(is_single_aligned_buffer(
+    sem.get_extent_map(shard_id_t(1)).begin().get_val()));
+  pad_and_check(sem);
+}
+
+TEST(ECUtil, pad_and_rebuild_unaligned_start)
+{
+  stripe_info_t sinfo(2, 1, 2 * 4096);
+  shard_extent_map_t sem(&sinfo);
+  sem.insert_in_shard(shard_id_t(0), 100, pattern_bl(4096 - 100, 11));
+  pad_and_check(sem);
+  ASSERT_EQ(0u, sem.get_ro_start());
+}
+
+TEST(ECUtil, pad_and_rebuild_unaligned_end)
+{
+  stripe_info_t sinfo(2, 1, 2 * 4096);
+  shard_extent_map_t sem(&sinfo);
+  sem.insert_in_shard(shard_id_t(0), 0, pattern_bl(100, 13));
+  pad_and_check(sem);
+  ASSERT_EQ(4096u, sem.get_ro_end());
+}
+
+TEST(ECUtil, pad_and_rebuild_unaligned_both_ends_multi_page)
+{
+  stripe_info_t sinfo(2, 1, 2 * 4096);
+  shard_extent_map_t sem(&sinfo);
+  sem.insert_in_shard(shard_id_t(1), 4096 + 100, fragmented_pattern_bl(8000, 17));
+  pad_and_check(sem);
+}
+
+TEST(ECUtil, pad_and_rebuild_two_extents_same_page)
+{
+  // Both extents widen to the same 4K page: neither may be lost.
+  stripe_info_t sinfo(2, 1, 2 * 4096);
+  shard_extent_map_t sem(&sinfo);
+  sem.insert_in_shard(shard_id_t(0), 100, pattern_bl(100, 21));
+  sem.insert_in_shard(shard_id_t(0), 1000, pattern_bl(100, 23));
+  ASSERT_EQ(2u, sem.get_extent_map(shard_id_t(0)).ext_count());
+  pad_and_check(sem);
+}
+
+TEST(ECUtil, pad_and_rebuild_overlapping_padding_across_pages)
+{
+  // First extent's tail padding and second extent's head padding cover the
+  // same page (4096~4096); the first extent's data in that page must survive.
+  stripe_info_t sinfo(2, 1, 2 * 4096);
+  shard_extent_map_t sem(&sinfo);
+  sem.insert_in_shard(shard_id_t(0), 100, pattern_bl(4000, 31));   // 100..4100
+  sem.insert_in_shard(shard_id_t(0), 6000, pattern_bl(100, 37));   // 6000..6100
+  pad_and_check(sem);
+}
+
+TEST(ECUtil, pad_and_rebuild_mixed_shards_and_parity)
+{
+  stripe_info_t sinfo(2, 1, 2 * 4096);
+  shard_extent_map_t sem(&sinfo);
+  bufferlist aligned;
+  aligned.push_back(buffer::create_aligned(4096, EC_ALIGN_SIZE));
+  aligned.begin().copy_in(4096, pattern_bl(4096, 41).c_str());
+  sem.insert_in_shard(shard_id_t(0), 0, aligned);
+  sem.insert_in_shard(shard_id_t(1), 200, pattern_bl(300, 43));
+  sem.insert_in_shard(shard_id_t(2), 8192 + 5, pattern_bl(10, 47));  // parity
+  pad_and_check(sem);
+}
+
+TEST(ECUtil, pad_and_rebuild_is_idempotent)
+{
+  stripe_info_t sinfo(2, 1, 2 * 4096);
+  shard_extent_map_t sem(&sinfo);
+  sem.insert_in_shard(shard_id_t(0), 100, fragmented_pattern_bl(5000, 51));
+  sem.insert_in_shard(shard_id_t(1), 9000, pattern_bl(3, 53));
+  sem.pad_and_rebuild_to_ec_align();
+  shard_extent_map_t once = sem;
+  pad_and_check(sem);
+  ASSERT_EQ(once, sem);
+}
+
+// Test get_base_shard and get_shard_zone
+TEST(ECUtil, get_base_shard)
+{
+  int k = 2;
+  int m = 1;
+  stripe_info_t sinfo(k, m, 4096 * k);
+
+  // Basic: k+m=3, so shard % 3
+  ASSERT_EQ(shard_id_t(0), sinfo.get_rel_shard(shard_id_t(0)));
+  ASSERT_EQ(shard_id_t(2), sinfo.get_rel_shard(shard_id_t(2)));
+  ASSERT_EQ(shard_id_t(0), sinfo.get_rel_shard(shard_id_t(3)));
+  ASSERT_EQ(shard_id_t(1), sinfo.get_rel_shard(shard_id_t(100)));
+
+  // Zone: shard / 3
+  ASSERT_EQ(0, sinfo.get_shard_zone(shard_id_t(2)));
+  ASSERT_EQ(1, sinfo.get_shard_zone(shard_id_t(3)));
+  ASSERT_EQ(33, sinfo.get_shard_zone(shard_id_t(100)));
+}
+
+
+
+// Verify consistency: abs_shard == zone * (k+m) + rel_shard
+TEST(ECUtil, get_shard_zone_consistency_with_get_rel_shard)
+{
+  int k = 4;
+  int m = 2;
+  int chunk_size = 4096;
+  stripe_info_t sinfo(k, m, chunk_size * k);
+
+  // Test a few examples
+  for (int shard_id = 0; shard_id < 20; shard_id++) {
+    shard_id_t abs_shard(shard_id);
+    int zone = sinfo.get_shard_zone(abs_shard);
+    shard_id_t rel_shard = sinfo.get_rel_shard(abs_shard);
+    int reconstructed = zone * sinfo.get_k_plus_m() + rel_shard.id;
+    ASSERT_EQ(shard_id, reconstructed);
+    ASSERT_EQ(abs_shard, sinfo.get_abs_shard(rel_shard, zone));
+  }
+}
+
+// stripe_info_t::get_num_zones() and pg_pool_t::get_num_zones() answer the
+// same question ("how many zones does this pool have?") and must not
+// disagree on the default: a default pg_pool_t has num_zones 1.
+TEST(ECUtil, get_num_zones_matches_pg_pool_t_default)
+{
+  pg_pool_t pool;
+  stripe_info_t sinfo(2, 1, 4096 * 2, &pool);
+
+  // pg_pool_t treats "unset" as a single-zone pool.
+  ASSERT_EQ(1u, pool.get_num_zones());
+
+  // stripe_info_t must agree with pg_pool_t on the very same question,
+  // for the very same pool.
+  ASSERT_EQ(pool.get_num_zones(), sinfo.get_num_zones());
+}
+
+// Relative shard/zone helpers across three zones, NO_SHARD, and agreement
+// with pg_pool_t::get_relative_shard, which PGLog uses for written_shards.
+TEST(ECUtil, rel_shard_and_zone_three_zones_match_pool)
+{
+  pg_pool_t pool;
+  pool.type = pg_pool_t::TYPE_ERASURE;
+  pool.size = 18;
+  pool.num_zones = 3;
+  stripe_info_t sinfo(4, 2, 4096 * 4, &pool);
+
+  ASSERT_EQ(3u, sinfo.get_num_zones());
+  ASSERT_EQ(3u, pool.get_num_zones());
+
+  shard_id_t no_shard = shard_id_t::NO_SHARD;
+  ASSERT_EQ(no_shard, sinfo.get_rel_shard(no_shard));
+  ASSERT_EQ(0, sinfo.get_shard_zone(no_shard));
+  ASSERT_EQ(std::make_pair(no_shard, 0), sinfo.get_rel_shard_and_zone(no_shard));
+  ASSERT_EQ(no_shard, pool.get_relative_shard(no_shard));
+
+  for (int i = 0; i < 18; ++i) {
+    shard_id_t abs(i);
+    ASSERT_EQ(shard_id_t(i % 6), sinfo.get_rel_shard(abs));
+    ASSERT_EQ(i / 6, sinfo.get_shard_zone(abs));
+    ASSERT_EQ(std::make_pair(sinfo.get_rel_shard(abs), sinfo.get_shard_zone(abs)),
+              sinfo.get_rel_shard_and_zone(abs));
+    ASSERT_EQ(sinfo.get_rel_shard(abs), pool.get_relative_shard(abs));
+    ASSERT_EQ(sinfo.get_raw_shard(sinfo.get_rel_shard(abs)),
+              sinfo.get_raw_shard(abs));
+  }
+}
+
+// zones_or folds every zone's shards onto the zone-0 (relative) ids.
+TEST(ECUtil, zones_or)
+{
+  pg_pool_t pool;
+  stripe_info_t sinfo(2, 1, 4096 * 2, &pool);
+
+  ASSERT_EQ(shard_id_set(), sinfo.zones_or(shard_id_set()));
+  ASSERT_EQ(shard_id_set({shard_id_t(0), shard_id_t(1), shard_id_t(2)}),
+            sinfo.zones_or(shard_id_set({shard_id_t(0), shard_id_t(1),
+                                         shard_id_t(2)})));
+  ASSERT_EQ(shard_id_set({shard_id_t(0)}),
+            sinfo.zones_or(shard_id_set({shard_id_t(3)})));
+  ASSERT_EQ(shard_id_set({shard_id_t(1), shard_id_t(2)}),
+            sinfo.zones_or(shard_id_set({shard_id_t(1), shard_id_t(5)})));
+  ASSERT_EQ(shard_id_set({shard_id_t(0), shard_id_t(1), shard_id_t(2)}),
+            sinfo.zones_or(shard_id_set({shard_id_t(0), shard_id_t(4),
+                                         shard_id_t(8)})));
+  ASSERT_EQ(shard_id_set({shard_id_t(0), shard_id_t(2)}),
+            sinfo.zones_or(shard_id_set({shard_id_t(2), shard_id_t(3)})));
+
+  // k+m = 24, so zone 2 starts beyond the first 64-bit word.
+  stripe_info_t wide(20, 4, 4096 * 20, &pool);
+  ASSERT_EQ(shard_id_set({shard_id_t(22)}),
+            wide.zones_or(shard_id_set({shard_id_t(70)})));
+  ASSERT_EQ(shard_id_set({shard_id_t(0), shard_id_t(23)}),
+            wide.zones_or(shard_id_set({shard_id_t(23), shard_id_t(48)})));
+}
+
+// Absolute zone-1 shard ids must not be used on per-zone shard maps.
+TEST(ECUtil, per_zone_maps_reject_absolute_shards)
+{
+  pg_pool_t pool;
+  stripe_info_t sinfo(2, 1, 4096 * 2, &pool);
+
+  shard_extent_set_t set(sinfo.get_k_plus_m());
+  ASSERT_EQ(0u, set.erase(shard_id_t(2)));
+  EXPECT_DEATH(set.erase(shard_id_t(3)), "");
+
+  shard_extent_map_t semap(&sinfo);
+  bufferlist bl;
+  bl.append_zero(4096);
+  semap.insert_in_shard(shard_id_t(1), 0, bl);
+  ASSERT_TRUE(semap.contains_shard(shard_id_t(1)));
+  ASSERT_EQ(4096u, semap.get_extent_set(shard_id_t(1)).size());
+  EXPECT_DEATH(semap.contains_shard(shard_id_t(4)), "");
+  EXPECT_DEATH(semap.get_extent_set(shard_id_t(4)), "");
+}
+
+// Test a single-zone pool marks raw shards 1 to k-1
+TEST(ECUtil, nonprimary_shards_one_zone)
+{
+  EXPECT_EQ(shard_id_set({shard_id_t(1), shard_id_t(2), shard_id_t(3)}),
+            ECUtil::nonprimary_shards(4, 2, {}, 1));
+}
+
+// Test every zone's copy of raw shards 1 to k-1 is marked
+TEST(ECUtil, nonprimary_shards_two_zones)
+{
+  EXPECT_EQ(shard_id_set({shard_id_t(1), shard_id_t(2), shard_id_t(3),
+                          shard_id_t(7), shard_id_t(8), shard_id_t(9)}),
+            ECUtil::nonprimary_shards(4, 2, {}, 2));
+}
+
+// Test three zones of k=2 m=1
+TEST(ECUtil, nonprimary_shards_three_zones)
+{
+  EXPECT_EQ(shard_id_set({shard_id_t(1), shard_id_t(4), shard_id_t(7)}),
+            ECUtil::nonprimary_shards(2, 1, {}, 3));
+}
+
+// Test k=1 leaves every shard able to become a primary
+TEST(ECUtil, nonprimary_shards_k_one)
+{
+  EXPECT_TRUE(ECUtil::nonprimary_shards(1, 2, {}, 2).empty());
+}
+
+// Test the chunk mapping turns raw shards into shards
+TEST(ECUtil, nonprimary_shards_chunk_mapping)
+{
+  const std::vector<shard_id_t> mapping = {
+    shard_id_t(0), shard_id_t(2), shard_id_t(1)};
+  EXPECT_EQ(shard_id_set({shard_id_t(2), shard_id_t(5)}),
+            ECUtil::nonprimary_shards(2, 1, mapping, 2));
+}
+
+// Test the identity chunk mapping gives the same set as none
+TEST(ECUtil, nonprimary_shards_identity_mapping)
+{
+  const std::vector<shard_id_t> mapping = {
+    shard_id_t(0), shard_id_t(1), shard_id_t(2), shard_id_t(3),
+    shard_id_t(4), shard_id_t(5)};
+  EXPECT_EQ(ECUtil::nonprimary_shards(4, 2, {}, 2),
+            ECUtil::nonprimary_shards(4, 2, mapping, 2));
+}

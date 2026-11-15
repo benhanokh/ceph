@@ -19,6 +19,7 @@
 
 #include <rocksdb/version.h>
 
+#include "common/debug.h"
 #include "common/errno.h"
 #include "common/perf_counters_key.h"
 #include "crush/CrushWrapper.h"
@@ -167,7 +168,7 @@ PyObject *ActivePyModules::get_metadata_python(
     Py_RETURN_NONE;
   }
   auto l = without_gil([&] {
-    return std::lock_guard(lock);
+    return std::lock_guard(metadata->lock);
   });
   PyFormatter f;
   f.dump_string("hostname", metadata->hostname);
@@ -188,7 +189,7 @@ PyObject *ActivePyModules::get_daemon_status_python(
     Py_RETURN_NONE;
   }
   auto l = without_gil([&] {
-    return std::lock_guard(lock);
+    return std::lock_guard(metadata->lock);
   });
   PyFormatter f;
   for (const auto &[daemon, status] : metadata->service_status) {
@@ -266,7 +267,9 @@ PyObject *ActivePyModules::get_python(std::string_view what, const bool get_muta
     cluster_state.with_osdmap([&](const OSDMap &osd_map){
       no_gil.acquire_gil();
       if (what == "osd_map") {
-        osd_map.dump(&f, g_ceph_context);
+        // without read balance scores, which map every PG of each
+        // replicated pool; the balancer gets them from get_osdmap()
+        osd_map.dump(&f, nullptr, false);
       } else if (what == "osd_map_tree") {
         osd_map.print_tree(&f, nullptr);
       } else if (what == "osd_map_crush") {
@@ -1793,14 +1796,15 @@ void ActivePyModules::unregister_client(std::string_view name, std::string addrs
 
 PyObject* ActivePyModules::get_daemon_health_metrics()
 {
+  PyFormatter f;
   without_gil_t no_gil;
-  return daemon_state.with_daemons_by_server([&no_gil]
+  daemon_state.with_daemons_by_server([&no_gil, &f]
       (const std::map<std::string, DaemonStateCollection> &all) {
-      no_gil.acquire_gil();
-      PyFormatter f;
-      for (const auto &[hostname, daemon_state] : all) {
-        for (const auto &[key, state] : daemon_state) {
-          f.open_array_section(ceph::to_string(key));
+    for (const auto &[hostname, daemon_state] : all) {
+      for (const auto &[key, state] : daemon_state) {
+        std::lock_guard l(state->lock);
+        with_gil(no_gil, [&f, key=ceph::to_string(key), state=state] {
+          f.open_array_section(key.c_str());
           for (const auto &metric : state->daemon_health_metrics) {
             f.open_object_section(metric.get_type_name());
             f.dump_int("value", metric.get_n1());
@@ -1808,10 +1812,11 @@ PyObject* ActivePyModules::get_daemon_health_metrics()
             f.close_section();
           }
           f.close_section();
-        }
+        });
       }
-      return f.get();
+    }
   });
+  return f.get();
 }
 
 void ActivePyModules::check_all_modules_started(Context *modules_start_complete) {

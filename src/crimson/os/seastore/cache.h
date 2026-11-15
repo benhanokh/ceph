@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <unordered_map>
+
 #include "seastar/core/shared_future.hh"
 
 #include "include/buffer.h"
@@ -770,7 +772,132 @@ public:
     stats.read_hit_cold += t.read_hit_cold;
   }
 
+  // A logical extent of type ext is being read by laddr.
+  void account_laddr_lookup(Transaction &t, extent_types_t ext) {
+    ++get_by_ext(get_by_src(stats.laddr_lookups_by_src_ext, t.get_src()), ext);
+  }
+
+  // laddr index: laddr -> cached metadata extent, to skip the LBA walk.
+  // Any change to the mapping invalidates the extent, so a valid entry is safe.
+  static constexpr bool is_laddr_indexed(extent_types_t type) {
+    switch (type) {
+    case extent_types_t::COLL_BLOCK:
+    case extent_types_t::ONODE_BLOCK_STAGED:
+    case extent_types_t::LOG_NODE:
+      return true;
+    default:
+      return false;
+    }
+  }
+
+  // Returns the indexed extent at laddr viewable by t, or null if it isn't
+  // indexed or t retired it.
+  get_extent_iertr::future<CachedExtentRef> laddr_index_lookup(
+    Transaction &t,
+    extent_types_t type,
+    laddr_t laddr) {
+    if (!is_laddr_indexed(type)) {
+      return get_extent_iertr::make_ready_future<CachedExtentRef>();
+    }
+    auto it = laddr_index.find(laddr);
+    if (it == laddr_index.end()) {
+      return get_extent_iertr::make_ready_future<CachedExtentRef>();
+    }
+    LogicalCachedExtent &extent = *it;
+    // Invalid extents are unlinked when replaced (laddr_index_replace) or
+    // retired (laddr_index_erase), both of which run before the extent is
+    // invalidated. So a linked extent is always valid.
+    assert(extent.is_valid());
+    assert(extent.get_type() == type);
+    // Pending extents are transaction-local and must never be in the shared
+    // index; insert/replace only link stable (CLEAN/DIRTY) extents.
+    assert(extent.is_stable());
+    // Indexed types (onode/coll/log) are never partially loaded.
+    assert(extent.is_fully_loaded());
+    if (!extent.maybe_get_transactional_view(t)) {
+      // t retired it
+      return get_extent_iertr::make_ready_future<CachedExtentRef>();
+    }
+    ++get_by_ext(get_by_src(stats.laddr_index_hits_by_src_ext, t.get_src()), type);
+    return get_extent_viewable_by_trans(t, CachedExtentRef(&extent));
+  }
+
+  // Called after a lookup miss. Mutations update the index via
+  // laddr_index_replace; retires via laddr_index_erase. So a miss either
+  // means an empty slot or this extent is already linked (soft miss when
+  // wrong-length / not visible to t) — never a different occupant.
+  //
+  // Invariant: while an extent is linked into the index, its key is get_laddr().
+  void laddr_index_insert(laddr_t laddr, CachedExtentRef extent) {
+    if (!is_laddr_indexed(extent->get_type()) ||
+        !extent->is_valid() ||
+        !extent->is_stable()) {
+      return;
+    }
+    auto &lext = static_cast<LogicalCachedExtent&>(*extent);
+    assert(lext.get_laddr() == laddr);
+    if (lext.laddr_index_hook.is_linked()) {
+      assert(&*laddr_index.find(laddr) == &lext);
+      return;
+    }
+    [[maybe_unused]] auto [it, inserted] = laddr_index.insert(lext);
+    // A different extent at this laddr would mean replace/erase was skipped.
+    assert(inserted);
+  }
+
+  // On mutation commit: point the index entry from prev to next.
+  // An is_laddr_indexed extent only reaches commit_replace_extent after being
+  // read via read_extent, which links the stable extent into the index on an
+  // LBA-walk miss. So prev is always linked here.
+  void laddr_index_replace(CachedExtentRef next, CachedExtentRef prev) {
+    if (!is_laddr_indexed(prev->get_type())) {
+      return;
+    }
+    auto &lprev = static_cast<LogicalCachedExtent&>(*prev);
+    assert(lprev.laddr_index_hook.is_linked());
+    auto &lnext = static_cast<LogicalCachedExtent&>(*next);
+    assert(!lnext.laddr_index_hook.is_linked());
+    assert(lnext.get_laddr() == lprev.get_laddr());
+    lprev.laddr_index_hook.unlink();
+    [[maybe_unused]] auto [it, ok] = laddr_index.insert(lnext);
+    assert(ok);
+  }
+
+  // On retire commit: the extent is no longer reachable by laddr.
+  void laddr_index_erase(CachedExtentRef ref) {
+    if (!is_laddr_indexed(ref->get_type())) {
+      return;
+    }
+    auto &lref = static_cast<LogicalCachedExtent&>(*ref);
+    assert(lref.laddr_index_hook.is_linked());
+    // O(1), no laddr re-hash
+    lref.laddr_index_hook.unlink();
+  }
+
+  void laddr_index_clear() {
+    // auto_unlink hooks: clear() resets each entry's hook to unlinked.
+    laddr_index.clear();
+  }
+
 private:
+  /**
+   * maybe_page_aligned_bptr
+   *
+   * Return a page-aligned buffer covering src[offset, length).
+   * If the slice is already page-aligned (and uniquely owned when
+   * share_ok is false), share it and skip the copy.
+   */
+  ceph::bufferptr maybe_page_aligned_bptr(
+    const ceph::bufferptr &src,
+    extent_len_t offset,
+    extent_len_t length,
+    bool share_ok
+#ifdef CRIMSON_DETAILED_SAMPLING
+    , uint64_t &copy_counter
+    , uint64_t &skip_counter
+#endif
+    );
+
   using get_extent_ertr = base_ertr;
   template <typename T>
   using read_extent_ret = get_extent_ertr::future<TCachedExtentRef<T>>;
@@ -1282,9 +1409,24 @@ public:
     LOG_PREFIX(Cache::alloc_remapped_extent);
     TCachedExtentRef<T> ext;
     if (original_bptr.has_value()) {
-      // shallow copy the buffer from original extent
-      auto nbp = ceph::bufferptr(buffer::create_page_aligned(remap_length));
-      original_bptr->copy_out(remap_offset, remap_length, nbp.c_str());
+      // Remap leftovers are block-aligned and SeaStore block_size is a
+      // multiple of CEPH_PAGE_SIZE after mkfs, so the leftover slice must
+      // already be page-aligned. share_ok is true here, so skip and
+      // page-aligned are the same; we share the parent buffer.
+      ceph_assert(original_bptr->is_page_aligned());
+      ceph_assert(original_bptr->is_n_page_sized());
+      ceph_assert(remap_offset % CEPH_PAGE_SIZE == 0);
+      ceph_assert(remap_length % CEPH_PAGE_SIZE == 0);
+      auto nbp = maybe_page_aligned_bptr(
+        *original_bptr,
+        remap_offset,
+        remap_length,
+        true /* share_ok */
+#ifdef CRIMSON_DETAILED_SAMPLING
+        , stats.remap_bptr_copy
+        , stats.remap_bptr_skip
+#endif
+        );
       // ExtentPlacementManager::alloc_new_extent will make a new
       // (relative/temp) paddr, so make extent directly
       ext = CachedExtent::make_cached_extent_ref<T>(std::move(nbp));
@@ -1778,6 +1920,16 @@ private:
 
   const bool force_backref = false;
 
+  // Fixed bucket array backing laddr_index. The intrusive set never rehashes,
+  // so this is sized generously; if the index outgrows it, lookups just get
+  // slower (longer chains), never incorrect. Each bucket is one pointer.
+  static constexpr std::size_t LADDR_INDEX_BUCKETS = 8192; // power of 2
+  laddr_extent_index_t::bucket_type laddr_index_buckets[LADDR_INDEX_BUCKETS];
+
+  // doesn't hold refs, so it never keeps an evicted extent alive; evicted
+  // extents self-unlink via their auto_unlink hook, see ~LogicalCachedExtent()
+  laddr_extent_index_t laddr_index;
+
   /**
    * dirty
    *
@@ -1887,6 +2039,10 @@ private:
     counter_by_src_t<uint64_t> cache_absent_by_src;
     counter_by_src_t<counter_by_extent_t<cache_access_stats_t> >
       access_by_src_ext;
+    counter_by_src_t<counter_by_extent_t<uint64_t> >
+      laddr_lookups_by_src_ext;
+    counter_by_src_t<counter_by_extent_t<uint64_t> >
+      laddr_index_hits_by_src_ext;
 
     uint64_t onode_tree_depth = 0;
     int64_t onode_tree_extents_num = 0;
@@ -1915,6 +2071,13 @@ private:
     uint64_t write_hit_cold = 0;
     uint64_t read_hit_hot = 0;
     uint64_t read_hit_cold = 0;
+
+  #ifdef CRIMSON_DETAILED_SAMPLING
+    uint64_t remap_bptr_copy = 0;
+    uint64_t remap_bptr_skip = 0;
+    uint64_t exist_mutate_bptr_copy = 0;
+    uint64_t exist_mutate_bptr_skip = 0;
+  #endif
 
     rewrite_stats_t trim_rewrites;
     rewrite_stats_t reclaim_rewrites;
@@ -2204,14 +2367,23 @@ void stage_visibility_handoff(Transaction& t,
           extents_read.back().extent != extent) {
         extents_read.emplace_back(extent, false);
       }
+      if (extent->is_range_loaded(ext.offset, ext.length)) {
+        extents_read.back().fully_loaded = extent->is_fully_loaded();
+        continue;
+      }
       if (!extent->is_pending_io()) {
         extent->set_io_wait(extent->state, false);
       }
       auto old_length = extent->get_loaded_length();
       load_ranges_t to_read = extent->load_ranges(ext.offset, ext.length);
       auto new_length = extent->get_loaded_length();
-      assert(new_length > old_length);
-      pinboard->increase_cached_size(*extent, new_length - old_length, &t_src);
+      ceph_assert(new_length >= old_length);
+      if (new_length > old_length) {
+        pinboard->increase_cached_size(*extent, new_length - old_length, &t_src);
+      } else {
+        // duplicate request should not schedule additional reads
+        ceph_assert(to_read.ranges.empty());
+      }
       for (auto &range : to_read.ranges) {
 	auto range_paddr = extent->get_paddr() + range.offset;
 	ranges_to_read.emplace_back(range_to_read_t{range_paddr, range});
@@ -2301,9 +2473,5 @@ void stage_visibility_handoff(Transaction& t,
   bool booting = true;
 };
 using CacheRef = std::unique_ptr<Cache>;
-
-constexpr bool needs_deepcopy_on_mutate_exist(extent_types_t type) {
-  return type == extent_types_t::LOG_NODE;
-}
 
 }

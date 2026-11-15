@@ -493,6 +493,9 @@ public:
   void clear_sent_ready_to_merge();
   void prune_sent_ready_to_merge(const OSDMapRef& osdmap);
 
+  // -- pg migrated pool --
+  void send_pg_migrated_pool(std::optional<int64_t> migration_target, pg_t pgid);
+
   // -- pg_temp --
 private:
   ceph::mutex pg_temp_lock = ceph::make_mutex("OSDService::pg_temp_lock");
@@ -1469,7 +1472,8 @@ private:
 
   ShardedThreadPool osd_op_tp;
 
-  void get_latest_osdmap();
+  /// @return the epoch of the newest osdmap, once the Objecter has it
+  epoch_t get_latest_osdmap();
 
   // -- sessions --
 private:
@@ -2017,6 +2021,14 @@ protected:
   void _collect_metadata(std::map<std::string,std::string> *pmeta);
   void _get_purged_snaps();
   void handle_get_purged_snaps_reply(MMonGetPurgedSnapsReply *r);
+  /// the epochs (start, last] asked of the monitor by the pending
+  /// purged-snaps request(s). If several requests are pending, 'last' is
+  /// the smallest requested one. Protected by osd_lock.
+  struct purged_snaps_request_t {
+    epoch_t start = 0;
+    epoch_t last = 0;
+  };
+  std::optional<purged_snaps_request_t> purged_snaps_request;
 
   void start_waiting_for_healthy();
   bool _is_healthy();
@@ -2127,6 +2139,7 @@ private:
     case MSG_OSD_PG_REMOVE:
     case MSG_OSD_BACKFILL_RESERVE:
     case MSG_OSD_RECOVERY_RESERVE:
+    case MSG_OSD_POOLMIGRATION_RESERVE:
     case MSG_OSD_REPOP:
     case MSG_OSD_REPOPREPLY:
     case MSG_OSD_PG_PUSH:

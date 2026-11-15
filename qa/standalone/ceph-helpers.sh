@@ -404,6 +404,10 @@ function get_unused_port() {
 # The remaining arguments are passed verbatim to ceph-mon --mkfs
 # and the ceph-mon daemon.
 #
+# The run_mon function creates the monitor data directory with
+# ceph-mon --mkfs and relies on the activate_mon function to run
+# the daemon.
+#
 # Two mandatory arguments must be provided: --fsid and --mon-host
 # Instead of adding them to every call to run_mon, they can be
 # set in the CEPH_ARGS environment variable to be read implicitly
@@ -449,6 +453,40 @@ function run_mon() {
         --run-dir=$dir \
         "$@" || return 1
 
+    activate_mon $dir $id "$@" || return 1
+
+    cat > $dir/ceph.conf <<EOF
+[global]
+fsid = $(get_config mon $id fsid)
+mon host = $(get_config mon $id mon_host)
+EOF
+}
+
+##
+# Run (activate) a monitor by the name mon.**id** with data in
+# **dir**/**id**, either just created by run_mon or left by a
+# previous run of ceph-mon. The logs can be found in
+# **dir**/mon.**id**.log and the pid file is **dir**/mon.**id**.pid.
+#
+# The remaining arguments are passed verbatim to ceph-mon.
+#
+# Examples:
+#
+# kill_daemons $dir TERM mon.a
+# activate_mon $dir a --public-addr 127.0.0.1:7018 # restart mon.a
+#
+# @param dir path name of the environment
+# @param id mon identifier
+# @param ... can be any option valid for ceph-mon
+# @return 0 on success, 1 on error
+#
+function activate_mon() {
+    local dir=$1
+    shift
+    local id=$1
+    shift
+    local data=$dir/$id
+
     ceph-mon \
         --id $id \
 	--osd-failsafe-full-ratio=.99 \
@@ -474,12 +512,6 @@ function run_mon() {
 	--mon-osd-backfillfull-ratio .99 \
 	--mon-warn-on-insecure-global-id-reclaim-allowed=false \
         "$@" || return 1
-
-    cat > $dir/ceph.conf <<EOF
-[global]
-fsid = $(get_config mon $id fsid)
-mon host = $(get_config mon $id mon_host)
-EOF
 }
 
 function test_run_mon() {
@@ -523,6 +555,23 @@ function test_run_mon() {
     teardown $dir || return 1
 }
 
+function test_activate_mon() {
+    local dir=$1
+
+    setup $dir || return 1
+
+    run_mon $dir a || return 1
+    kill_daemons $dir TERM mon || return 1
+
+    activate_mon $dir a --osd_pool_default_size=3 || return 1
+    ceph mon dump | grep "mon.a" || return 1
+    local size=$(CEPH_ARGS='' ceph --format=json daemon $(get_asok_path mon.a) \
+        config get osd_pool_default_size)
+    test "$size" = '{"osd_pool_default_size":"3"}' || return 1
+
+    teardown $dir || return 1
+}
+
 function create_rbd_pool() {
     ceph osd pool delete rbd rbd --yes-i-really-really-mean-it || return 1
     create_pool rbd $PG_NUM || return 1
@@ -537,6 +586,62 @@ function create_pool() {
 function delete_pool() {
     local poolname=$1
     ceph osd pool delete $poolname $poolname --yes-i-really-really-mean-it
+}
+
+##
+# Add the replicated CRUSH rule **name** for a pool over zones, as
+# ceph osd pool create --num_zones builds one: it takes **root**, or
+# only the devices of **device_class** under it, chooses **num_zones**
+# buckets of type **zone_type**, and **replicas_per_zone** of type
+# **osd_type** in each. The rule id is one more than the highest in
+# use.
+#
+# @param dir path name of the environment
+# @param name the name of the rule
+# @param root the CRUSH root the rule takes
+# @param zone_type the CRUSH type of the zones
+# @param num_zones the number of zones
+# @param osd_type the CRUSH type of the replicas' failure domain
+# @param replicas_per_zone the number of replicas in each zone
+# @param device_class (optional) the device class the rule takes
+# @return 0 on success, 1 on error
+#
+function add_stretch_rule() {
+    local dir=$1
+    local name=$2
+    local root=$3
+    local zone_type=$4
+    local num_zones=$5
+    local osd_type=$6
+    local replicas_per_zone=$7
+    local device_class=$8
+    local map=$dir/add_stretch_rule.crushmap
+
+    local take=$root
+    if [ -n "$device_class" ]; then
+        take+=" class $device_class"
+    fi
+    # chooseleaf of type osd can return OSDs that are out
+    local choose=chooseleaf
+    if [ "$osd_type" = osd ]; then
+        choose=choose
+    fi
+    local id
+    id=$(ceph osd crush rule dump --format json | jq 'map(.rule_id) | max + 1') || return 1
+    ceph osd getcrushmap -o $map || return 1
+    crushtool -d $map -o $map.txt || return 1
+    cat >> $map.txt <<EOF
+rule $name {
+        id $id
+        type replicated
+        step take $take
+        step choose firstn $num_zones type $zone_type
+        step $choose firstn $replicas_per_zone type $osd_type
+        step emit
+}
+EOF
+    crushtool -c $map.txt -o $map.new || return 1
+    ceph osd setcrushmap -i $map.new || return 1
 }
 
 #######################################################################
@@ -1685,7 +1790,7 @@ function is_pg_clean() {
 
 #######################################################################
 
-calc() { $AWK "BEGIN{print $*}"; }
+calc() { $AWK "BEGIN{print ($*) }"; }
 
 ##
 # Return a list of numbers that are increasingly larger and whose
@@ -1825,6 +1930,63 @@ function wait_for_pg_clean() {
         loop+=1
     done
     return 0
+}
+
+##
+# Wait until the mgr's PGMap - what `osd ok-to-stop` and `osd ok-to-upgrade`
+# read, as opposed to the mon's OSDMap that get_osds() reads - reports PG
+# **pgid** with the given **acting** set and a state containing **state**,
+# or until a timeout of $WAIT_FOR_CLEAN_TIMEOUT seconds. On timeout, the
+# acting set and state last reported for the PG are displayed.
+#
+# @param pgid the PG id, e.g. 1.0
+# @param acting the expected acting set, space separated and in order, e.g. "0 1 2"
+# @param state a substring the PG state must contain (default: active)
+# @return 0 if the PG reached the acting set and state, 1 otherwise
+#
+function wait_for_pg_acting() {
+    local pgid=$1
+    local acting="$2"
+    local state=${3:-active}
+    local -a delays=($(get_timeout_delays $WAIT_FOR_CLEAN_TIMEOUT .1))
+    local -i loop=0
+    local last
+
+    flush_pg_stats || return 1
+    while true ; do
+        last=$(ceph --format json pg dump pgs 2>/dev/null | \
+            jq -r --arg pgid "$pgid" \
+               '.pg_stats[] | select(.pgid == $pgid)
+                | "\(.acting | map(tostring) | join(" "))|\(.state)"')
+        if test "${last%%|*}" = "$acting" && [[ "${last#*|}" == *"$state"* ]] ; then
+            return 0
+        fi
+        if (( $loop >= ${#delays[*]} )) ; then
+            echo "PG $pgid: expected acting [$acting] with state containing '$state'," \
+                 "got acting [${last%%|*}] state '${last#*|}'"
+            return 1
+        fi
+        sleep ${delays[$loop]}
+        loop+=1
+    done
+}
+
+function test_wait_for_pg_acting() {
+    local dir=$1
+
+    setup $dir || return 1
+    run_mon $dir a --osd_pool_default_size=2 || return 1
+    run_osd $dir 0 || return 1
+    run_osd $dir 1 || return 1
+    run_mgr $dir x || return 1
+    create_rbd_pool || return 1
+    wait_for_clean || return 1
+    local pgid=$(get_pg rbd SOMETHING)
+    local acting=$(get_osds rbd SOMETHING)
+    wait_for_pg_acting $pgid "$acting" clean || return 1
+    ! WAIT_FOR_CLEAN_TIMEOUT=1 wait_for_pg_acting $pgid "$acting" degraded || return 1
+    ! WAIT_FOR_CLEAN_TIMEOUT=1 wait_for_pg_acting $pgid "9" || return 1
+    teardown $dir || return 1
 }
 
 ##

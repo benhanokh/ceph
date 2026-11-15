@@ -5,7 +5,9 @@
 #include <openssl/x509.h>
 #include <openssl/pem.h>
 #include <openssl/bio.h>
+#include <netdb.h>
 
+#include <cerrno>
 #include <vector>
 #include <string>
 #include <array>
@@ -23,6 +25,7 @@
 
 
 #include "ceph_ver.h"
+#include "common/errno.h"
 #include "common/Formatter.h"
 #include "common/utf8.h"
 #include "common/ceph_json.h"
@@ -44,6 +47,7 @@
 
 #include "rgw_sts.h"
 #include "rgw_rest_oidc_provider.h"
+#include "rgw_url.h"
 #include "rgw_asio_thread.h"
 
 
@@ -90,9 +94,11 @@ WebTokenEngine::get_role_name(const string& role_arn) const
 
 int WebTokenEngine::load_provider(const DoutPrefixProvider* dpp, optional_yield y,
                                   const string& role_arn, const string& iss,
-                                  RGWOIDCProviderInfo& info) const
+                                  RGWOIDCProviderInfo& info,
+                                  bool& is_global_oidc) const
 {
   string tenant = get_role_tenant(role_arn);
+  is_global_oidc = false;
 
   string idp_url = iss;
   auto pos = idp_url.find("http://");
@@ -110,7 +116,20 @@ int WebTokenEngine::load_provider(const DoutPrefixProvider* dpp, optional_yield 
     idp_url.erase(pos, 7);
   }
 
-  return driver->load_oidc_provider(dpp, y, tenant, idp_url, info, nullptr);
+  int r = driver->load_oidc_provider(dpp, y, tenant, idp_url, info, nullptr);
+  // Global providers are account-scoped only: fall back only when the role's
+  // tenant is a valid account id. Legacy tenant-based roles must not be able
+  // to consume global providers.
+  if (r == -ENOENT && tenant != global_oidc_id &&
+      rgw::account::validate_id(tenant)) {
+    ldpp_dout(dpp, 20) << "no OIDC provider found for tenant '" << tenant
+        << "' and url '" << idp_url << "', trying global" << dendl;
+    r = driver->load_oidc_provider(dpp, y, global_oidc_id, idp_url, info, nullptr);
+    if (r == 0) {
+      is_global_oidc = true;
+    }
+  }
+  return r;
 }
 
 bool
@@ -213,10 +232,11 @@ WebTokenEngine::get_token_claims(const jwt::decoded_jwt& decoded) const
 }
 
 //Offline validation of incoming Web Token which is a signed JWT (JSON Web Token)
-std::tuple<boost::optional<WebTokenEngine::token_t>, boost::optional<WebTokenEngine::principal_tags_t>>
+std::tuple<boost::optional<WebTokenEngine::token_t>, boost::optional<WebTokenEngine::principal_tags_t>, bool>
 WebTokenEngine::get_from_jwt(const DoutPrefixProvider* dpp, const std::string& token, const req_state* const s,
 			     optional_yield y) const
 {
+  bool is_global_oidc = false;
   WebTokenEngine::token_t t;
   WebTokenEngine::principal_tags_t principal_tags;
   try {
@@ -251,7 +271,7 @@ WebTokenEngine::get_from_jwt(const DoutPrefixProvider* dpp, const std::string& t
 
     string role_arn = s->info.args.get("RoleArn");
     RGWOIDCProviderInfo provider;
-    int r = load_provider(dpp, y, role_arn, iss, provider);
+    int r = load_provider(dpp, y, role_arn, iss, provider, is_global_oidc);
     if (r < 0) {
       ldpp_dout(dpp, 0) << "Couldn't get oidc provider info using input iss" << iss << dendl;
       throw std::system_error(EACCES, std::system_category());
@@ -290,13 +310,13 @@ WebTokenEngine::get_from_jwt(const DoutPrefixProvider* dpp, const std::string& t
         throw std::system_error(EACCES, std::system_category());
       }
     } else {
-      return {boost::none, boost::none};
+      return {boost::none, boost::none, false};
     }
   } catch (const std::exception& e) {
     ldpp_dout(dpp, 5) << "Invalid JWT token" << dendl;
-    return {boost::none, boost::none};
+    return {boost::none, boost::none, false};
   }
-  return {t, principal_tags};
+  return {t, principal_tags, is_global_oidc};
 }
 
 std::string
@@ -336,63 +356,37 @@ WebTokenEngine::get_cert_url(const string& iss, const DoutPrefixProvider *dpp, o
   return cert_url;
 }
 
-std::string
-WebTokenEngine::get_top_level_domain_from_host(const DoutPrefixProvider* dpp, const std::string& hostname) const
-{
-  std::string host = hostname;
-  //get top level domain only, removing https etc
-  auto pos = host.find("http://");
-  if (pos == std::string::npos) {
-    pos = host.find("https://");
-    if (pos != std::string::npos) {
-      host.erase(pos, 8);
-    } else {
-      pos = host.find("www.");
-      if (pos != std::string::npos) {
-        host.erase(pos, 4);
-      }
-    }
-  } else {
-    host.erase(pos, 7);
-  }
-
-  pos = host.find("/");
-  if (pos != std::string::npos) {
-    host.erase(pos, (host.length() - 1));
-  }
-
-  ldpp_dout(dpp, 20) << "Top level domain name of the host is: " << host << dendl;
-  return host;
-}
-
 int
 WebTokenEngine::create_connection(const DoutPrefixProvider* dpp, const std::string& hostname, int port) const
 {
-  struct hostent* host = gethostbyname(hostname.c_str());
-  if (!host) {
-    ldpp_dout(dpp, 0) << "gethostbyname failed for host: " << hostname << dendl;
-    return -1;
-  }
-
-  struct sockaddr_in addr;
-  memset(&addr, 0, sizeof(addr));
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons(port);
-  memcpy(&addr.sin_addr, host->h_addr, host->h_length);
-
-  int sock = socket(AF_INET, SOCK_STREAM, 0);
-  if (sock < 0) {
-    ldpp_dout(dpp, 10) << "creation of socket failed: " << sock << dendl;
-    return -1;
-  }
-
-  int ret = connect(sock, (struct sockaddr*)&addr, sizeof(addr));
+  struct addrinfo hints = {};
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  struct addrinfo* addrs = nullptr;
+  const auto service = std::to_string(port);
+  int ret = getaddrinfo(hostname.c_str(), service.c_str(), &hints, &addrs);
   if (ret != 0) {
-    ldpp_dout(dpp, 10) << "connection to socket failed: " << ret << dendl;
-    close(sock);
+    ldpp_dout(dpp, 0) << "getaddrinfo failed for host: " << hostname
+                    << ": " << gai_strerror(ret) << dendl;
     return -1;
   }
 
+  int sock = -1;
+  for (auto ai = addrs; ai != nullptr; ai = ai->ai_next) {
+    sock = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+    if (sock < 0) {
+      ldpp_dout(dpp, 10) << "creation of socket failed: " << sock << dendl;
+      continue;
+    }
+    if (connect(sock, ai->ai_addr, ai->ai_addrlen) == 0) {
+      break;
+    }
+    ldpp_dout(dpp, 10) << "connection to " << hostname << ":" << port
+                      << " failed: " << cpp_strerror(errno) << dendl;
+    close(sock);
+    sock = -1;
+  }
+  freeaddrinfo(addrs);
   return sock;
 }
 
@@ -590,9 +584,14 @@ bool WebTokenEngine::verify_oidc_thumbprint(const DoutPrefixProvider* dpp, const
   }
 
   // Fetch and verify cert according to https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_providers_create_oidc_verify-thumbprint.html
-  const auto hostname = get_top_level_domain_from_host(dpp, cert_url);
-  ldpp_dout(dpp, 20) << "Validating hostname: " << hostname << dendl;
-  const auto cert_chain = connect_to_host_get_cert_chain(dpp, hostname, 443);
+  std::string hostname;
+  uint16_t port = 0;
+  if (!rgw::parse_url_host_port(cert_url, hostname, port, 443)) {
+    ldpp_dout(dpp, 5) << "Failed to parse JWKS url: " << cert_url << dendl;
+    return false;
+  }
+  ldpp_dout(dpp, 20) << "Validating hostname: " << hostname << " port: " << port << dendl;
+  const auto cert_chain = connect_to_host_get_cert_chain(dpp, hostname, port);
   std::string cert;
   try {
     cert = extract_last_certificate(dpp, cert_chain);
@@ -784,7 +783,7 @@ WebTokenEngine::authenticate( const DoutPrefixProvider* dpp,
   }
 
   try {
-    auto [t, princ_tags] = get_from_jwt(dpp, token, s, y);
+    auto [t, princ_tags, is_global_oidc] = get_from_jwt(dpp, token, s, y);
     if (t) {
       string role_session = s->info.args.get("RoleSessionName");
       if (role_session.empty()) {
@@ -824,7 +823,7 @@ WebTokenEngine::authenticate( const DoutPrefixProvider* dpp,
       boost::optional<multimap<string,string>> role_tags = role->get_tags();
       auto apl = apl_factory->create_apl_web_identity(
           cct, s, role->get_id(), role_session, role_tenant,
-          *t, role_tags, princ_tags, std::move(account));
+          *t, role_tags, princ_tags, std::move(account), is_global_oidc);
       return result_t::grant(std::move(apl));
     }
     return result_t::deny(-EACCES);
@@ -835,62 +834,6 @@ WebTokenEngine::authenticate( const DoutPrefixProvider* dpp,
 }
 
 } // namespace rgw::auth::sts
-
-int RGWREST_STS::verify_permission(optional_yield y)
-{
-  //blocking role chaining as it is not officially supported in RGW
-  //this logic applies only to AssumeRole* calls.
-  //this needs to be revisited in case any other STS op uses this method
-  //to verify its permission.
-  //disallow temporary credentials from invoking assumerole* calls
-  if (s->auth.identity && s->auth.identity->get_identity_type() == TYPE_ROLE) {
-    s->err.message = "Role chaining is not supported";
-    return -EPERM;
-  }
-  STS::STSService _sts(s->cct, driver, s->user->get_id(), s->auth.identity.get());
-  sts = std::move(_sts);
-
-  string rArn = s->info.args.get("RoleArn");
-  const auto& [ret, role] = sts.getRoleInfo(s, rArn, y);
-  if (ret < 0) {
-    ldpp_dout(this, 0) << "failed to get role info using role arn: " << rArn << dendl;
-    return ret;
-  }
-  string policy = role->get_assume_role_policy();
-
-  //Parse the policy
-  //TODO - This step should be part of Role Creation
-  try {
-    // resource policy is not restricted to the current tenant
-    const std::string* policy_tenant = nullptr;
-
-    const rgw::IAM::Policy p(s->cct, policy_tenant, policy, false);
-    if (!s->principal_tags.empty()) {
-      auto res = p.eval(this, s->env, *s->auth.identity, rgw::IAM::stsTagSession, boost::none);
-      if (res != rgw::IAM::Effect::Allow) {
-        ldout(s->cct, 0) << "evaluating policy for stsTagSession returned deny/pass" << dendl;
-        return -EPERM;
-      }
-    }
-    uint64_t op;
-    if (get_type() == RGW_STS_ASSUME_ROLE_WEB_IDENTITY) {
-      op = rgw::IAM::stsAssumeRoleWithWebIdentity;
-    } else {
-      op = rgw::IAM::stsAssumeRole;
-    }
-
-    auto res = p.eval(this, s->env, *s->auth.identity, op, boost::none);
-    if (res != rgw::IAM::Effect::Allow) {
-      ldout(s->cct, 0) << "evaluating policy for op: " << op << " returned deny/pass" << dendl;
-      return -EPERM;
-    }
-  } catch (rgw::IAM::PolicyParseException& e) {
-    ldpp_dout(this, 0) << "failed to parse policy: " << e.what() << dendl;
-    return -EPERM;
-  }
-
-  return 0;
-}
 
 void RGWREST_STS::send_response()
 {
@@ -995,6 +938,82 @@ int RGWSTSAssumeRoleWithWebIdentity::get_params()
   return 0;
 }
 
+int RGWSTSAssumeRoleWithWebIdentity::verify_permission(optional_yield y)
+{
+  //blocking role chaining as it is not officially supported in RGW
+  //this logic applies only to AssumeRole* calls.
+  //this needs to be revisited in case any other STS op uses this method
+  //to verify its permission.
+  //disallow temporary credentials from invoking assumerole* calls
+  if (s->auth.identity && s->auth.identity->get_identity_type() == TYPE_ROLE) {
+    s->err.message = "Role chaining is not supported";
+    return -EPERM;
+  }
+  // A capped Keystone identity (e.g. a project reader) must not assume a
+  // role. AssumeRole does not scope access, it replaces the identity with a
+  // role identity (TYPE_ROLE) that has its own permissions and no perm_mask,
+  // so it would remove the cap entirely. Refuse up front; the role's trust
+  // policy, evaluated below, can never re-grant what the cap forbids.
+  if (s->auth.identity && is_capped_keystone_identity(s->perm_mask, *s->auth.identity)) {
+    ldpp_dout(this, 4) << "read-only Keystone identity may not assume a role"
+                       << dendl;
+    return -EPERM;
+  }
+  STS::STSService _sts(s->cct, driver, s->user->get_id(), s->auth.identity.get());
+  sts = std::move(_sts);
+
+  string rArn = s->info.args.get("RoleArn");
+  const auto& [ret, role] = sts.getRoleInfo(s, rArn, y);
+  if (ret < 0) {
+    ldpp_dout(this, 0) << "failed to get role info using role arn: " << rArn << dendl;
+    return ret;
+  }
+  auto arn = rgw::ARN::parse(rArn);
+  if (!arn) {
+    ldpp_dout(this, 0) << "failed to parse role arn: " << rArn << dendl;
+    return -EINVAL;
+  }
+  string policy = role->get_assume_role_policy();
+
+  // tenanted roles will have an empty account id, resulting in an empty
+  // rgw_owner. this means that account users will always use cross-account
+  // rules for policy evaluation
+  const rgw_owner owner = role->get_account_id();
+
+  //Parse the policy
+  //TODO - This step should be part of Role Creation
+  try {
+    // resource policy is not restricted to the current tenant
+    const std::string* policy_tenant = nullptr;
+
+    const rgw::IAM::Policy p(s->cct, policy_tenant, policy, false);
+    if (!s->principal_tags.empty()) {
+      // require sts:TagSession permission
+      constexpr uint64_t op = rgw::IAM::stsTagSession;
+      if (!verify_resource_permission(this, s->env, *s->auth.identity,
+                                      op, *arn, boost::none, owner, p,
+                                      s->iam_identity_policies,
+                                      s->session_policies)) {
+        ldpp_dout(this, 0) << "evaluating policy for stsTagSession returned deny/pass" << dendl;
+        return -EPERM;
+      }
+    }
+    constexpr uint64_t op = rgw::IAM::stsAssumeRoleWithWebIdentity;
+    if (!verify_resource_permission(this, s->env, *s->auth.identity,
+                                    op, *arn, boost::none, owner, p,
+                                    s->iam_identity_policies,
+                                    s->session_policies)) {
+      ldpp_dout(this, 0) << "evaluating policy for op: " << op << " returned deny/pass" << dendl;
+      return -EPERM;
+    }
+  } catch (rgw::IAM::PolicyParseException& e) {
+    ldpp_dout(this, 0) << "failed to parse policy: " << e.what() << dendl;
+    return -EPERM;
+  }
+
+  return 0;
+}
+
 void RGWSTSAssumeRoleWithWebIdentity::execute(optional_yield y)
 {
   if (op_ret = get_params(); op_ret < 0) {
@@ -1051,6 +1070,82 @@ int RGWSTSAssumeRole::get_params()
       s->err.message = e.what();
       return -ERR_MALFORMED_DOC;
     }
+  }
+
+  return 0;
+}
+
+int RGWSTSAssumeRole::verify_permission(optional_yield y)
+{
+  //blocking role chaining as it is not officially supported in RGW
+  //this logic applies only to AssumeRole* calls.
+  //this needs to be revisited in case any other STS op uses this method
+  //to verify its permission.
+  //disallow temporary credentials from invoking assumerole* calls
+  if (s->auth.identity && s->auth.identity->get_identity_type() == TYPE_ROLE) {
+    s->err.message = "Role chaining is not supported";
+    return -EPERM;
+  }
+  // A capped Keystone identity (e.g. a project reader) must not assume a
+  // role. AssumeRole does not scope access, it replaces the identity with a
+  // role identity (TYPE_ROLE) that has its own permissions and no perm_mask,
+  // so it would remove the cap entirely. Refuse up front; the role's trust
+  // policy, evaluated below, can never re-grant what the cap forbids.
+  if (s->auth.identity && is_capped_keystone_identity(s->perm_mask, *s->auth.identity)) {
+    ldpp_dout(this, 4) << "read-only Keystone identity may not assume a role"
+                       << dendl;
+    return -EPERM;
+  }
+  STS::STSService _sts(s->cct, driver, s->user->get_id(), s->auth.identity.get());
+  sts = std::move(_sts);
+
+  string rArn = s->info.args.get("RoleArn");
+  const auto& [ret, role] = sts.getRoleInfo(s, rArn, y);
+  if (ret < 0) {
+    ldpp_dout(this, 0) << "failed to get role info using role arn: " << rArn << dendl;
+    return ret;
+  }
+  auto arn = rgw::ARN::parse(rArn);
+  if (!arn) {
+    ldpp_dout(this, 0) << "failed to parse role arn: " << rArn << dendl;
+    return -EINVAL;
+  }
+  string policy = role->get_assume_role_policy();
+
+  // tenanted roles will have an empty account id, resulting in an empty
+  // rgw_owner. this means that account users will always use cross-account
+  // rules for policy evaluation
+  const rgw_owner owner = role->get_account_id();
+
+  //Parse the policy
+  //TODO - This step should be part of Role Creation
+  try {
+    // resource policy is not restricted to the current tenant
+    const std::string* policy_tenant = nullptr;
+
+    const rgw::IAM::Policy p(s->cct, policy_tenant, policy, false);
+    if (!s->principal_tags.empty()) {
+      // require sts:TagSession permission
+      constexpr uint64_t op = rgw::IAM::stsTagSession;
+      if (!verify_resource_permission(this, s->env, *s->auth.identity,
+                                      op, *arn, boost::none, owner, p,
+                                      s->iam_identity_policies,
+                                      s->session_policies)) {
+        ldpp_dout(this, 0) << "evaluating policy for stsTagSession returned deny/pass" << dendl;
+        return -EPERM;
+      }
+    }
+    constexpr uint64_t op = rgw::IAM::stsAssumeRole;
+    if (!verify_resource_permission(this, s->env, *s->auth.identity,
+                                    op, *arn, boost::none, owner, p,
+                                    s->iam_identity_policies,
+                                    s->session_policies)) {
+      ldpp_dout(this, 0) << "evaluating policy for op: " << op << " returned deny/pass" << dendl;
+      return -EPERM;
+    }
+  } catch (rgw::IAM::PolicyParseException& e) {
+    ldpp_dout(this, 0) << "failed to parse policy: " << e.what() << dendl;
+    return -EPERM;
   }
 
   return 0;

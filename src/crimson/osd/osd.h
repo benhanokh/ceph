@@ -11,6 +11,7 @@
 #include <seastar/core/shared_future.hh>
 #include <seastar/core/timer.hh>
 
+#include "common/debug_level_guard.h"
 #include "crimson/common/logclient.h"
 #include "crimson/common/type_helpers.h"
 #include "crimson/common/auth_handler.h"
@@ -108,6 +109,7 @@ class OSD final : public crimson::net::Dispatcher,
   // which pgs were scanned for min_lec
   std::vector<pg_t> min_last_epoch_clean_pgs;
   void update_stats();
+  void check_debug_levels();
   seastar::future<MessageURef> get_stats() final;
 
   // AuthHandler methods
@@ -129,6 +131,8 @@ class OSD final : public crimson::net::Dispatcher,
   /// caching the total snap trim queue length across all PGs,
   /// updated periodically by the tick_timer
   uint64_t snap_trim_queue_total = 0;
+
+  DebugLevelGuard debug_level_guard;
 
   seastar::timer<seastar::lowres_clock> stats_timer;
   std::vector<ShardServices::shard_stats_t> shard_stats;
@@ -178,6 +182,11 @@ public:
   /// @return the seq id of the pg stats being sent
   seastar::future<uint64_t> send_pg_stats();
 
+  /// fetch the newest osdmap from the mon, and wait until it is
+  /// applied by all PGs
+  /// @return the epoch of that map
+  seastar::future<epoch_t> wait_for_latest_osdmap();
+
   auto &get_shard_services() {
     return shard_services.local();
   }
@@ -191,6 +200,7 @@ private:
     crimson::os::FuturizedStore &store
   );
   seastar::future<> start_boot();
+  seastar::future<> start_cluster_lanes(uint64_t osd_required);
   seastar::future<> _preboot(version_t oldest_osdmap, version_t newest_osdmap);
   seastar::future<> _send_boot();
   seastar::future<> _add_me_to_crush();

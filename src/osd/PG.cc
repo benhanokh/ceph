@@ -19,6 +19,7 @@
 #include "common/debug.h"
 #include "common/errno.h"
 #include "common/ceph_releases.h"
+#include "common/Cond.h"
 #include "common/config.h"
 #include "OSD.h"
 #include "OpRequest.h"
@@ -36,6 +37,7 @@
 #include "messages/MOSDPGBackfillRemove.h"
 #include "messages/MBackfillReserve.h"
 #include "messages/MRecoveryReserve.h"
+#include "messages/MPoolMigrationReserve.h"
 #include "messages/MOSDPGPush.h"
 #include "messages/MOSDPGPushReply.h"
 #include "messages/MOSDPGPull.h"
@@ -807,10 +809,43 @@ void PG::publish_stats_to_osd()
     });
 
   std::lock_guard l{pg_stats_publish_lock};
+  const bool was_dirty = recovery_state.debug_has_dirty_state();
   auto stats =
     recovery_state.prepare_stats_for_publish(pg_stats_publish, unstable_stats);
   if (stats) {
     pg_stats_publish = std::move(stats);
+  }
+
+  if (was_dirty || !recovery_state.debug_has_dirty_state()) {
+    return;
+  }
+
+  if (recovery_state.is_dispatching_peering_event()) {
+    // The peering-event dispatch currently in progress
+    // (do_peering_event()/advance_map()/activate_map()) already calls
+    // write_if_dirty(rctx.transaction) right after it finishes, so this
+    // transition will be flushed through that transaction. A brand-new
+    // PG's own collection-creation transaction can still be pending in
+    // rctx at this point (OSD::handle_pg_create_info() dispatches
+    // activate_map() before submitting it), so issuing a second,
+    // standalone transaction here could reach the store before that
+    // one and hit a collection that doesn't exist yet.
+    dout(15) << __func__ << " deferring a new vulnerability/rebuild "
+             << "latch transition to the current peering event "
+             << "dispatch's own write_if_dirty()" << dendl;
+    return;
+  }
+
+  // Not every caller of publish_stats_to_osd() has a transaction in
+  // flight to carry this write. An op/repop-completion callback, for
+  // instance, runs after its own transaction has already committed.
+  // So don't rely on one coming along later; write it now.
+  dout(15) << __func__ << " forcing an immediate write for a new "
+           << "vulnerability/rebuild latch transition" << dendl;
+  ObjectStore::Transaction t;
+  recovery_state.write_if_dirty(t);
+  if (!t.empty()) {
+    osd->store->queue_transaction(ch, std::move(t), nullptr);
   }
 }
 
@@ -1104,7 +1139,8 @@ void PG::read_state(ObjectStore *store)
 	oss,
 	cct->_conf->osd_ignore_stale_divergent_priors,
 	pool.info.allows_ecoptimizations(),
-	cct->_conf->osd_debug_verify_missing_on_start);
+        cct->_conf->osd_debug_verify_missing_on_start,
+        &pool.info);
 
       if (oss.tellp())
 	osd->clog->error() << oss.str();
@@ -1332,6 +1368,10 @@ void PG::queue_want_pg_temp(const vector<int> &wanted) {
 
 void PG::clear_want_pg_temp() {
   osd->remove_want_pg_temp(get_pgid().pgid);
+}
+
+void PG::send_pg_migrated_pool() {
+  osd->send_pg_migrated_pool(pool.info.migration_target, get_pgid().pgid);
 }
 
 void PG::on_role_change() {
@@ -1581,6 +1621,19 @@ void PG::on_recovery_reserved()
   queue_recovery();
 }
 
+void PG::on_pool_migration_source_reserved()
+{
+  state_set(PG_STATE_MIGRATING);
+  state_clear(PG_STATE_MIGRATION_TOOFULL);
+  state_clear(PG_STATE_MIGRATION_WAIT);
+  queue_recovery();
+}
+
+void PG::on_pool_migration_source_suspended()
+{
+  state_clear(PG_STATE_MIGRATING);
+}
+
 void PG::set_not_ready_to_merge_target(pg_t pgid, pg_t src)
 {
   osd->set_not_ready_to_merge_target(pgid, src);
@@ -1640,22 +1693,6 @@ void PG::rebuild_missing_set_with_deletes(PGLog &pglog)
     recovery_state.get_info());
 }
 
-void PG::on_activate_committed()
-{
-  if (!is_primary()) {
-    // waiters
-    if (recovery_state.needs_flush() == 0) {
-      requeue_ops(waiting_for_peered);
-    } else if (!waiting_for_peered.empty()) {
-      dout(10) << __func__ << " flushes in progress, moving "
-	       << waiting_for_peered.size() << " items to waiting_for_flush"
-	       << dendl;
-      ceph_assert(waiting_for_flush.empty());
-      waiting_for_flush.swap(waiting_for_peered);
-    }
-  }
-}
-
 // Compute pending backfill data
 static int64_t pending_backfill(CephContext *cct, int64_t bf_bytes, int64_t local_bytes)
 {
@@ -1672,7 +1709,7 @@ static int64_t pending_backfill(CephContext *cct, int64_t bf_bytes, int64_t loca
 // However, setting above zero reserves space for backfill and requires
 // the OSDService::stat_lock which protects all OSD usage
 bool PG::try_reserve_recovery_space(
-  int64_t primary_bytes, int64_t local_bytes) {
+  int64_t primary_bytes, int64_t local_bytes, int64_t num_objects) {
   // Use tentative_bacfill_full() to make sure enough
   // space is available to handle target bytes from primary.
 
@@ -1689,15 +1726,20 @@ bool PG::try_reserve_recovery_space(
   // statfs using ps->primary_bytes.
   uint64_t pending_adjustment = 0;
   if (primary_bytes) {
+    if (!num_objects) {
+      // backfill uses number of objects from the stats, pool migration
+      // tells the target PG how many objects will be migrated
+      num_objects = info.stats.stats.sum.num_objects;
+    }
     // For erasure coded pool overestimate by a full stripe per object
     // because we don't know how each objected rounded to the nearest stripe
     if (pool.info.is_erasure()) {
       primary_bytes /= (int)get_pgbackend()->get_ec_data_chunk_count();
       primary_bytes += get_pgbackend()->get_ec_stripe_chunk_size() *
-	info.stats.stats.sum.num_objects;
+	num_objects;
       local_bytes /= (int)get_pgbackend()->get_ec_data_chunk_count();
       local_bytes += get_pgbackend()->get_ec_stripe_chunk_size() *
-	info.stats.stats.sum.num_objects;
+	num_objects;
     }
     pending_adjustment = pending_backfill(
       cct,
@@ -2122,7 +2164,10 @@ void PG::do_peering_event(PGPeeringEventRef evt, PeeringCtx &rctx)
   if (old_peering_evt(evt)) {
     dout(10) << "discard old " << evt->get_desc() << dendl;
   } else {
+    bool saved_dispatching = recovery_state.is_dispatching_peering_event();
+    recovery_state.set_dispatching_peering_event(true);
     recovery_state.handle_event(evt, &rctx);
+    recovery_state.set_dispatching_peering_event(saved_dispatching);
   }
   // write_if_dirty regardless of path above to ensure we capture any work
   // done by OSD::advance_pg().

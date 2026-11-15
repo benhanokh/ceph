@@ -23,9 +23,10 @@ from ceph.deployment.service_spec import (
     NvmeofServiceSpec,
 )
 from ceph.utils import str_to_datetime, datetime_to_str, datetime_now
-from orchestrator import OrchestratorError, HostSpec, OrchestratorEvent, service_to_daemon_types
+from orchestrator import OrchestratorError, HardwareNoReport, HostSpec, OrchestratorEvent, service_to_daemon_types, \
+    NODE_PROXY_REPORT_KEYS
 from cephadm.services.cephadmservice import CephadmDaemonDeploySpec
-from mgr_util import parse_combined_pem_file
+from ceph.deployment.tls_utils import SSLConfigException, parse_tls_pem_bundle
 
 from .utils import get_node_proxy_status_value, resolve_ip, SpecialHostLabels
 from .migrations import queue_migrate_nfs_spec, queue_migrate_rgw_spec
@@ -489,7 +490,21 @@ class SpecStore():
                 else:
                     cert_str = rgw_cert
                 assert isinstance(cert_str, str)
-                cert, key = parse_combined_pem_file(cert_str)
+                # parse_tls_pem_bundle is the canonical parser for any TLS PEM
+                # bundle (plain cert, cert+key, or fullchain with intermediates)
+                # — it preserves the full chain and validates key/cert match.
+                # Explicitly typed Optional[str]: this name is reused further
+                # down in this function (nvmeof branch) with Optional values,
+                # and Python/mypy give a single type to a name across the
+                # whole function body, not per if/elif block.
+                cert: Optional[str]
+                key: Optional[str]
+                try:
+                    cert, key = parse_tls_pem_bundle(cert_str)
+                except SSLConfigException as exc:
+                    cert, key = '', ''
+                    # Never log cert_str — it may contain private key material.
+                    logger.error(f'Cannot parse RGW certificate PEM: {exc}')
                 if cert and key:
                     self.mgr.cert_mgr.save_cert(
                         'rgw_ssl_cert',
@@ -502,7 +517,8 @@ class SpecStore():
                         service_name=rgw_spec.service_name(),
                         user_made=True)
                 else:
-                    logger.error(f'Cannot parse the rgw certificate {cert_str}.')
+                    # Never log cert_str — it may contain private key material.
+                    logger.error('Cannot parse the rgw certificate: missing certificate or key.')
         elif spec.service_type == 'iscsi':
             iscsi_spec = cast(IscsiServiceSpec, spec)
             if iscsi_spec.ssl_cert:
@@ -1538,6 +1554,20 @@ class HostCache():
         daemons = list(self.daemons[host].values()) if host else self._get_daemons()
         return [d for d in daemons if d.daemon_type in service_to_daemon_types(service_type)]
 
+    def get_daemons_by_daemon_type(self, daemon_type: str, host: str = '') -> List[orchestrator.DaemonDescription]:
+        """Return all daemons whose ``daemon_type`` matches *daemon_type*.
+
+        Unlike ``get_daemons_by_type()`` which accepts a *service* type
+        and maps it through ``service_to_daemon_types()``, this method
+        filters directly on ``DaemonDescription.daemon_type``.  This is
+        safe for compound service daemon types like ``haproxy`` and
+        ``keepalived`` which have no corresponding service-type key.
+        """
+        if host:
+            host = normalize_hostname(host)
+        daemons = list(self.daemons[host].values()) if host else self._get_daemons()
+        return [d for d in daemons if d.daemon_type == daemon_type]
+
     def get_daemons_by_types(self, daemon_types: List[str]) -> List[str]:
         daemon_names = []
         for daemon_type in daemon_types:
@@ -1881,10 +1911,15 @@ class NodeProxyCache:
         if hostname is None:
             return list(self.data.keys())
         if hostname not in self.data:
-            raise OrchestratorError(
+            raise HardwareNoReport(
                 f"Host '{hostname}' has no node-proxy data (unknown host or node-proxy not running)."
             )
         return [hostname]
+
+    def list_hosts(self) -> List[str]:
+        # Returns hosts with a complete node-proxy report; no blobs loaded.
+        return sorted(host for host, report in self.data.items()
+                      if all(key in report for key in NODE_PROXY_REPORT_KEYS))
 
     def fullreport(self, **kw: Any) -> Dict[str, Any]:
         """
@@ -1969,10 +2004,8 @@ class NodeProxyCache:
         _result = {}
 
         for host in hosts:
-            try:
-                _result[host] = self.data[host]['status'][endpoint]
-            except KeyError:
-                raise KeyError(f'Invalid host {host} or component {endpoint}.')
+            status = self.data[host].get('status', {})
+            _result[host] = status.get(endpoint, {})
         return _result
 
     def firmware(self, **kw: Any) -> Dict[str, Any]:
@@ -2125,13 +2158,14 @@ class AgentCache():
         return True
 
     def agent_config_successfully_delivered(self, daemon_spec: CephadmDaemonDeploySpec) -> None:
-        # agent successfully received new config (HTTP ACK or successful SSH
+        # Agent successfully received new config (HTTP ACK or successful SSH
         # deploy/reconfig). Only call this after confirmed delivery so
         # last_deps tracks what the agent actually has.
+        # Agent_timestamp get refreshed in handle_metadata(). This HTTP/SSH
+        # config delivery means the agent got new deps, not that it is reporting.
         assert daemon_spec.daemon_type == 'agent'
         self.update_agent_config_deps(
             daemon_spec.host, daemon_spec.deps, datetime_now())
-        self.agent_timestamp[daemon_spec.host] = datetime_now()
         self.agent_counter[daemon_spec.host] = 1
         self.save_agent(daemon_spec.host)
         self.mgr.log.debug(

@@ -2,6 +2,7 @@
 
 import argparse
 import datetime
+import importlib
 import ipaddress
 import io
 import json
@@ -53,6 +54,7 @@ from cephadmlib.constants import (
     DATA_DIR_MODE,
     DATEFMT,
     DEFAULT_RETRY,
+    BOOTSTRAP_MGR_MODULE_LOAD_RETRY,
     DEFAULT_TIMEOUT,
     LATEST_STABLE_RELEASE,
     LOGROTATE_DIR,
@@ -99,6 +101,7 @@ from cephadmlib.container_engines import (
 )
 from cephadmlib.data_utils import (
     dict_get_join,
+    parse_ini_section,
     get_legacy_daemon_fsid,
     is_fsid,
     normalize_image_digest,
@@ -203,7 +206,7 @@ from cephadmlib.cluster_ops import (
 )
 from cephadmlib.firewalld import Firewalld, update_firewalld
 from cephadmlib import templating
-from cephadmlib.daemons.ceph import get_ceph_mounts_for_type, ceph_daemons
+from cephadmlib.daemons.ceph import get_ceph_mounts_for_type, ceph_daemons, update_osd_bluestore_affinity
 from cephadmlib.daemons import (
     Ceph,
     CephExporter,
@@ -313,6 +316,57 @@ def is_available(ctx, what, func):
         logger.info('%s not available, waiting (%s/%s)...'
                     % (what, num, retry))
 
+        num += 1
+        time.sleep(2)
+
+
+def wait_for_mgr_modules_loaded(
+    cli: Callable,
+    module_names: Sequence[str],
+) -> None:
+    """
+    Wait until the given mgr modules are loaded in the active mgr.
+
+    Enabling a module updates the mgrmap before the active mgr finishes
+    loading Python modules.  Bootstrap should not run orchestrator commands
+    until orchestrator is out of pending_modules.
+
+    Uses up to BOOTSTRAP_MGR_MODULE_LOAD_RETRY waits of 2 seconds each
+    (~90 seconds total).  If modules are still pending when the limit is
+    reached, log a warning and return so bootstrap can continue; later orch
+    commands may still fail with a clearer error.
+    """
+    names = set(module_names)
+    label = 'mgr modules %s loaded' % ','.join(sorted(names))
+    retry = BOOTSTRAP_MGR_MODULE_LOAD_RETRY
+    wait_seconds = retry * 2
+    still_pending = names
+    logger.info('Waiting for %s...' % label)
+    num = 1
+    while True:
+        try:
+            out = cli(
+                ['tell', 'mgr', 'mgr_status'],
+                verbosity=CallVerbosity.QUIET_UNLESS_ERROR,
+            )
+            pending = set(json.loads(out).get('pending_modules', []))
+            still_pending = names & pending
+            if not still_pending:
+                logger.info('%s is available' % label)
+                return
+        except Exception as e:
+            logger.debug('tell mgr mgr_status failed: %s' % e)
+
+        if num > retry:
+            logger.warning(
+                '%s not available after %s tries (~%s seconds); '
+                'continuing bootstrap anyway (still pending: %s)'
+                % (label, retry, wait_seconds,
+                   ','.join(sorted(still_pending)) or 'unknown'))
+            return
+
+        logger.info('%s not available, waiting (%s/%s)...'
+                    % (label, num, retry))
         num += 1
         time.sleep(2)
 
@@ -675,8 +729,21 @@ def create_daemon_dirs(
             and key_path_exists
             and key_path_content != keyring
         ):
-            # need to update keyring with ceph-bluestore-tool
-            update_bluestore_label_osd_keyring = True
+            # The raw keyring strings differ, but the difference may only be
+            # caps (e.g. existing keyring has no caps while the new one does).
+            # Extract just the bare key value from both sides and only trigger
+            # the bluestore-label update when the key itself has changed.
+            existing_key = parse_ini_section(key_path_content, ident.daemon_name, 'key')
+            new_key = parse_ini_section(keyring, ident.daemon_name, 'key')
+            if existing_key and new_key and existing_key != new_key:
+                # need to update keyring with ceph-bluestore-tool
+                update_bluestore_label_osd_keyring = True
+            else:
+                logger.debug(
+                    'OSD keyring key value unchanged (only caps differ); '
+                    'skipping bluestore-label keyring update for %s',
+                    ident.daemon_id,
+                )
         with write_new(keyring_path, owner=(uid, gid)) as f:
             f.write(keyring)
         if update_bluestore_label_osd_keyring:
@@ -730,6 +797,12 @@ def create_daemon_dirs(
             data_dir_root = ident.data_dir(ctx.data_dir)
             config_dir = 'etc/node-exporter'
             makedirs(os.path.join(data_dir_root, config_dir), uid, gid, 0o755)
+            recursive_chown(os.path.join(data_dir_root, 'etc'), uid, gid)
+        elif daemon_type == 'pushgateway':
+            data_dir_root = ident.data_dir(ctx.data_dir)
+            config_dir = 'etc/pushgateway'
+            makedirs(os.path.join(data_dir_root, config_dir), uid, gid, 0o755)
+            makedirs(os.path.join(data_dir_root, 'data'), uid, gid, 0o755)
             recursive_chown(os.path.join(data_dir_root, 'etc'), uid, gid)
 
         # populate the config directory for the component from the config-json
@@ -1107,6 +1180,262 @@ def _avail_bytes(ctx: CephadmContext, path: str) -> int:
     return int(lines[1])
 
 
+def _read_metrics_push_endpoint(path: str) -> Dict[str, str]:
+    saved: Dict[str, str] = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or '=' not in line:
+                    continue
+                key, value = line.split('=', 1)
+                saved[key] = value
+    except FileNotFoundError:
+        return {}
+    return saved
+
+
+def _metrics_push_target_changed(
+    saved: Dict[str, str],
+    pushgateway_url: str,
+    zone_name: str,
+) -> bool:
+    # No saved push means there is nothing to drop. Disable uses
+    # force_delete so it does not depend on this comparison.
+    if not saved.get('endpoint'):
+        return False
+    return (
+        saved.get('pushgateway_url', '') != pushgateway_url
+        or saved.get('zone_name', '') != zone_name
+    )
+
+
+def _delete_pushgateway_group(
+    ctx: CephadmContext,
+    ident: 'DaemonIdentity',
+    endpoint: str,
+) -> bool:
+    # 404 means the group is already gone. Pushgateway returns 202 on
+    # delete. A failure must not abort reconfig; the caller keeps the
+    # endpoint file so a later reconfig or push can retry.
+    if not endpoint:
+        return True
+    data_dir = ident.data_dir(ctx.data_dir)
+    cert_names = (
+        'metrics-push-ca.pem',
+        'metrics-push.crt',
+        'metrics-push.key',
+    )
+    have_certs = all(
+        os.path.exists(os.path.join(data_dir, name)) for name in cert_names
+    )
+    engine = getattr(getattr(ctx, 'container_engine', None), 'path', '')
+    cid = ''
+    if engine:
+        for name in (ident.container_name, ident.legacy_container_name):
+            out, _, code = call(
+                ctx,
+                [engine, 'ps', '-q', '--filter', f'name={name}'],
+                verbosity=CallVerbosity.DEBUG,
+                timeout=30,
+            )
+            if code != 0:
+                continue
+            ids = [line.strip() for line in out.splitlines() if line.strip()]
+            if ids:
+                cid = ids[0]
+                break
+    cert_dir = (
+        f'/var/lib/ceph/radosgw/ceph-rgw.{ident.daemon_id}' if cid else data_dir
+    )
+    cmd = [
+        'curl', '-sS', '-o', '/dev/null', '-w', '%{http_code}',
+        '-X', 'DELETE',
+    ]
+    if have_certs:
+        cmd.extend([
+            '--cacert', os.path.join(cert_dir, cert_names[0]),
+            '--cert', os.path.join(cert_dir, cert_names[1]),
+            '--key', os.path.join(cert_dir, cert_names[2]),
+        ])
+    cmd.append(endpoint)
+    if cid and engine:
+        cmd = [engine, 'exec', cid, *cmd]
+    out, err, code = call(
+        ctx, cmd, verbosity=CallVerbosity.DEBUG, timeout=30,
+    )
+    http = out.split()[-1] if out.split() else ''
+    if http in ('200', '202', '404'):
+        return True
+    detail = err.strip().replace('\n', ' ')[:200]
+    logger.warning(
+        f'failed to delete pushgateway group {endpoint} for '
+        f'{ident.daemon_name} (http={http!r} rc={code}'
+        f'{": " + detail if detail else ""})'
+    )
+    return False
+
+
+def _retire_metrics_push_timer(
+    ctx: CephadmContext,
+    ident: 'DaemonIdentity',
+    desired: Optional[Dict[str, Any]],
+    force_delete: bool,
+) -> None:
+    unit_id = f'metrics-push@{ident.daemon_type}.{ident.daemon_id}'
+    # Stop the timer before deleting so an in-flight push cannot
+    # rewrite the group we just removed.
+    systemd_unit.remove_timer_unit(ctx, ident.fsid, unit_id)
+    data_dir = ident.data_dir(ctx.data_dir)
+    path = os.path.join(data_dir, 'metrics-push.endpoint')
+    saved = _read_metrics_push_endpoint(path)
+    if not saved.get('endpoint'):
+        return
+    changed = False
+    if desired is not None:
+        changed = _metrics_push_target_changed(
+            saved,
+            str(desired.get('pushgateway_url', '')),
+            str(desired.get('zone_name', '')),
+        )
+    if force_delete or changed:
+        endpoint = saved.get('endpoint', '')
+        if endpoint and _delete_pushgateway_group(ctx, ident, endpoint):
+            unlink_file(path, missing_ok=True)
+            logger.info(
+                f'Removed pushgateway group {endpoint} for {ident.daemon_name}'
+            )
+        elif endpoint:
+            # Keep the file so the next reconfig or push can retry.
+            logger.warning(
+                f'Leaving {path} in place so the pushgateway group for '
+                f'{ident.daemon_name} can be deleted on a later reconfig'
+            )
+        return
+    if desired is not None:
+        # Same target on a daemon that is no longer elected: handoff.
+        # The new exporter replaces the group on its next push.
+        logger.debug(
+            f'{ident.daemon_name}: keeping pushgateway group across '
+            f'metrics-push handoff'
+        )
+
+
+def _deploy_metrics_push_timer(
+    ctx: CephadmContext,
+    ident: 'DaemonIdentity',
+    metrics_push: Dict[str, Any],
+) -> None:
+    """Set up a systemd timer that periodically pushes RGW bucket usage
+    metrics to pushgateway via rgw-export-bucket-usage."""
+    pushgateway_url = str(metrics_push.get('pushgateway_url', ''))
+    zone_name = str(metrics_push.get('zone_name', ''))
+    interval = int(metrics_push.get('interval', 3600))
+    timeout = int(metrics_push.get('timeout', 300))
+
+    if not pushgateway_url:
+        logger.warning('metrics_push enabled but no pushgateway_url provided, skipping timer')
+        return
+
+    data_dir = ident.data_dir(ctx.data_dir)
+    unit_id = f'metrics-push@{ident.daemon_type}.{ident.daemon_id}'
+    endpoint_path = os.path.join(data_dir, 'metrics-push.endpoint')
+    saved_endpoint = _read_metrics_push_endpoint(endpoint_path)
+    if _metrics_push_target_changed(saved_endpoint, pushgateway_url, zone_name):
+        systemd_unit.remove_timer_unit(ctx, ident.fsid, unit_id)
+        endpoint = saved_endpoint.get('endpoint', '')
+        if endpoint and _delete_pushgateway_group(ctx, ident, endpoint):
+            unlink_file(endpoint_path, missing_ok=True)
+            logger.info(
+                f'Removed pushgateway group {endpoint} for {ident.daemon_name}'
+            )
+        elif endpoint:
+            logger.warning(
+                f'Leaving {endpoint_path} in place so the pushgateway group '
+                f'for {ident.daemon_name} can be deleted on a later reconfig'
+            )
+
+    # The endpoint URL expected by rgw-export-bucket-usage includes the job path
+    endpoint = f'{pushgateway_url}/metrics/job/rgw-bucket-usage'
+
+    container_name = ident.container_name
+    legacy_container_name = ident.legacy_container_name
+    script_path = os.path.join(data_dir, 'metrics-push.run')
+    status_file = os.path.join(data_dir, 'metrics-push.status')
+
+    # The RGW container only has the daemon keyring, not the admin keyring.
+    # CEPH_ARGS lets radosgw-admin authenticate with the daemon keyring.
+    daemon_name = f'client.rgw.{ident.daemon_id}'
+    keyring_path = f'/var/lib/ceph/radosgw/ceph-rgw.{ident.daemon_id}/keyring'
+    ceph_args = f'-n {daemon_name} -k {keyring_path}'
+
+    # Build the zone-id resolution command.  If a zone name was provided in
+    # the spec, query that specific zone, otherwise query the default zone.
+    if zone_name:
+        zone_get_cmd = f'radosgw-admin zone get --rgw-zone {shlex.quote(zone_name)}'
+    else:
+        zone_get_cmd = 'radosgw-admin zone get'
+
+    # When secure_monitoring_stack is enabled, write TLS certs to the data
+    # directory (which is mounted into the RGW container) so curl can
+    # authenticate with pushgateway.
+    pushgateway_args = ''
+    root_cert = metrics_push.get('root_cert', '')
+    client_cert = metrics_push.get('client_cert', '')
+    client_key = metrics_push.get('client_key', '')
+    if root_cert and client_cert and client_key:
+        for fname, content in [('metrics-push-ca.pem', root_cert),
+                               ('metrics-push.crt', client_cert),
+                               ('metrics-push.key', client_key)]:
+            fpath = os.path.join(data_dir, fname)
+            with write_new(fpath, owner=None, perms=0o600) as f:
+                f.write(content)
+        # cert paths inside the container
+        cdata_dir = f'/var/lib/ceph/radosgw/ceph-rgw.{ident.daemon_id}'
+        pushgateway_args = (
+            f'--cacert {cdata_dir}/metrics-push-ca.pem '
+            f'--cert {cdata_dir}/metrics-push.crt '
+            f'--key {cdata_dir}/metrics-push.key'
+        )
+
+    # generate the bash script that exec's into the RGW container
+    engine = ctx.container_engine.path
+    script = templating.render(
+        ctx,
+        templating.Templates.metrics_push_run,
+        status_file=status_file,
+        engine=engine,
+        container_name=container_name,
+        legacy_container_name=legacy_container_name,
+        ceph_args=ceph_args,
+        zone_get_cmd=zone_get_cmd,
+        endpoint=endpoint,
+        endpoint_file=endpoint_path,
+        pushgateway_url=pushgateway_url,
+        zone_name=zone_name,
+        pushgateway_args=pushgateway_args,
+        timeout=timeout,
+    )
+    with write_new(script_path, owner=None, perms=0o755) as f:
+        f.write(script)
+
+    logger.info(
+        f'Installing metrics push timer for {ident.daemon_name} '
+        f'(interval={interval}s, pushgateway={pushgateway_url})'
+    )
+    # install a systemd timer to run the script periodically
+    systemd_unit.install_timer_unit(
+        ctx,
+        fsid=ident.fsid,
+        unit_id=unit_id,
+        job_description=f'RGW metrics push for {ident.daemon_name}',
+        script_path=script_path,
+        interval_sec=interval,
+        timeout_sec=timeout,
+        randomized_delay_sec=min(60, interval // 10),
+    )
+
+
 def deploy_daemon(
     ctx: CephadmContext,
     ident: 'DaemonIdentity',
@@ -1193,6 +1522,19 @@ def deploy_daemon(
                     d3n_state(ctx, data_dir, D3NStateAction.WRITE, d3n, uid, gid)
                 except Exception as e:
                     logger.warning(f'[D3N] failed to persist D3N state in {data_dir}: {e}')
+
+            metrics_push = config_json.get('metrics_push')
+            if metrics_push:
+                assert isinstance(metrics_push, dict)
+                _deploy_metrics_push_timer(ctx, ident, metrics_push)
+            else:
+                target = config_json.get('metrics_push_target')
+                _retire_metrics_push_timer(
+                    ctx,
+                    ident,
+                    desired=target if isinstance(target, dict) else None,
+                    force_delete=bool(config_json.get('metrics_push_cleanup')),
+                )
 
     # only write out unit files and start daemon
     # with systemd if this is not a reconfig
@@ -1338,6 +1680,9 @@ def deploy_daemon_units(
             _osd_unit_poststop_commands(ctx, ident, osd_fsid)
         )
     if ident.daemon_type == CephIscsi.daemon_type:
+        # Load target_core_user so rbd-target-api can contact the API (required on
+        # some distros e.g. Fedora 43 where it is in kernel-modules-extra).
+        pre_start_commands.append(CephIscsi.shell_load_target_core_user())
         pre_start_commands.append(
             CephIscsi.configfs_mount_umount(data_dir, mount=True)
         )
@@ -1733,6 +2078,10 @@ class CephadmAgent(DaemonForm):
                 self.loop_interval = int(config['refresh_period'])
                 self.starting_port = int(config['listener_port'])
                 self.host = config['host']
+                # Older agent.json files do not contain this field. Keep the
+                # existing image inference fallback for upgrade compatibility.
+                if 'container_image' in config:
+                    self.ctx.image = config['container_image'] or None
                 use_lsm = config['device_enhanced_scan']
         except Exception as e:
             self.shutdown()
@@ -2044,26 +2393,25 @@ def command_agent(ctx: CephadmContext) -> None:
 @executes_early
 def command_version(ctx):
     # type: (CephadmContext) -> int
-    import importlib
     import zipimport
     import zipfile
     import types
+    from cephadmlib.agent import _load_version_module
 
     vmod: Optional[types.ModuleType]
     zmod: Optional[types.ModuleType]
+
+    # Use the shared helper to locate _cephadmmeta.version or _version.
+    vmod = _load_version_module()  # type: ignore[assignment]
+
+    # The zmod path is only needed for the verbose zipimport output below.
+    # Try _cephadmmeta.version first (already loaded by vmod if successful),
+    # then fall back to the outer _cephadmmeta package for the loader.
     try:
-        vmod = importlib.import_module('_cephadmmeta.version')
-        zmod = vmod
+        zmod = importlib.import_module('_cephadmmeta.version')
     except ImportError:
-        vmod = zmod = None
-    if vmod is None:
-        # fallback to earlier location
-        try:
-            vmod = importlib.import_module('_version')
-        except ImportError:
-            pass
+        zmod = None
     if zmod is None:
-        # fallback to outer package, for zip import module
         try:
             zmod = importlib.import_module('_cephadmmeta')
         except ImportError:
@@ -2144,6 +2492,7 @@ def _pull_image(ctx, image, insecure=False):
         'error creating read-write layer with ID',
         'net/http: TLS handshake timeout',
         'Digest did not match, expected',
+        'failed to copy: httpReadSeeker: failed open: failed to do request',
     ]
 
     cmd = pull_command(ctx, image, insecure=insecure)
@@ -2202,6 +2551,18 @@ def get_image_info_from_inspect(out, image):
 ##################################
 
 
+def _check_mon_ip_vs_public_network(mon_ip: str, public_network: str) -> None:
+    if not ip_in_subnets(mon_ip, public_network):
+        raise Error(f'The provided --mon-ip {mon_ip} does not belong to any public_network(s) {public_network}')
+
+
+def _check_mon_addrv_vs_public_network(mon_addrv: str, public_network: str) -> None:
+    addrv_args = parse_mon_addrv(mon_addrv)
+    for addrv in addrv_args:
+        if not ip_in_subnets(addrv.ip, public_network):
+            raise Error(f'The provided --mon-addrv {addrv.ip} ip does not belong to any public_network(s) {public_network}')
+
+
 def get_public_net_from_cfg(ctx: CephadmContext) -> Optional[str]:
     """Get mon public network from configuration file."""
     cp = read_config(ctx.config)
@@ -2230,18 +2591,91 @@ def get_public_net_from_cfg(ctx: CephadmContext) -> Optional[str]:
     if not valid_public_net:
         raise Error(f'None of the public CIDR network(s) {configured_subnets} (from -c conf file) is configured locally.')
 
-    # Ensure public_network is compatible with the provided mon-ip (or mon-addrv)
+    # Ensure public_network is compatible with the provided mon address (--mon-ip, --mon-addrv, or --mon-net)
     if ctx.mon_ip:
-        if not ip_in_subnets(ctx.mon_ip, public_network):
-            raise Error(f'The provided --mon-ip {ctx.mon_ip} does not belong to any public_network(s) {public_network}')
+        _check_mon_ip_vs_public_network(ctx.mon_ip, public_network)
     elif ctx.mon_addrv:
-        addrv_args = parse_mon_addrv(ctx.mon_addrv)
-        for addrv in addrv_args:
-            if not ip_in_subnets(addrv.ip, public_network):
-                raise Error(f'The provided --mon-addrv {addrv.ip} ip does not belong to any public_network(s) {public_network}')
+        _check_mon_addrv_vs_public_network(ctx.mon_addrv, public_network)
 
     logger.debug(f'Using mon public network from configuration file {public_network}')
     return public_network
+
+
+def _parse_network(
+    net_str: str
+) -> Optional[Union[ipaddress.IPv4Network, ipaddress.IPv6Network]]:
+    """
+    Parse a CIDR string into a network object.
+
+    :param net_str: CIDR network string (e.g., '192.168.1.0/24' or 'fd00::/64')
+    :return: IPv4Network or IPv6Network on success, None if the string is not a valid CIDR
+    """
+    try:
+        return ipaddress.ip_network(net_str)
+    except ValueError:
+        return None
+
+
+def _parse_ip(
+    ip_str: str
+) -> Optional[Union[ipaddress.IPv4Address, ipaddress.IPv6Address]]:
+    """
+    Parse an IP address string into an address object.
+
+    :param ip_str: IP address string (e.g., '192.168.1.1' or 'fd00::1')
+    :return: IPv4Address or IPv6Address on success, None if the string is not a valid IP address
+    """
+    try:
+        return ipaddress.ip_address(ip_str)
+    except ValueError:
+        return None
+
+
+def select_ip_from_network(ctx: CephadmContext, network: str) -> str:
+    """
+    Given a CIDR network, select an appropriate IP from local interfaces
+    in that network. Supports both IPv4 and IPv6 networks.
+
+    :param ctx: CephadmContext
+    :param network: CIDR network string (e.g., '192.168.1.0/24' for IPv4 or 'fd00::/64' for IPv6)
+    :return: Selected IP address string (IPv4 unchanged, IPv6 wrapped in brackets)
+    :raises Error: if no suitable IP found in the network or invalid CIDR format
+    """
+    net = _parse_network(network)
+    if net is None:
+        raise Error(f'Invalid network CIDR {network}')
+
+    # local_networks = {'192.168.100.0/24': {'ens3': {'192.168.100.100'}}, 'fe80::/64': {'ens3': {'fe80::5054:ff:fe83:9e8f'}}}
+    local_networks = list_networks(ctx)
+    candidates = []
+    for local_net, ifaces in local_networks.items():
+        local_net_obj = _parse_network(local_net)
+        if local_net_obj is None:
+            logger.debug(f'Skipping invalid local network {local_net}')
+            continue
+        if local_net_obj.version != net.version:
+            logger.debug(f'Skipping local network {local_net} due to IP version mismatch with requested network {network}')
+            continue
+        if not local_net_obj.overlaps(net):
+            logger.debug(f'Skipping local network {local_net} as it does not overlap with requested network {network}')
+            continue
+        for _, ips in ifaces.items():
+            for ip in ips:
+                ip_obj = _parse_ip(ip)
+                if ip_obj is None:
+                    logger.debug(f'Skipping invalid IP address {ip} on local network {local_net}')
+                    continue
+                if ip_obj in net:
+                    candidates.append(ip)
+
+    if not candidates:
+        raise Error(f'No local IP found in network {network}. Local networks: {list(local_networks.keys())}')
+
+    candidates = sorted(set(candidates), key=ipaddress.ip_address)
+    selected_ip = wrap_ipv6(candidates[0]) if is_ipv6(candidates[0]) else candidates[0]
+
+    logger.info(f'Selected IP {selected_ip} from network {network}')
+    return selected_ip
 
 
 def infer_mon_network(ctx: CephadmContext, mon_eps: List[EndPoint]) -> Optional[str]:
@@ -2288,8 +2722,12 @@ def prepare_mon_addresses(ctx: CephadmContext) -> Tuple[str, bool, Optional[str]
         ipv6 = ctx.mon_addrv.count('[') > 1
         addrv_args = parse_mon_addrv(ctx.mon_addrv)
         mon_addrv = ctx.mon_addrv
-    else:
-        raise Error('must specify --mon-ip or --mon-addrv')
+    elif ctx.mon_net:
+        selected_ip = select_ip_from_network(ctx, ctx.mon_net)
+        ctx.mon_ip = selected_ip
+        ipv6 = is_ipv6(selected_ip)
+        addrv_args = parse_mon_ip(selected_ip)
+        mon_addrv = build_addrv_params(addrv_args)
 
     if addrv_args:
         for end_point in addrv_args:
@@ -2628,18 +3066,21 @@ def prepare_ssh(
 
 
 def enable_cephadm_mgr_module(
-    cli: Callable, wait_for_mgr_restart: Callable
+    cli: Callable,
+    wait_for_mgr_restart: Callable,
 ) -> None:
 
     logger.info('Enabling cephadm module...')
     cli(['mgr', 'module', 'enable', 'cephadm'])
-    wait_for_mgr_restart()
+    wait_for_mgr_restart(['cephadm'])
     # https://tracker.ceph.com/issues/67969
+    # https://tracker.ceph.com/issues/77148
     # luckily `ceph mgr module enable <module>` returns
     # a zero rc when the module is already enabled so
     # this is no issue even if it is unnecessary
     logger.info('Verifying orchestrator module is enabled...')
     cli(['mgr', 'module', 'enable', 'orchestrator'])
+    wait_for_mgr_restart(['orchestrator'])
     logger.info('Setting orchestrator backend to cephadm...')
     cli(['orch', 'set', 'backend', 'cephadm'])
 
@@ -2657,7 +3098,7 @@ def prepare_dashboard(
     # configuring dashboard parameters
     logger.info('Enabling the dashboard module...')
     cli(['mgr', 'module', 'enable', 'dashboard'])
-    wait_for_mgr_restart()
+    wait_for_mgr_restart(['dashboard'])
 
     # dashboard crt and key
     if ctx.dashboard_key and ctx.dashboard_crt:
@@ -3113,7 +3554,9 @@ def command_bootstrap(ctx):
             cli(['config', 'set', 'mgr', ldkey, value, '--force'])
 
     # wait for mgr to restart (after enabling a module)
-    def wait_for_mgr_restart() -> None:
+    def wait_for_mgr_restart(
+        module_names: Optional[Sequence[str]] = None,
+    ) -> None:
         # first get latest mgrmap epoch from the mon.  try newer 'mgr
         # stat' command first, then fall back to 'mgr dump' if
         # necessary
@@ -3136,6 +3579,8 @@ def command_bootstrap(ctx):
                 logger.debug('tell mgr mgr_status failed: %s' % e)
                 return False
         is_available(ctx, 'mgr epoch %d' % epoch, mgr_has_latest_epoch)
+        if module_names:
+            wait_for_mgr_modules_loaded(cli, module_names)
 
     enable_cephadm_mgr_module(cli, wait_for_mgr_restart)
 
@@ -4299,6 +4744,8 @@ def command_rm_daemon(ctx):
 
     if ident.daemon_type == 'rgw':
         d3n_state(ctx, data_dir, action=D3NStateAction.CLEANUP)
+        timer_unit_id = f'metrics-push@{ident.daemon_type}.{ident.daemon_id}'
+        systemd_unit.remove_timer_unit(ctx, ctx.fsid, timer_unit_id)
 
     if ident.daemon_type in ['mon', 'osd', 'prometheus'] and \
        not ctx.force_delete_data:
@@ -4371,6 +4818,30 @@ def _zap_osds(ctx: CephadmContext) -> None:
             # TODO: we need to map the lv_names back to device paths (the vg
             # id isn't part of the output here!)
             logger.warning(f'Not zapping LVs (not implemented): {lv_names}')
+
+    c = get_ceph_volume_container(ctx,
+                                  args=['raw', 'list', '--format', 'json'],
+                                  volume_mounts=mounts,
+                                  envs=ctx.env)
+    out, err, code = call_throws(ctx, c.run_cmd())
+    if code:
+        raise Error('failed to list raw osds')
+    try:
+        raw_ls = json.loads(out)
+    except ValueError as e:
+        raise Error(f'Invalid JSON in ceph-volume raw list: {e}')
+    if not isinstance(raw_ls, dict):
+        raise Error('Invalid JSON in ceph-volume raw list: expected object')
+
+    seen = set()
+    for details in raw_ls.values():
+        if not isinstance(details, dict) or details.get('ceph_fsid') != ctx.fsid:
+            continue
+        for key in ('device', 'device_db', 'device_wal'):
+            path = details.get(key)
+            if path and path not in seen:
+                seen.add(path)
+                _zap(ctx, path)
 
 
 def command_zap_osds(ctx: CephadmContext) -> None:
@@ -4449,6 +4920,14 @@ def _rm_cluster(ctx: CephadmContext, keep_logs: bool, zap_osds: bool) -> None:
     unlink_file(unit_dir / f'ceph-{ctx.fsid}@.service', missing_ok=True)
     unlink_file(unit_dir / f'ceph-{ctx.fsid}.target', missing_ok=True)
     shutil.rmtree(unit_dir / f'ceph-{ctx.fsid}.target.wants', ignore_errors=True)
+    # `systemctl edit` creates <unit>.d directories that match this glob.
+    # unlink() raises IsADirectoryError on a real directory and would abort
+    # rm-cluster before the cluster data is deleted.
+    for p in unit_dir.glob(f'ceph-{ctx.fsid}-metrics-push@*'):
+        if p.is_dir() and not p.is_symlink():
+            shutil.rmtree(p)
+        else:
+            unlink_file(p, missing_ok=True)
 
     # rm data
     shutil.rmtree(Path(ctx.data_dir) / ctx.fsid, ignore_errors=True)
@@ -4743,13 +5222,21 @@ def update_service_for_daemon(ctx: CephadmContext,
     # check if all the daemon names are valid
     if not set(update_daemons).issubset(set(available_daemons)):
         raise Error(f'Error EINVAL: one or more daemons of {update_daemons} does not exist on this host')
+    # osdspec_affinity stores the bare service id (e.g. "foobar"), not the
+    # full service name (e.g. "osd.foobar"), consistent with how ceph-volume
+    # writes it at OSD creation time via CEPH_VOLUME_OSDSPEC_AFFINITY.
+    _, _, service_id = ctx.service_name.partition('.')
+    if not service_id:
+        service_id = ctx.service_name
     for name in update_daemons:
         path = os.path.join(ctx.data_dir, ctx.fsid, name, 'unit.meta')
         update_meta_file(path, data)
+        update_osd_bluestore_affinity(ctx, name, service_id)
         print(f'Successfully updated daemon {name} with service {ctx.service_name}')
 
 
 @infer_fsid
+@infer_image
 def command_update_osd_service(ctx: CephadmContext) -> int:
     """update service for provided daemon"""
     update_daemons = [f'osd.{osd_id}' for osd_id in ctx.osd_ids.split(',')]
@@ -5617,13 +6104,16 @@ def _get_parser():
         '--mon-id',
         required=False,
         help='mon id (default: local hostname)')
-    group = parser_bootstrap.add_mutually_exclusive_group()
+    group = parser_bootstrap.add_mutually_exclusive_group(required=True)
     group.add_argument(
         '--mon-addrv',
         help='mon IPs (e.g., [v2:localipaddr:3300,v1:localipaddr:6789])')
     group.add_argument(
         '--mon-ip',
         help='mon IP')
+    group.add_argument(
+        '--mon-net',
+        help='mon network CIDR (e.g., 192.168.1.0/24) - will select first available IP from network')
     parser_bootstrap.add_argument(
         '--mgr-id',
         required=False,

@@ -7,8 +7,10 @@ Vcs-Browser: https://github.com/ceph/ceph
 Maintainer: Ceph Maintainers <ceph-maintainers@ceph.io>
 Uploaders: Ken Dreyer <kdreyer@redhat.com>,
            Alfredo Deza <adeza@redhat.com>,
-Build-Depends: automake,
+Build-Depends: autoconf-archive,
+               automake,
                bison,
+               cargo,
                cmake (>= 3.10.2),
                cpio,
                cython3,
@@ -17,6 +19,7 @@ Build-Depends: automake,
                dh-exec,
                dh-python,
                flex,
+               foundationdb-clients (>= 7.3) <pkg.ceph.fdb>,
                git,
                golang,
                gperf,
@@ -81,9 +84,9 @@ Build-Depends: automake,
                libthrift-dev (>= 0.13.0),
                libyaml-cpp-dev (>= 0.6),
                libzstd-dev <pkg.ceph.check>,
-               libpmemobj-dev (>= 1.8) <pkg.ceph.pmdk>,
                libprotobuf-dev,
                libxsimd-dev <!pkg.ceph.arrow>,
+               meson <pkg.ceph.crimson>,
                ninja-build,
                nlohmann-json3-dev,
                patch,
@@ -102,6 +105,8 @@ Build-Depends: automake,
                python3-xmltodict <pkg.ceph.check>,
                python3-openssl <pkg.ceph.check>,
                python3-prettytable <pkg.ceph.check>,
+               python3-pyelftools <pkg.ceph.crimson>,
+               python3-tabulate <pkg.ceph.crimson>,
                python3-requests <pkg.ceph.check>,
                python3-scipy <pkg.ceph.check>,
                python3-onelogin-saml2 <pkg.ceph.check>,
@@ -129,6 +134,7 @@ Standards-Version: 4.4.0
 Package: ceph
 Architecture: linux-any
 Depends: ceph-mgr (= ${binary:Version}),
+         ceph-mgr-modules-standard (= ${binary:Version}),
          ceph-mon (= ${binary:Version}),
          ceph-osd (= ${binary:Version}),
 Recommends: ceph-mds (= ${binary:Version}),
@@ -1100,6 +1106,7 @@ Description: debugging symbols for rbd-nbd
 Package: ceph-common
 Architecture: linux-any
 Depends: adduser (>= 3.11),
+         ${fdb:Depends},
          librbd1 (= ${binary:Version}),
          python3-cephfs (= ${binary:Version}),
          python3-ceph-argparse (= ${binary:Version}),
@@ -1458,6 +1465,7 @@ Package: librgw2
 Architecture: linux-any
 Section: libs
 Depends: librados2 (= ${binary:Version}),
+         ${fdb:Depends},
          liblua5.3-0,
          ${misc:Depends},
          ${shlibs:Depends},
@@ -1503,6 +1511,7 @@ Description: RADOS client library (development files)
 Package: radosgw
 Architecture: linux-any
 Depends: ceph-common (= ${binary:Version}),
+         ${fdb:Depends},
          librgw2 (= ${binary:Version}),
          media-types | mime-support,
          ${misc:Depends},

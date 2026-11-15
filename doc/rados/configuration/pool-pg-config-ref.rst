@@ -47,6 +47,7 @@ See :ref:`pg-autoscaler`.
    :language: ini
 
 .. confval:: mon_max_pool_pg_num
+.. confval:: mon_target_pg_per_osd
 .. confval:: mon_pg_stuck_threshold
 .. confval:: mon_pg_warn_min_per_osd
 .. confval:: mon_pg_warn_min_objects
@@ -56,14 +57,22 @@ See :ref:`pg-autoscaler`.
 .. confval:: mon_delta_reset_interval
 .. confval:: osd_crush_chooseleaf_type
 .. confval:: osd_crush_initial_weight
+.. confval:: osd_pool_default_type
 .. confval:: osd_pool_default_crush_rule
 .. confval:: osd_pool_erasure_code_stripe_unit
 .. confval:: osd_pool_default_size
+.. confval:: osd_pool_default_num_zones
+.. confval:: osd_pool_default_zone_failure_domain
+.. confval:: osd_pool_default_osd_failure_domain
+.. confval:: osd_pool_default_root
+.. confval:: osd_pool_default_class
 .. confval:: osd_pool_default_min_size
 .. confval:: osd_pool_default_pg_num
 .. confval:: osd_pool_default_pgp_num
 .. confval:: osd_pool_default_pg_autoscale_mode
 .. confval:: osd_pool_default_flags
+.. confval:: osd_pool_default_flag_bulk
+.. confval:: osd_pool_default_crimson
 .. confval:: osd_max_pgls
 .. confval:: osd_min_pg_log_entries
 .. confval:: osd_max_pg_log_entries

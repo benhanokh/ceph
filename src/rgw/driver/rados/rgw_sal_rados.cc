@@ -16,6 +16,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <string>
+#include <shared_mutex>
 
 #include <unistd.h>
 
@@ -61,12 +62,18 @@
 #include "rgw_rest_user.h"
 #include "rgw_sal.h"
 #include "rgw_sal_rados.h"
+#ifdef WITH_RADOSGW_LANCEDB
+#include "rgw_rest_vector_bucket.h"
+#include "rgw_s3vector.h"
+#include "rgw_s3vector_background.h"
+#endif
 #include "rgw_service.h"
 #include "rgw_tools.h"
 #include "rgw_tracer.h"
 #include "rgw_zone.h"
 #include "rgw_restore.h"
 #include "rgw_multipart_meta_filter.h"
+#include "yield_completion.h"
 
 #include "services/svc_bilog_rados.h"
 #include "services/svc_bi_rados.h"
@@ -138,6 +145,25 @@ static rgw_raw_obj get_owner_buckets_obj(RGWSI_User* svc_user,
     rgw_raw_obj operator()(const rgw_account_id& id) {
       const RGWZoneParams& zone = svc_zone->get_zone_params();
       return rgwrados::account::get_buckets_obj(zone, id);
+    }
+  };
+  return std::visit(visitor{svc_user, svc_zone}, owner);
+}
+
+static rgw_raw_obj get_owner_vector_buckets_obj(RGWSI_User* svc_user,
+                                         RGWSI_Zone* svc_zone,
+                                         const rgw_owner& owner)
+{
+  struct visitor {
+    RGWSI_User* svc_user;
+    RGWSI_Zone* svc_zone;
+
+    rgw_raw_obj operator()(const rgw_user& user) {
+      return svc_user->get_vector_buckets_obj(user);
+    }
+    rgw_raw_obj operator()(const rgw_account_id& id) {
+      const RGWZoneParams& zone = svc_zone->get_zone_params();
+      return rgwrados::account::get_vector_buckets_obj(zone, id);
     }
   };
   return std::visit(visitor{svc_user, svc_zone}, owner);
@@ -631,6 +657,108 @@ int RadosBucket::remove_bypass_gc(int concurrent_max, bool
   return ret;
 }
 
+RadosVectorBucket::~RadosVectorBucket() = default;
+
+int RadosVectorBucket::unlink(const DoutPrefixProvider* dpp, const rgw_owner& owner, optional_yield y, bool update_entrypoint)
+{
+  ldpp_dout(dpp, 20) << "s3vector --- RadosVectorBucket::unlink called" << dendl;
+  librados::Rados& rados = *store->getRados()->get_rados_handle();
+  return store->ctl()->vector_bucket->unlink_bucket(rados, owner, info.bucket,
+                                             y, dpp, update_entrypoint);
+}
+
+int RadosVectorBucket::remove(const DoutPrefixProvider* dpp,
+			bool delete_children,
+			optional_yield y)
+{
+  ldpp_dout(dpp, 20) << "s3vector --- RadosVectorBucket::remove called" << dendl;
+
+#ifdef WITH_RADOSGW_LANCEDB
+  {
+    // the namespace of the vector bucket takes the place of the tenant in its key
+    rgw::s3vector::bucket_namespace_t ns;
+    if (const auto* account_id = std::get_if<rgw_account_id>(&info.owner); account_id) {
+      // the tenant of the vector bucket is the one of the account that owns it
+      RGWAccountInfo account;
+      Attrs account_attrs;
+      RGWObjVersionTracker account_objv;
+      if (const int r = store->load_account_by_id(dpp, y, *account_id, account,
+                                                  account_attrs, account_objv); r < 0) {
+        ldpp_dout(dpp, 1) << "ERROR: failed to load account " << *account_id <<
+          " of s3vector bucket " << info.bucket << ". error: " << r << dendl;
+        return r;
+      }
+      ns.account = *account_id;
+      ns.tenant = account.tenant;
+    } else {
+      ns.tenant = info.bucket.tenant;
+    }
+    // the indexes hold the data of a vector bucket, like the objects of an ordinary
+    // one: they are removed only when the caller asks for it, and prevent the removal
+    // of the vector bucket otherwise
+    const int r = rgw::s3vector::remove_indexes(dpp, store, ns,
+                                                info.bucket.name, delete_children, y);
+    if (r == -ENOENT) {
+      // the backend of the vector bucket does not exist. this happens when the bucket
+      // was created, but its backend was never initialized. the metadata should still
+      // be removed, so that the bucket does not stay around forever
+      ldpp_dout(dpp, 5) << "WARNING: s3vector bucket " << info.bucket <<
+        " has no backend. removing its metadata" << dendl;
+    } else if (r < 0) {
+      return r;
+    }
+    // the data of the vector bucket is gone, and so should be its cached session
+    rgw::s3vector::notify_session_delete(dpp, ns, info.bucket.name);
+  }
+#endif
+
+  // Once no vector indexes remain, remove internal objects and uploads before
+  // dropping the bucket index. A separate S3 backing bucket is left intact.
+  // This is being indicated by the fact the vector bucket is indexless
+  if (!info.is_indexless()) {
+    ListParams params;
+    params.list_versions = true;
+    params.allow_unordered = true;
+    ListResults results;
+    do {
+      results.objs.clear();
+      int r = list(dpp, params, 1000, results, y);
+      if (r < 0) {
+        return r;
+      }
+      for (const auto& obj : results.objs) {
+        rgw_obj_key key(obj.key);
+        r = rgw_remove_object(dpp, store, this, key, y);
+        if (r < 0 && r != -ENOENT) {
+          return r;
+        }
+      }
+    } while (results.is_truncated);
+    int r = abort_multiparts(dpp, store->ctx(), y);
+    if (r < 0) {
+      return r;
+    }
+  }
+
+  RGWObjVersionTracker ot;
+
+  int ret = store->getRados()->delete_vector_bucket(info, ot, y, dpp);
+  if (ret < 0) {
+    ldpp_dout(dpp, -1) << "ERROR: could not remove s3vector bucket " <<
+      info.bucket.name << dendl;
+    return ret;
+  }
+
+  librados::Rados& rados = *store->getRados()->get_rados_handle();
+  ret = store->ctl()->vector_bucket->unlink_bucket(rados, info.owner,
+                                            info.bucket, y, dpp, false);
+  if (ret < 0) {
+    ldpp_dout(dpp, -1) << "ERROR: unable to remove user s3vector bucket information" << dendl;
+  }
+
+  return ret;
+}
+
 int RadosBucket::load_bucket(const DoutPrefixProvider* dpp, optional_yield y)
 {
   int ret;
@@ -657,6 +785,138 @@ int RadosBucket::load_bucket(const DoutPrefixProvider* dpp, optional_yield y)
   return ret;
 }
 
+int RadosVectorBucket::load_bucket(const DoutPrefixProvider* dpp, optional_yield y)
+{
+  ldpp_dout(dpp, 20) << "s3vector --- RadosVectorBucket::load_bucket called" << dendl;
+  int ret;
+
+  RGWObjVersionTracker ep_ot;
+  if (info.bucket.bucket_id.empty()) {
+    ret = store->ctl()->vector_bucket->read_bucket_info(info.bucket, &info, y, dpp,
+				      RGWBucketCtl::BucketInstance::GetParams()
+				      .set_mtime(&mtime)
+				      .set_attrs(&attrs),
+				      &ep_ot);
+  } else {
+    ret  = store->ctl()->vector_bucket->read_bucket_instance_info(info.bucket, &info, y, dpp,
+				      RGWBucketCtl::BucketInstance::GetParams()
+				      .set_mtime(&mtime)
+				      .set_attrs(&attrs));
+  }
+  if (ret != 0) {
+    return ret;
+  }
+
+  bucket_version = ep_ot.read_version;
+
+  return ret;
+}
+
+int RadosVectorBucket::create(const DoutPrefixProvider* dpp,
+                        const CreateParams& params,
+                        optional_yield y)
+{
+  ldpp_dout(dpp, 20) << "s3vector --- RadosVectorBucket::create called" << dendl;
+  rgw_bucket key = get_key();
+  key.marker = params.marker;
+  key.bucket_id = params.bucket_id;
+
+  int ret = store->getRados()->create_vector_bucket(
+      dpp, y, key, params.owner, params.zonegroup_id, params.zone_placement,
+      params.placement_rule, params.attrs,
+      params.quota, params.creation_time, params.index_type,
+      params.index_shards, &bucket_version, info);
+
+  bool existed = false;
+  if (ret == -EEXIST) {
+    existed = true;
+    /* bucket already existed, might have raced with another bucket creation,
+     * or might be partial bucket creation that never completed. Read existing
+     * bucket info, verify that the reported bucket owner is the current user.
+     * If all is ok then update the user's list of buckets.  Otherwise inform
+     * client about a name conflict.
+     */
+    if (info.owner != params.owner) {
+      return -ERR_BUCKET_EXISTS;
+    }
+    // prevent re-creation with different index type or shard count
+    if ((params.index_type && *params.index_type !=
+         info.layout.current_index.layout.type) ||
+        (params.index_shards && *params.index_shards !=
+         info.layout.current_index.layout.normal.num_shards)) {
+      return -ERR_BUCKET_EXISTS;
+    }
+    ret = 0;
+  } else if (ret != 0) {
+    return ret;
+  }
+
+  ret = link(dpp, params.owner, y, true);
+  if (ret && !existed && ret != -EEXIST) {
+    /* if it exists (or previously existed), don't remove it! */
+    ret = unlink(dpp, params.owner, y);
+    if (ret < 0) {
+      ldpp_dout(dpp, 0) << "WARNING: failed to unlink bucket: ret=" << ret
+		       << dendl;
+    }
+  } else if (ret == -EEXIST) {
+    ret = -ERR_BUCKET_EXISTS;
+  } else if (ret == 0) {
+    /* this is to handle the following race condition:
+     * a concurrent DELETE bucket request deletes the bucket entry point and
+     * unlinks it (if the bucket pre-exists) before it's linked in this
+     * bucket creation request. */
+
+    if (existed) {
+      ret = -ERR_BUCKET_EXISTS;
+    }
+
+    RGWBucketEntryPoint ep;
+    RGWObjVersionTracker objv_tracker;
+    int r = store->ctl()->vector_bucket->read_bucket_entrypoint_info(info.bucket,
+                                                            &ep,
+                                                            y,
+                                                            dpp,
+                                                            RGWBucketCtl::Bucket::GetParams()
+                                                            .set_objv_tracker(&objv_tracker));
+    if (r == -ENOENT) {
+      ret = 0;
+
+      ldpp_dout(dpp, 5) << "WARNING: the bucket entry point has been deleted by a concurrent DELETE bucket request."
+                        << " Unlinking the bucket." << dendl;
+      r = unlink(dpp, params.owner, y);
+      if (r < 0) {
+        ldpp_dout(dpp, 0) << "WARNING: failed to unlink bucket: ret=" << r << dendl;
+      }
+    }
+  }
+
+  return ret;
+}
+
+int RadosVectorBucket::link(const DoutPrefixProvider* dpp, const rgw_owner& new_owner, optional_yield y, bool update_entrypoint, RGWObjVersionTracker* objv) {
+  ldpp_dout(dpp, 20) << "s3vector --- RadosVectorBucket::link called" << dendl;
+  RGWBucketEntryPoint ep;
+  ep.bucket = info.bucket;
+  ep.owner = new_owner;
+  ep.creation_time = get_creation_time();
+  ep.linked = true;
+  Attrs ep_attrs;
+  rgw_ep_info ep_data{ep, ep_attrs};
+
+  librados::Rados& rados = *store->getRados()->get_rados_handle();
+  int r = store->ctl()->vector_bucket->link_bucket(rados, new_owner, info.bucket,
+					    get_creation_time(), y, dpp, update_entrypoint,
+					    &ep_data);
+  if (r < 0)
+    return r;
+
+  if (objv)
+    *objv = ep_data.ep_objv;
+
+  return r;
+}
+
 int RadosBucket::read_stats(const DoutPrefixProvider *dpp, optional_yield y,
 			    const bucket_index_layout_generation& idx_layout,
 			    int shard_id, std::string* bucket_ver, std::string* master_ver,
@@ -677,7 +937,12 @@ int RadosBucket::sync_owner_stats(const DoutPrefixProvider *dpp, optional_yield 
                                   RGWBucketEnt* ent)
 {
   librados::Rados& rados = *store->getRados()->get_rados_handle();
-  return store->ctl()->bucket->sync_owner_stats(dpp, rados, info.owner, info, y, ent);
+  // This shared method handles both S3 and vector buckets.
+  auto* ctl = info.is_vector() ? store->ctl()->vector_bucket : store->ctl()->bucket;
+  if (info.is_vector() && info.is_indexless()) {
+    return 0;
+  }
+  return ctl->sync_owner_stats(dpp, rados, info.owner, info, y, ent);
 }
 
 int RadosBucket::check_bucket_shards(const DoutPrefixProvider* dpp,
@@ -782,11 +1047,21 @@ int RadosBucket::chown(const DoutPrefixProvider* dpp,
 int RadosBucket::put_info(const DoutPrefixProvider* dpp, bool exclusive, ceph::real_time _mtime, optional_yield y)
 {
   mtime = _mtime;
-  return store->getRados()->put_bucket_instance_info(info, exclusive, mtime, &attrs, dpp, y);
+  return store->getRados()->put_bucket_instance_info(info, exclusive, mtime, &attrs, dpp, y, store->ctl()->bucket);
+}
+
+int RadosVectorBucket::put_info(const DoutPrefixProvider* dpp, bool exclusive, ceph::real_time _mtime, optional_yield y)
+{
+  mtime = _mtime;
+  return store->getRados()->put_bucket_instance_info(info, exclusive, mtime, &attrs, dpp, y, store->ctl()->vector_bucket);
 }
 
 int RadosBucket::check_empty(const DoutPrefixProvider* dpp, optional_yield y)
 {
+  // Indexless vector buckets have no local objects to inspect.
+  if (info.is_vector() && info.is_indexless()) {
+    return 0;
+  }
   return store->getRados()->check_bucket_empty(dpp, info, y);
 }
 
@@ -808,7 +1083,12 @@ int RadosBucket::merge_and_store_attrs(const DoutPrefixProvider* dpp, Attrs& new
 
 int RadosBucket::try_refresh_info(const DoutPrefixProvider* dpp, ceph::real_time* pmtime, optional_yield y)
 {
-  return store->getRados()->try_refresh_bucket_info(info, pmtime, dpp, y, &attrs);
+  return store->getRados()->try_refresh_bucket_info(info, pmtime, dpp, y, &attrs, store->ctl()->bucket);
+}
+
+int RadosVectorBucket::try_refresh_info(const DoutPrefixProvider* dpp, ceph::real_time* pmtime, optional_yield y)
+{
+  return store->getRados()->try_refresh_bucket_info(info, pmtime, dpp, y, &attrs, store->ctl()->vector_bucket);
 }
 
 int RadosBucket::read_usage(const DoutPrefixProvider *dpp, uint64_t start_epoch, uint64_t end_epoch,
@@ -2489,11 +2769,12 @@ void RadosStore::get_quota(RGWQuota& quota)
     quota.user_quota = svc()->quota->get_user_quota();
 }
 
-void RadosStore::get_ratelimit(RGWRateLimitInfo& bucket_ratelimit, RGWRateLimitInfo& user_ratelimit, RGWRateLimitInfo& anon_ratelimit)
+void RadosStore::get_ratelimit(RGWRateLimitInfo& bucket_ratelimit, RGWRateLimitInfo& user_ratelimit, RGWRateLimitInfo& account_ratelimit, RGWRateLimitInfo& anon_ratelimit)
 {
   bucket_ratelimit = svc()->zone->get_current_period().get_config().bucket_ratelimit;
   user_ratelimit = svc()->zone->get_current_period().get_config().user_ratelimit;
   anon_ratelimit = svc()->zone->get_current_period().get_config().anon_ratelimit;
+  account_ratelimit = svc()->zone->get_current_period().get_config().account_ratelimit;
 }
 
 int RadosStore::set_buckets_enabled(const DoutPrefixProvider* dpp, vector<rgw_bucket>& buckets, bool enabled, optional_yield y)
@@ -2580,6 +2861,9 @@ void RadosStore::register_admin_apis(RGWRESTMgr* mgr)
 {
   mgr->register_resource("user", new RGWRESTMgr_User);
   mgr->register_resource("bucket", new RGWRESTMgr_Bucket);
+#ifdef WITH_RADOSGW_LANCEDB
+  mgr->register_resource("vectorbucket", new RGWRESTMgr_VectorBucket);
+#endif
   /*Registering resource for /admin/metadata */
   mgr->register_resource("metadata", new RGWRESTMgr_Metadata);
   mgr->register_resource("log", new RGWRESTMgr_Log);
@@ -2731,6 +3015,25 @@ int RadosStore::get_obj_head_ioctx(const DoutPrefixProvider *dpp, const RGWBucke
   return rados->get_obj_head_ioctx(dpp, bucket_info, obj, ioctx);
 }
 
+int RadosStore::load_vector_bucket(const DoutPrefixProvider* dpp, const rgw_bucket& b,
+                            std::unique_ptr<VectorBucket>* bucket, optional_yield y) {
+  *bucket = std::make_unique<RadosVectorBucket>(this, b);
+  return (*bucket)->load_bucket(dpp, y);
+}
+
+int RadosStore::list_vector_buckets(const DoutPrefixProvider* dpp,
+			     const rgw_owner& owner, const std::string& ns,
+			     const std::string& marker, const std::string& end_marker,
+			     uint64_t max, BucketList& listing,
+			     optional_yield y) {
+  librados::Rados& rados = *getRados()->get_rados_handle();
+  const rgw_raw_obj& obj = get_owner_vector_buckets_obj(svc()->user, svc()->zone, owner);
+
+  // the namespace takes the place of the tenant in the keys of the vector buckets
+  return rgwrados::buckets::list(dpp, y, rados, obj, ns,
+                                    marker, end_marker, max, listing);
+}
+
 RadosObject::~RadosObject()
 {
   if (rados_ctx_owned)
@@ -2748,7 +3051,7 @@ bool RadosObject::is_sync_completed(const DoutPrefixProvider* dpp,
   }
 
   const auto& log_layout = bucket_info.layout.logs.front();
-  const uint32_t shard_count = num_shards(log_to_index_layout(log_layout));
+  const uint32_t shard_count = num_shards(log_layout);
 
   std::string marker;
   bool truncated;
@@ -2898,6 +3201,34 @@ int RadosObject::load_obj_state(const DoutPrefixProvider* dpp, optional_yield y,
   return ret;
 }
 
+int RadosObject::update_olh(const DoutPrefixProvider* dpp, optional_yield y, uint32_t flags)
+{
+  RGWObjState* s = nullptr;
+  int r = store->getRados()->get_obj_state(dpp, rados_ctx, bucket->get_info(), get_obj(),
+                                           &s, nullptr, false, y);
+  if (r < 0) {
+    ldpp_dout(dpp, 0) << "ERROR: failed to read olh state for obj=" << get_key()
+                      << ": " << cpp_strerror(-r) << dendl;
+    return r;
+  }
+  if (!s->is_olh) {
+    return 0;
+  }
+  auto iter = s->attrset.lower_bound(RGW_ATTR_OLH_PENDING_PREFIX);
+  if (iter == s->attrset.end() ||
+      !boost::algorithm::starts_with(iter->first, RGW_ATTR_OLH_PENDING_PREFIX)) {
+    return 0;
+  }
+  r = store->getRados()->update_olh(dpp, *rados_ctx, s, bucket->get_info(), get_obj(), y,
+                                    nullptr, false, flags & FLAG_LOG_OP);
+  if (r < 0 && r != -ECANCELED) {
+    ldpp_dout(dpp, 0) << "ERROR: failed to apply pending olh log for obj=" << get_key()
+                      << ": " << cpp_strerror(-r) << dendl;
+    return r;
+  }
+  return 0;
+}
+
 int RadosObject::read_attrs(const DoutPrefixProvider* dpp, RGWRados::Object::Read &read_op, optional_yield y, rgw_obj* target_obj)
 {
   read_op.params.attrs = &state.attrset;
@@ -2913,15 +3244,12 @@ int RadosObject::set_obj_attrs(const DoutPrefixProvider* dpp, Attrs* setattrs, A
 {
   Attrs empty;
   const bool log_op = flags & rgw::sal::FLAG_LOG_OP;
-  // make a tiny adjustment to the existing mtime so that fetch_remote_obj()
-  // won't return ERR_NOT_MODIFIED when syncing the modified object
-  const auto mtime = log_op ? state.mtime + std::chrono::nanoseconds(1) : state.mtime;
   return store->getRados()->set_attrs(dpp, rados_ctx,
 			bucket->get_info(),
 			get_obj(),
 			setattrs ? *setattrs : empty,
 			delattrs ? delattrs : nullptr,
-			y, log_op, mtime);
+			y, log_op);
 }
 
 int RadosObject::get_obj_attrs(optional_yield y, const DoutPrefixProvider* dpp)
@@ -3778,6 +4106,8 @@ int RadosObject::copy_object(const ACLOwner& owner,
 				bool high_precision_time,
 				const char* if_match,
 				const char* if_nomatch,
+				const char* dest_if_match,
+				const char* dest_if_nomatch,
 				AttrsMod attrs_mod,
 				bool copy_if_newer,
 				Attrs& attrs,
@@ -3811,6 +4141,8 @@ int RadosObject::copy_object(const ACLOwner& owner,
 				     high_precision_time,
 				     if_match,
 				     if_nomatch,
+				     dest_if_match,
+				     dest_if_nomatch,
 				     static_cast<RGWRados::AttrsMod>(attrs_mod),
 				     copy_if_newer,
 				     attrs,
@@ -3978,7 +4310,7 @@ int RadosMultipartUpload::abort(const DoutPrefixProvider *dpp, CephContext *cct,
   list<rgw_obj_index_key> remove_objs;
   bool truncated;
   int marker = 0;
-  int ret;
+  int ret = 0;
   uint64_t parts_accounted_size = 0;
 
   prefix_map_t processed_prefixes;
@@ -4724,12 +5056,7 @@ void MPRadosSerializer::stop_renewal()
 
   // wait for notification of completion
   boost::system::error_code ec_ignored;
-  if (y) {
-    cond.async_wait(lock, y.get_yield_context()[ec_ignored]);
-  } else {
-    maybe_warn_about_blocking(dpp);
-    cond.async_wait(lock, ceph::async::use_blocked[ec_ignored]);
-  }
+  cond.async_wait(lock, rgw::maybe_yield(dpp, y, ec_ignored));
 }
 
 int MPRadosSerializer::try_lock(const DoutPrefixProvider *dpp, ceph::timespan dur, optional_yield y)
@@ -4998,11 +5325,10 @@ int RadosRestore::initialize(const DoutPrefixProvider* dpp, optional_yield y,
   num_objs = n_objs;
   obj_names = o_names;
 
-  maybe_warn_about_blocking(dpp);
   for (auto i=0; i < num_objs; i++) {
     std::unique_ptr<fifo::FIFO> fifo_tmp;
     try {
-      fifo_tmp = fifo::FIFO::create(dpp, r, obj_names[i], neo_ioctx, ceph::async::use_blocked);
+      fifo_tmp = fifo::FIFO::create(dpp, r, obj_names[i], neo_ioctx, rgw::maybe_yield(dpp, y));
     } catch (const sys::system_error& e) {
       ldpp_dout(dpp, -1) << "creating fifo object for index=" << i
 	   << ", objname=" << obj_names[i] << " failed : " << e.what() << dendl;
@@ -5057,9 +5383,8 @@ int RadosRestore::push(const DoutPrefixProvider *dpp, optional_yield y,
 		int index, std::deque<ceph::buffer::list>&& items) {
   ldpp_dout(dpp, 20) << __PRETTY_FUNCTION__
 		 << "Pushing entries to FIFO:" << obj_names[index] << dendl;
-  maybe_warn_about_blocking(dpp);
   try {
-    fifos[index]->push(dpp, items, ceph::async::use_blocked);
+    fifos[index]->push(dpp, items, rgw::maybe_yield(dpp, y));
   } catch (const sys::system_error& e) {
     ldpp_dout(dpp, -1) << __PRETTY_FUNCTION__
 		 << ": unable to push to FIFO: " << obj_names[index]
@@ -5074,9 +5399,8 @@ int RadosRestore::push(const DoutPrefixProvider *dpp, optional_yield y,
   ldpp_dout(dpp, 20) << __PRETTY_FUNCTION__
 		 << "Pushing entry to FIFO:" << obj_names[index] << dendl;
 
-  maybe_warn_about_blocking(dpp);
   try {
-    fifos[index]->push(dpp, std::move(bl), ceph::async::use_blocked);
+    fifos[index]->push(dpp, std::move(bl), rgw::maybe_yield(dpp, y));
   } catch (const sys::system_error& e) {
     ldpp_dout(dpp, -1) << __PRETTY_FUNCTION__
 		 << ": unable to push to FIFO: " << obj_names[index]
@@ -5125,10 +5449,9 @@ int RadosRestore::list(const DoutPrefixProvider *dpp, optional_yield y,
   ldpp_dout(dpp, 20) << __PRETTY_FUNCTION__
 		 << "Listing entries from FIFO:" << obj_names[index] << dendl;
 
-  maybe_warn_about_blocking(dpp);
   try {
     auto [lentries, lmark] = fifos[index]->list(dpp, marker,
-			  	 restore_entries, ceph::async::use_blocked);
+			  	 restore_entries, rgw::maybe_yield(dpp, y));
     entries.clear();
 
     for (const auto& entry : lentries) {
@@ -5186,9 +5509,8 @@ int RadosRestore::trim(const DoutPrefixProvider *dpp, optional_yield y,
   ldpp_dout(dpp, 20) << __PRETTY_FUNCTION__
 		 << "Trimming FIFO:" << obj_names[index] << " upto marker:" << marker << dendl;
 
-  maybe_warn_about_blocking(dpp);
   try {
-    fifos[index]->trim(dpp, std::string(marker), false, ceph::async::use_blocked);
+    fifos[index]->trim(dpp, std::string(marker), false, rgw::maybe_yield(dpp, y));
   } catch (const sys::system_error& e) {
     ldpp_dout(dpp, -1) << __PRETTY_FUNCTION__
 		 << ": unable to trim FIFO: " << obj_names[index]
@@ -5453,6 +5775,7 @@ RadosLuaManager::RadosLuaManager(RadosStore* _s, const std::string& _luarocks_pa
 }
 
 uint64_t RadosLuaManager::get_watch_handle_for_script(const std::string& script_oid) {
+  std::shared_lock<std::shared_mutex> lock(watch_mutex);
   auto search = script_watches.find(script_oid);
   if (search != script_watches.end()) {
     return search->second;
@@ -5461,6 +5784,7 @@ uint64_t RadosLuaManager::get_watch_handle_for_script(const std::string& script_
 }
 
 std::string RadosLuaManager::get_script_for_watch_handle(uint64_t handle) {
+  std::shared_lock<std::shared_mutex> lock(watch_mutex);
   auto search = reverse_script_watches.find(handle);
   if (search != reverse_script_watches.end()) {
     return search->second;
@@ -5479,16 +5803,18 @@ int RadosLuaManager::watch_script(const DoutPrefixProvider* dpp, const std::stri
     if (r < 0) {
       ldpp_dout(dpp, 1) << "ERROR: failed to watch " << script_oid
                         << ". error: " << cpp_strerror(r) << dendl;
-      if (r == -ENOENT) {
-        // Let the background thread know to update the script cache
+      // Let the background thread know to update the script cache
+      if (lua_background) {
         lua_background->process_script_add(script_oid);
       }
-    // Return error?
       return r;
     }
     ldpp_dout(dpp, 20) << "INFO: inited watch on " << script_oid  << " with handle " << w_handle << dendl;
-    script_watches.emplace(script_oid, w_handle);
-    reverse_script_watches.emplace(w_handle, script_oid);
+    {
+      std::lock_guard<std::shared_mutex> lock(watch_mutex);
+      script_watches.emplace(script_oid, w_handle);
+      reverse_script_watches.emplace(w_handle, script_oid);
+    }
   }
   return 0;
 }
@@ -5513,10 +5839,11 @@ int RadosLuaManager::unwatch_script(const DoutPrefixProvider* dpp, const std::st
         << ". error: " << cpp_strerror(r) << dendl;
     return r;
   }
-
-  script_watches.erase(script_oid);
-  reverse_script_watches.erase(w_handle);
-
+  {
+    std::lock_guard<std::shared_mutex> lock(watch_mutex);
+    script_watches.erase(script_oid);
+    reverse_script_watches.erase(w_handle);
+  }
   ldpp_dout(dpp, 20) << "Stopped watching for updates of Lua script " << script_oid
     << " with handle: " << w_handle << dendl;
 
@@ -5583,7 +5910,6 @@ std::tuple<rgw::lua::LuaCodeType, int> RadosLuaManager::get_script_or_bytecode(c
                       <<  ", error = " << err.what() << dendl;
     return std::make_tuple("", -EIO);
   }
-
   r = watch_script(dpp, key);
   if (r < 0) {
     ldpp_dout(dpp, 10) << "WARNING: failed to watch Lua script: " << key << ", err:"
@@ -5976,6 +6302,10 @@ void RadosLuaManager::ScriptsWatcher::handle_error(uint64_t cookie, int err)
     ldpp_dout(this, 5) << "ERROR: failed to find the script for watch handle: "
                        << cookie << dendl;
     return;
+  }
+
+  if (parent->lua_background) {
+    parent->lua_background->process_script_add(script_oid);
   }
   ldpp_dout(this, 5) << "WARNING: restarting watch handler for script: "
                      << script_oid << ", err:" << err << dendl;

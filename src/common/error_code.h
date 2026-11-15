@@ -23,10 +23,12 @@
 #    include <format>
 #  endif
 #endif
+#include <exception>
 #include <functional>
 #include <new>
 #include <optional>
 #include <regex>
+#include <exception>
 #include <stdexcept>
 #include <system_error>
 #include <variant>

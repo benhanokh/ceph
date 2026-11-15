@@ -1,5 +1,6 @@
 include(GetGitRevisionDescription)
 include(CheckCXXCompilerFlag)
+include(CheckLinkerFlag)
 
 # for erasure and compressor plugins
 set(CEPH_INSTALL_PKGLIBDIR ${CMAKE_INSTALL_LIBDIR}/${PROJECT_NAME})
@@ -113,7 +114,7 @@ if(NOT MSVC)
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wno-ignored-qualifiers>)
 endif()
 
-if (CMAKE_CXX_COMPILER_ID STREQUAL Clang)
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wsign-compare>)
 endif()
 
@@ -162,7 +163,7 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL GNU)
       string(APPEND CMAKE_EXE_LINKER_FLAGS " -pie")
     endif()
   endif()
-elseif(CMAKE_CXX_COMPILER_ID STREQUAL Clang)
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 16)
     message(FATAL_ERROR "C++20 support requires a minimum Clang version of 16.")
   endif()
@@ -174,14 +175,14 @@ elseif(CMAKE_CXX_COMPILER_ID STREQUAL Clang)
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wno-unused-private-field>)
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wno-address-of-packed-member>)
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wno-unknown-warning-option>)
+  # might reach a GCC C compiler, which ignores unknown -Wno- but not -W options
   add_compile_options(
     -Wno-unused-function
     -Wno-unused-local-typedef
     -Wno-varargs
     -Wno-gnu-designator
     -Wno-missing-braces
-    -Wno-parentheses
-    -Wno-deprecated-register)
+    -Wno-parentheses)
   if(CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 18)
     add_compile_options(
     -Wno-vla-cxx-extension)
@@ -195,6 +196,15 @@ elseif(CMAKE_CXX_COMPILER_ID STREQUAL Clang)
     string(APPEND CMAKE_SHARED_LINKER_FLAGS " -undefined dynamic_lookup")
   endif()
 endif(CMAKE_CXX_COMPILER_ID STREQUAL GNU)
+
+# checked per language, since the C and C++ compilers may differ
+add_compile_options($<$<COMPILE_LANG_AND_ID:C,AppleClang,Clang>:-Wconditional-uninitialized>)
+add_compile_options($<$<COMPILE_LANG_AND_ID:CXX,AppleClang,Clang>:-Wconditional-uninitialized>)
+
+# --copy-dt-needed-entries is a GNU ld option; lld, Apple's ld64 and
+# lld in MinGW mode reject it. Test the linker instead of the OS or
+# the compiler, since clang on Linux uses GNU ld by default.
+check_linker_flag(CXX "-Wl,--copy-dt-needed-entries" HAVE_LINK_COPY_DT_NEEDED_ENTRIES)
 
 if(WITH_CEPH_DEBUG_MUTEX)
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-DCEPH_DEBUG_MUTEX>)
@@ -246,7 +256,7 @@ endif()
 
 # Set WITH_EC_ISA_PLUGIN early so it's available when processing common/options
 # This must be set before add_subdirectory(common) is called
-if(HAVE_NASM_X64_AVX2 OR HAVE_ARMV8_SIMD OR HAS_ALTIVEC OR HAVE_RISCV_RVV)
+if(HAVE_NASM_X64_AVX2 OR HAVE_ARMV8_SIMD OR HAS_ALTIVEC OR HAVE_RISCV_RVV OR HAVE_S390X)
   set(WITH_EC_ISA_PLUGIN TRUE CACHE BOOL "")
 endif()
 
@@ -451,14 +461,16 @@ else()
 endif()
 
 # in osd/PeeringState.h, the number of elements in PeeringState::Active::reactions
-# is now 21 which exceeds the default value of BOOST_MPL_LIMIT_VECTOR_SIZE, which
-# is 20. so we need to override it. see
+# now exceeds the default value of BOOST_MPL_LIMIT_LIST_SIZE, which is 20, so we
+# override it. The limit must be a multiple of 10, and
+# BOOST_MPL_CFG_NO_PREPROCESSED_HEADERS forces the preprocessor to regenerate the
+# mpl::list machinery for the requested size. see
 # https://www.boost.org/doc/libs/1_74_0/libs/mpl/doc/refmanual/limit-list-size.html
 # link with this library, if your code includes osd/PeeringState.h (indirectly)
 add_library(Boost::MPL INTERFACE IMPORTED)
 set_target_properties(Boost::MPL PROPERTIES
   INTERFACE_COMPILE_DEFINITIONS
-    "BOOST_MPL_CFG_NO_PREPROCESSED_HEADERS;BOOST_MPL_LIMIT_LIST_SIZE=30")
+    "BOOST_MPL_CFG_NO_PREPROCESSED_HEADERS;BOOST_MPL_LIMIT_LIST_SIZE=40")
 
 if(WITH_CRIMSON)
   find_package(c-ares 1.13.0 QUIET)
@@ -481,11 +493,12 @@ if(WITH_CRIMSON)
     set(Seastar_SANITIZE "OFF" CACHE STRING "" FORCE)
   endif()
   if(Seastar_DPDK)
-    find_package(DPDK QUIET)
-    if(NOT DPDK_FOUND)
-      include(BuildDPDK)
-      build_dpdk(${CMAKE_BINARY_DIR}/src/dpdk)
+    if(WITH_CRIMSON_SPDK OR WITH_SPDK)
+      message(FATAL_ERROR "Seastar_DPDK cannot be enabled together with SPDK: "
+        "SPDK links its own bundled DPDK. "
+        "Set WITH_CRIMSON_SPDK=OFF and WITH_SPDK=OFF")
     endif()
+    find_package(DPDK REQUIRED)
   endif()
   set(old_BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS})
   if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
@@ -516,6 +529,7 @@ if(WITH_CRIMSON)
     "-Wno-sign-compare"
     "-Wno-attributes"
     "-Wno-pessimizing-move"
+    "$<$<CXX_COMPILER_ID:Clang>:-Wno-conditional-uninitialized>"
     "-Wno-address-of-packed-member")
   if(WITH_ASAN)
     # As built here (RelWithDebInfo) seastar keeps its own allocator, which
@@ -536,9 +550,11 @@ set(libcommon_files
   ceph_ver.c
   global/global_context.cc
   xxHash/xxhash.c
-  include/filepath.cc
   include/invoke_date.cc
   include/object.cc
+  include/client_t.cc
+  include/errorcode32.cc
+  include/shard_id.cc
   include/types.cc
   include/utime.cc
   include/uuid.cc
@@ -566,6 +582,7 @@ set(libcommon_files
   osd/OpRequest.cc
   osd/ClassHandler.cc
   osd/osd_op_util.cc
+  osd/osd_types.cc
   osdc/Striper.cc
   osdc/Objecter.cc
   osdc/error_code.cc
@@ -616,7 +633,6 @@ set(ceph_common_deps
   Boost::program_options
   Boost::date_time
   Boost::iostreams
-  StdFilesystem::filesystem
   ${FMT_LIB}
   ${BLKID_LIBRARIES}
   ${Backtrace_LIBRARIES}
@@ -652,15 +668,6 @@ endif()
 if(WIN32)
   list(APPEND ceph_common_deps ws2_32 mswsock iphlpapi bcrypt)
   list(APPEND ceph_common_deps dlfcn_win32)
-endif()
-
-if(WITH_RBD_RWL)
-  if(WITH_SYSTEM_PMDK)
-    find_package(pmdk 1.8 REQUIRED COMPONENTS pmemobj)
-  else()
-    include(Buildpmdk)
-    build_pmdk()
-  endif()
 endif()
 
 if(WITH_BREAKPAD)
@@ -839,6 +846,8 @@ set(ceph_osd_srcs
   ceph_osd.cc)
 
 add_executable(ceph-osd ${ceph_osd_srcs})
+set_target_properties(ceph-osd PROPERTIES
+  JOB_POOL_LINK heavy_link_job_pool)
 add_dependencies(ceph-osd erasure_code_plugins extblkdev_plugins)
 target_link_libraries(ceph-osd osd os global-static common
   ${ALLOC_LIBS}
@@ -938,6 +947,7 @@ install(FILES
 install(PROGRAMS
   ceph_common.sh
   ceph-osd-prestart.sh
+  block-device-health
   DESTINATION ${CMAKE_INSTALL_LIBEXECDIR}/ceph)
 
 install(PROGRAMS

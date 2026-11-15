@@ -10,6 +10,7 @@
 #include "rgw_sal_fwd.h"
 
 #include <atomic>
+#include <boost/asio/ip/address.hpp>
 
 class RGWSI_Zone;
 
@@ -64,6 +65,11 @@ inline param_vec_t make_param_list(const std::map<std::string, std::string> *pp)
   }
   return params;
 }
+
+// Build a CURLOPT_CONNECT_TO entry "host:port:addr:port". libcurl requires
+// IPv6 addresses to be enclosed in brackets.
+std::string make_connect_to(const std::string& host, uint16_t port,
+                            const boost::asio::ip::address& addr);
 
 /**
  * ResolvedIP - Per-IP connection status tracking.
@@ -156,6 +162,7 @@ class RGWRESTConn
 {
   CephContext *cct;
   std::atomic<int64_t> endpoint_rr_index = { 0 }; // Round-robin counter for resolved_endpoints
+  std::atomic<bool> in_endpoint_fallback = { false }; // Set while no endpoint has a usable IP
   std::vector<ResolvedEndpoint> resolved_endpoints;
   RGWAccessKey key;
   std::string self_zone_group;

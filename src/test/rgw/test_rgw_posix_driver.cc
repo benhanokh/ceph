@@ -1099,7 +1099,7 @@ public:
         }
       }
     }
-    quota_handler = RGWQuotaHandler::generate_handler(env->dpp, this, false);
+    quota_handler = RGWQuotaHandler::generate_handler(this, false);
     /* ordered listing cache */
     bucket_cache.reset(new BucketCache(
         this, base_path, cache_base, 100, 3, 3, 3));
@@ -1532,6 +1532,8 @@ TEST_F(POSIXObjectTest, ObjectCopy)
 	   false,
 	   nullptr,
 	   nullptr,
+	   nullptr,
+	   nullptr,
 	   ATTRSMOD_NONE,
 	   false,
 	   attrs,
@@ -1839,6 +1841,8 @@ TEST_F(POSIXMPObjectTest, MPUploadCopy)
 	   &mtime,
 	   &mtime,
 	   false,
+	   nullptr,
+	   nullptr,
 	   nullptr,
 	   nullptr,
 	   ATTRSMOD_NONE,
@@ -2292,6 +2296,8 @@ TEST_F(POSIXVerObjectTest, ObjectCopy)
 	   false,
 	   nullptr,
 	   nullptr,
+	   nullptr,
+	   nullptr,
 	   ATTRSMOD_NONE,
 	   false,
 	   attrs,
@@ -2368,6 +2374,8 @@ TEST_F(POSIXVerObjectTest, CopyVersion)
 	   &mtime,
 	   &mtime,
 	   false,
+	   nullptr,
+	   nullptr,
 	   nullptr,
 	   nullptr,
 	   ATTRSMOD_NONE,

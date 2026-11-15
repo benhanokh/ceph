@@ -405,6 +405,9 @@ void ECBackend::handle_sub_write(
   if (!op.temp_added.empty()) {
     switcher->add_temp_objs(op.temp_added);
   }
+  if (op.migration_watermark) {
+    get_parent()->update_migration_watermark(*op.migration_watermark);
+  }
   if (op.backfill_or_async_recovery) {
     for (set<hobject_t>::iterator i = op.temp_removed.begin();
          i != op.temp_removed.end();
@@ -423,9 +426,10 @@ void ECBackend::handle_sub_write(
   dout(30) << __func__ << " missing before " <<
     get_parent()->get_log().get_missing().get_items() << dendl;
 
-  // Update EC omap journal on non-primary shards from log entries
-  // This ensures the journal has the correct generation info when transactions are applied
-  if (get_parent()->get_pool().supports_omap()) {
+  // Update EC omap journal on primary-capable non-acting-primary shards from log entries.
+  if (get_parent()->get_pool().supports_omap() &&
+      !get_parent()->pgb_is_primary() &&
+      !sinfo.is_nonprimary_shard(get_parent()->whoami_shard().shard)) {
     for (auto &&e: op.log_entries) {
       if (e.is_delete() || e.is_lost_delete() || e.is_replace() || (e.is_clone() && !e.soid.is_snap())) {
         if (!op.backfill_or_async_recovery) {
@@ -478,7 +482,7 @@ void ECBackend::handle_sub_write(
     async);
 
   if (!get_parent()->pg_is_undersized() &&
-    get_parent()->whoami_shard().shard >= sinfo.get_k())
+    whoami_rel_shard() >= sinfo.get_k())
     op.t.set_fadvise_flag(CEPH_OSD_OP_FLAG_FADVISE_DONTNEED);
 
   localt.register_on_commit(
@@ -525,39 +529,10 @@ void ECBackend::handle_sub_read(
     int r = 0;
     for (auto &&[offset, len, flags]: to_read) {
       bufferlist bl;
-      auto &subchunks = op.subchunks.at(hoid);
-      if ((subchunks.size() == 1) &&
-        (subchunks.front().second == ec_impl->get_sub_chunk_count())) {
-        dout(20) << __func__ << " case1: reading the complete chunk/shard." << dendl;
-        r = switcher->store->read(
-          switcher->ch,
-          ghobject_t(hoid, ghobject_t::NO_GEN, shard),
-          offset, len, bl, flags); // Allow EIO return
-      } else {
-        int subchunk_size =
-          sinfo.get_chunk_size() / ec_impl->get_sub_chunk_count();
-        dout(20) << __func__ << " case2: going to do fragmented read;"
-		 << " subchunk_size=" << subchunk_size
-		 << " chunk_size=" << sinfo.get_chunk_size() << dendl;
-        bool error = false;
-        for (int m = 0; m < (int)len && !error;
-             m += sinfo.get_chunk_size()) {
-          for (auto &&k: subchunks) {
-            bufferlist bl0;
-            r = switcher->store->read(
-              switcher->ch,
-              ghobject_t(hoid, ghobject_t::NO_GEN, shard),
-              offset + m + (k.first) * subchunk_size,
-              (k.second) * subchunk_size,
-              bl0, flags);
-            if (r < 0) {
-              error = true;
-              break;
-            }
-            bl.claim_append(bl0);
-          }
-        }
-      }
+      r = switcher->store->read(
+        switcher->ch,
+        ghobject_t(hoid, ghobject_t::NO_GEN, shard),
+        offset, len, bl, flags); // Allow EIO return
 
       if (r < 0) {
         // if we are doing fast reads, it's possible for one of the shard
@@ -715,7 +690,7 @@ void ECBackend::handle_sub_read(
           bufferlist val_bl;
           val_bl.append(value);
           current_batch.insert(make_pair(key, val_bl));
-          available -= std::min(available, num_new_bytes);
+          available -= std::min<uint64_t>(available, num_new_bytes);
           return ObjectStore::omap_iter_ret_t::NEXT;
         }, switcher->store);
 
@@ -759,6 +734,13 @@ void ECBackend::handle_sub_write_reply(
       get_parent()->update_peer_last_complete_ondisk(
         from, ec_write_reply_op.last_complete);
     }
+
+    if (op->cross_zone_write_dispatch_time.contains(from)) {
+      utime_t lat = ceph_clock_now() - op->cross_zone_write_dispatch_time.at(from);
+      get_parent()->get_logger()->tinc(l_osd_stretch_cross_zone_write_lat, lat);
+      get_parent()->get_logger()->hinc(l_osd_stretch_cross_zone_write_lat_hist,
+                                       lat.to_nsec(), 0);
+    }
   }
 
   if (cct->_conf->bluestore_debug_inject_read_err &&
@@ -781,6 +763,7 @@ void ECBackend::handle_sub_read_reply(
     pg_shard_t from,
     ECSubReadReply &op,
     const ZTracer::Trace &trace) {
+  auto from_rel_shard = sinfo.get_rel_shard(from.shard);
   trace.event("ec sub read reply");
   dout(10) << __func__ << ": reply " << op << dendl;
   map<ceph_tid_t, ReadOp>::iterator iter = read_pipeline.tid_to_read_map.
@@ -823,13 +806,29 @@ void ECBackend::handle_sub_read_reply(
 
     auto &buffers_read = rop.complete.at(hoid).buffers_read;
     for (auto &&[offset, buffer_list]: offset_buffer_map) {
-      buffers_read.insert_in_shard(from.shard, offset, buffer_list);
+      buffers_read.insert_in_shard(sinfo.get_rel_shard(from_rel_shard), offset, buffer_list);
     }
     rop.debug_log.emplace_back(ECUtil::READ_DONE, op.from, buffers_read);
 
     // zero length reads may need to be zero padded during recovery
-    if (!buffers_read.contains_shard(from.shard)) {
-      rop.complete.at(hoid).zero_length_reads.insert(from.shard);
+    if (!buffers_read.contains_shard(from_rel_shard)) {
+      rop.complete.at(hoid).zero_length_reads.insert(from_rel_shard);
+    }
+  }
+  // only cross zone reads in tracked
+  if (rop.cross_zone_read_dispatch_time.contains(from)) {
+    uint64_t recv_bytes = 0;
+    for (auto &[hoid, bufs] : op.buffers_read)
+      for (auto &[offset, bl] : bufs)
+        recv_bytes += bl.length();
+
+    if (recv_bytes > 0) {
+      utime_t lat = ceph_clock_now() - rop.cross_zone_read_dispatch_time.at(from);
+      get_parent()->get_logger()->inc(l_osd_stretch_cross_zone_read_recv_bytes,
+                                      recv_bytes);
+      get_parent()->get_logger()->tinc(l_osd_stretch_cross_zone_read_lat, lat);
+      get_parent()->get_logger()->hinc(l_osd_stretch_cross_zone_read_lat_hist,
+                                       lat.to_nsec(), recv_bytes);
     }
   }
   for (auto &&[hoid, req]: rop.to_read) {
@@ -837,13 +836,13 @@ void ECBackend::handle_sub_read_reply(
       rop.complete.emplace(hoid, &sinfo);
     }
     auto &complete = rop.complete.at(hoid);
-    if (!req.shard_reads.contains(from.shard)) {
+    if (!req.shard_reads.contains(from_rel_shard)) {
       continue;
     }
-    const shard_read_t &read = req.shard_reads.at(from.shard);
+    const shard_read_t &read = req.shard_reads.at(from_rel_shard);
     if (!complete.errors.contains(from)) {
       dout(20) << __func__ <<" read:" << read << dendl;
-      complete.processed_read_requests[from.shard].union_of(read.extents);
+      complete.processed_read_requests[from_rel_shard].union_of(read.extents);
     }
   }
   for (auto &&[hoid, attr]: op.attrs_read) {
@@ -910,12 +909,12 @@ void ECBackend::handle_sub_read_reply(
     auto &complete = rop.complete.at(hoid);
     complete.errors.emplace(from, err);
     rop.debug_log.emplace_back(ECUtil::ERROR, op.from, complete.buffers_read);
-    complete.buffers_read.erase_shard(from.shard);
-    complete.processed_read_requests.erase(from.shard);
+    complete.buffers_read.erase_shard(from_rel_shard);
+    complete.processed_read_requests.erase(from_rel_shard);
     // If there was an error for non-zero data on this shard, then we must also
     // ignore all zeros, or minimum_to_decode may conclude that it has enough
     // shards available.
-    rop.to_read.at(hoid).zeros_for_decode.erase(from.shard);
+    rop.to_read.at(hoid).zeros_for_decode.erase(from_rel_shard);
     dout(20) << __func__ << " shard=" << from << " error=" << err << dendl;
   }
 
@@ -967,8 +966,7 @@ void ECBackend::handle_sub_read_reply(
       }
 
       if (attrs_satisfied && omap_satisfied) {
-        err = ec_impl->minimum_to_decode(want_to_read, have, dummy_minimum,
-                                                    nullptr);
+        err = ec_impl->minimum_to_decode(want_to_read, have, dummy_minimum);
       }
 
       if (err) {
@@ -1040,7 +1038,7 @@ void ECBackend::handle_sub_read_reply(
      */
     for (auto pg_shard : rop.in_progress) {
       for (auto &&[oid, read] : rop.to_read) {
-        read.zeros_for_decode.erase(pg_shard.shard);
+        read.zeros_for_decode.erase(sinfo.get_rel_shard(pg_shard.shard));
       }
     }
     read_pipeline.complete_read_op(std::move(rop));
@@ -1086,6 +1084,10 @@ void ECBackend::on_change() {
 
 void ECBackend::clear_recovery_state() {
   recovery_backend.recovery_ops.clear();
+}
+
+void ECBackend::cancel_recovery_op(const hobject_t &soid) {
+  recovery_backend.recovery_ops.erase(soid);
 }
 
 void ECBackend::dump_recovery_info(Formatter *f) const {
@@ -1153,6 +1155,16 @@ struct ECClassicalOp : ECCommon::RMWPipeline::Op {
     }
     pending_roll_forward.insert(shard);
     return false;
+  }
+
+  std::optional<hobject_t> consider_updating_migration_watermark(ECListener *parent) final {
+    std::set<hobject_t> deleted;
+    for (auto &[hoid, op] : t.get()->op_map) {
+      if (op.is_delete()) {
+	deleted.insert(hoid);
+      }
+    }
+    return parent->consider_updating_migration_watermark(deleted);
   }
 };
 
@@ -1236,29 +1248,34 @@ int ECBackend::objects_read_sync(
   std::pair<ceph::buffer::list*, Context*>>> &to_read,
   CoroHandles coro)
 {
-  int result = 0;
-  bool done = false;
-  bool waiting = false;
+  struct ReadState {
+    int result = 0;
+    bool done = false;
+    bool waiting = false;
+  };
+  auto state = std::make_shared<ReadState>();
 
-  // Callback for the async read
-  Context *on_finish = new LambdaContext([&, coro](int r) {
-    result = r;
-    done = true;
+  std::weak_ptr<resume_token_t> weak_resume = coro.resume;
+  Context *on_finish = new LambdaContext([state, weak_resume](int r) {
+    state->result = r;
+    state->done = true;
 
-    if (waiting) {
-      coro.resume();
+    if (state->waiting) {
+      if (auto locked = weak_resume.lock(); locked) {
+        (*locked)();
+      }
     }
   });
 
   objects_read_async(hoid, object_size, to_read, on_finish, true);
 
   // If the async read is not yet complete, yield and wait for it to complete
-  if (!done) {
-    waiting = true;
+  if (!state->done) {
+    state->waiting = true;
     coro.yield();
   }
 
-  return result;
+  return state->result;
 }
 
 int ECBackend::objects_read_local(
@@ -1300,8 +1317,8 @@ std::pair<uint64_t, uint64_t> ECBackend::extent_to_shard_extent(uint64_t off, ui
   // This calculation is wrong for length = 0, but it doesn't matter if these reads get sent to the primary
   uint64_t end_chunk = (off + len - 1) / chunk_size;
   uint64_t shard_offset, shard_len;
-  shard_id_t shard = get_parent()->whoami_shard().shard;
-  raw_shard_id_t raw_shard = sinfo.get_raw_shard(shard);
+  shard_id_t rel_shard = whoami_rel_shard();
+  raw_shard_id_t raw_shard = sinfo.get_raw_shard(get_parent()->whoami_shard().shard);
 
   if (end_chunk == start_chunk) {
     shard_offset = sinfo.ro_offset_to_shard_offset(off, raw_shard);
@@ -1309,8 +1326,8 @@ std::pair<uint64_t, uint64_t> ECBackend::extent_to_shard_extent(uint64_t off, ui
   } else {
     ECUtil::shard_extent_set_t full_read(sinfo.get_k_plus_m());
     sinfo.ro_range_to_shard_extent_set(off, len, full_read);
-    shard_offset = full_read[shard].range_start();
-    shard_len = full_read[shard].range_end() - shard_offset;
+    shard_offset = full_read[rel_shard].range_start();
+    shard_len = full_read[rel_shard].range_end() - shard_offset;
   }
 
   return std::pair(shard_offset, shard_len);
@@ -1475,19 +1492,11 @@ void ECBackend::objects_read_async(
 }
 
 bool ECBackend::ec_can_decode(const shard_id_set &available_shards) const {
-  if (sinfo.supports_sub_chunks()) {
-    ceph_abort_msg("Interface does not support subchunks");
-    return false;
-  }
-
-  mini_flat_map<shard_id_t, std::vector<std::pair<int, int>>>
-      minimum_sub_chunks{ec_impl->get_chunk_count()};
   shard_id_set want_to_read = sinfo.get_all_shards();
   shard_id_set available(available_shards);
   shard_id_set minimum_set;
 
-  int r = ec_impl->minimum_to_decode(want_to_read, available, minimum_set,
-                                     &minimum_sub_chunks);
+  int r = ec_impl->minimum_to_decode(want_to_read, available, minimum_set);
   return (r == 0);
 }
 
@@ -1618,9 +1627,10 @@ int ECBackend::be_deep_scrub(
     return -EINPROGRESS;
   }
 
-  if (sinfo.supports_encode_decode_crcs()) {
+  if (sinfo.supports_encode_decode_crcs() || sinfo.get_num_zones() > 1) {
     // We pass the calculated digest here
-    // This will be used along with the plugin to verify data consistency
+    // This will be used along with the plugin to verify data consistency,
+    // and to compare the copies of a shard in different zones
     o.digest = pos.data_hash.digest();
   }
   else

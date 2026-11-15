@@ -270,15 +270,47 @@ public:
 
   template <typename T>
   using lextent_init_func_t = std::function<void (T&)>;
+  using read_extent_iertr = get_pin_iertr;
+  template <typename T>
+  using read_extent_ret =
+    read_extent_iertr::future<maybe_indirect_extent_t<T>>;
+  /**
+   * read_indexed_extent
+   *
+   * Read extent of type T at laddr from the cache's laddr index, skipping the
+   * LBA walk. Returns null if it isn't indexed or t can't use it.
+   */
+  template <typename T>
+  read_extent_iertr::future<TCachedExtentRef<T>> read_indexed_extent(
+    Transaction &t,
+    laddr_t laddr,
+    lextent_init_func_t<T> &maybe_init) {
+    // laddr_index_lookup returns the extent already viewable by t
+    // (same as read_pin() for a linked child)
+    auto ext = co_await cache->laddr_index_lookup(t, T::TYPE, laddr);
+    if (!ext) {
+      co_return TCachedExtentRef<T>();
+    }
+    auto extent = ext->template cast<T>();
+    if (!extent->is_seen_by_users()) {
+      maybe_init(*extent);
+      extent->set_seen_by_users();
+    }
+#ifndef NDEBUG
+    // the LBA walk must reach the same extent
+    auto pin = co_await get_pin(t, laddr);
+    auto walked = co_await read_pin<T>(t, std::move(pin));
+    assert(!walked.is_indirect());
+    assert(walked.extent == extent);
+#endif
+    co_return extent;
+  }
+
   /**
    * read_extent
    *
    * Read extent of type T at offset~length
    */
-  using read_extent_iertr = get_pin_iertr;
-  template <typename T>
-  using read_extent_ret =
-    read_extent_iertr::future<maybe_indirect_extent_t<T>>;
   template <typename T>
   read_extent_ret<T> read_extent(
     Transaction &t,
@@ -288,14 +320,25 @@ public:
     LOG_PREFIX(TransactionManager::read_extent);
     SUBDEBUGT(seastore_tm, "{}~0x{:x} {} ...",
               t, offset, length, T::TYPE);
+    cache->account_laddr_lookup(t, T::TYPE);
+    auto indexed = co_await read_indexed_extent<T>(
+      t, offset, maybe_init);
+    if (indexed) {
+      co_return maybe_indirect_extent_t<T>{
+        std::move(indexed), std::nullopt, false};
+    }
     auto pin = co_await get_pin(t, offset);
     if (length != pin.get_length() || !pin.get_val().is_real_location()) {
       SUBERRORT(seastore_tm, "{}~0x{:x} {} got wrong pin {}",
 		t, offset, length, T::TYPE, pin);
       ceph_abort_msg("Impossible");
     }
-    co_return co_await this->read_pin<T>(
+    auto ret = co_await this->read_pin<T>(
       t, std::move(pin), std::move(maybe_init));
+    if (!ret.is_indirect()) {
+      cache->laddr_index_insert(offset, ret.extent);
+    }
+    co_return ret;
   }
 
   /**
@@ -311,14 +354,25 @@ public:
     LOG_PREFIX(TransactionManager::read_extent);
     SUBDEBUGT(seastore_tm, "{} {} ...",
               t, offset, T::TYPE);
+    cache->account_laddr_lookup(t, T::TYPE);
+    auto indexed = co_await read_indexed_extent<T>(
+      t, offset, maybe_init);
+    if (indexed) {
+      co_return maybe_indirect_extent_t<T>{
+        std::move(indexed), std::nullopt, false};
+    }
     auto pin = co_await get_pin(t, offset);
     if (!pin.get_val().is_real_location()) {
       SUBERRORT(seastore_tm, "{} {} got wrong pin {}",
 		t, offset, T::TYPE, pin);
       ceph_abort_msg("Impossible");
     }
-    co_return co_await this->read_pin<T>(
+    auto ret = co_await this->read_pin<T>(
       t, std::move(pin), std::move(maybe_init));
+    if (!ret.is_indirect()) {
+      cache->laddr_index_insert(offset, ret.extent);
+    }
+    co_return ret;
   }
 
   template <typename T>
@@ -465,6 +519,10 @@ public:
     if (pin.is_indirect()) {
       pin = co_await complete_mapping(t, std::move(pin));
     }
+
+    // for an indirect pin, the intermediate offset is applied internally below.
+    // A caller passing an intermediate/direct offset here would double-apply it.
+    assert(partial_off + partial_len <= pin.get_length());
 
     extent_len_t direct_partial_off = partial_off;
     bool is_clone = pin.is_clone();
@@ -868,6 +926,40 @@ public:
     laddr_t dst_prefix,
     bool move_indirect);
 
+  /**
+   * alloc_and_copy_non_data_extent
+   *
+   * Used by move_region() to relocate a single-extent metadata mapping
+   * (OMAP_LEAF/OMAP_INNER) by content rather than by paddr.
+   */
+  template <typename T>
+  move_region_iertr::future<> alloc_and_copy_non_data_extent(
+    Transaction &t,
+    laddr_t dst_key,
+    extent_len_t length,
+    T &src_extent) {
+    auto extent = co_await alloc_non_data_extent<T>(
+      t, laddr_hint_t::create_as_fixed(dst_key), length
+    ).handle_error_interruptible(
+      move_region_iertr::pass_further(),
+      crimson::ct_error::assert_all("invalid error"));
+    extent->rewrite(t, src_extent, 0, true);
+    extent->set_laddr(dst_key);
+  }
+
+  /**
+   * alloc_and_copy_data_extents
+   *
+   * Same as alloc_and_copy_non_data_extent(), for OBJECT_DATA_BLOCK,
+   * which may span multiple destination extents.
+   */
+  move_region_iertr::future<> alloc_and_copy_data_extents(
+    Transaction &t,
+    laddr_t dst_key,
+    extent_len_t length,
+    LBAMapping &dst,
+    ceph::bufferlist bl);
+
   /* alloc_extents
    *
    * allocates more than one new blocks of type T.
@@ -1135,32 +1227,33 @@ public:
   }
 
   /**
-   * read_onode_root
+   * read_meta_onode_root
    *
-   * Get onode-tree root logical address
+   * Get the meta collection's onode-tree root logical address.
    */
-  using read_onode_root_iertr = base_iertr;
-  using read_onode_root_ret = read_onode_root_iertr::future<laddr_t>;
-  read_onode_root_ret read_onode_root(Transaction &t) {
+  using read_meta_onode_root_iertr = base_iertr;
+  using read_meta_onode_root_ret = read_meta_onode_root_iertr::future<laddr_t>;
+  read_meta_onode_root_ret read_meta_onode_root(Transaction &t) {
     return cache->get_root(t).si_then([&t](auto croot) {
-      LOG_PREFIX(TransactionManager::read_onode_root);
-      laddr_t ret = croot->get_root().onode_root;
+      LOG_PREFIX(TransactionManager::read_meta_onode_root);
+      laddr_t ret = croot->get_root().meta_onode_root;
       SUBTRACET(seastore_tm, "{}", t, ret);
       return ret;
     });
   }
 
   /**
-   * write_onode_root
+   * write_meta_onode_root
    *
-   * Write onode-tree root logical address, must be called after read.
+   * Write the meta collection's onode-tree root logical address, must be
+   * called after read.
    */
-  void write_onode_root(Transaction &t, laddr_t addr) {
-    LOG_PREFIX(TransactionManager::write_onode_root);
+  void write_meta_onode_root(Transaction &t, laddr_t addr) {
+    LOG_PREFIX(TransactionManager::write_meta_onode_root);
     SUBDEBUGT(seastore_tm, "{}", t, addr);
     auto croot = cache->get_root_fast(t);
     croot = cache->duplicate_for_write(t, croot)->cast<RootBlock>();
-    croot->get_root().onode_root = addr;
+    croot->get_root().meta_onode_root = addr;
   }
 
   /**
@@ -1977,7 +2070,8 @@ using TransactionManagerRef = std::unique_ptr<TransactionManager>;
 
 TransactionManagerRef make_transaction_manager(
     Device *primary_device,
-    const std::vector<Device*> &secondary_devices,
+    const std::vector<Device*> &cache_devices,
+    const std::vector<Device*> &data_devices,
     shard_stats_t& shard_stats,
     store_index_t store_index,
     bool is_test);

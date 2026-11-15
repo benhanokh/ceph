@@ -780,6 +780,8 @@ namespace rgw::sal {
       bool high_precision_time,
       const char* if_match,
       const char* if_nomatch,
+      const char* dest_if_match,
+      const char* dest_if_nomatch,
       AttrsMod attrs_mod,
       bool copy_if_newer,
       Attrs& attrs,
@@ -795,6 +797,9 @@ namespace rgw::sal {
       const DoutPrefixProvider* dpp,
       optional_yield y)
   {
+    if (dest_if_match || dest_if_nomatch) {
+      return -ERR_NOT_IMPLEMENTED;
+    }
         return 0;
   }
 
@@ -2020,7 +2025,11 @@ namespace rgw::sal {
     return 0;
   }
 
-  void DBStore::get_ratelimit(RGWRateLimitInfo& bucket_ratelimit, RGWRateLimitInfo& user_ratelimit, RGWRateLimitInfo& anon_ratelimit)
+  void DBStore::get_ratelimit(
+      RGWRateLimitInfo& bucket_ratelimit,
+      RGWRateLimitInfo& user_ratelimit,
+      RGWRateLimitInfo& account_ratelimit,
+      RGWRateLimitInfo& anon_ratelimit)
   {
     return;
   }

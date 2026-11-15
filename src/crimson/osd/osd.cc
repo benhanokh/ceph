@@ -15,6 +15,7 @@
 
 #include "common/pick_address.h"
 #include "include/util.h"
+#include "include/uuid_fmt.h"
 
 #include "messages/MCommand.h"
 #include "messages/MOSDBeacon.h"
@@ -53,8 +54,10 @@
 #include "crimson/os/futurized_collection.h"
 #include "crimson/os/futurized_store.h"
 #include "crimson/osd/heartbeat.h"
+#include "crimson/osd/osd_connection_priv.h"
 #include "crimson/osd/osd_meta.h"
 #include "crimson/osd/pg.h"
+#include "crimson/osd/watch.h"
 #include "crimson/osd/pg_backend.h"
 #include "crimson/osd/pg_meta.h"
 #include "crimson/osd/osd_operations/client_request.h"
@@ -134,6 +137,7 @@ OSD::OSD(int id, uint32_t nonce,
       std::ignore = update_heartbeat_peers(
       ).then([this] {
 	update_stats();
+	check_debug_levels();
         mgrc->update_daemon_health(get_health_metrics());
 	if (++trim_queue_length_countdown >= TRIM_QLENGTHS_UPDATE_PERIOD) {
 	  trim_queue_length_countdown = 0;
@@ -301,6 +305,30 @@ seastar::future<OSDMeta> OSD::open_or_create_meta_coll(FuturizedStore &store)
   });
 }
 
+namespace {
+
+/// Fail a --mkfs step with a plain error exit rather than an abort.
+///
+/// mkfs is a one-shot tool invocation, and its failures are overwhelmingly
+/// environmental: no space for the backing device files, wrong permissions
+/// on osd_data, a path that is not there. Aborting turns every one of those
+/// into a SIGABRT plus a core dump, which buries the single line that says
+/// what actually went wrong. Throwing instead lets main() report the error
+/// and exit non-zero.
+auto mkfs_step_failed(std::string what)
+{
+  return crimson::stateful_ec::handle(
+    [what = std::move(what)](const std::error_code &ec) {
+      LOG_PREFIX(OSD::mkfs);
+      auto osd_data = local_conf().get_val<std::string>("osd_data");
+      ERROR("{} in {}: {}", what, osd_data, ec.message());
+      return seastar::make_exception_future<>(
+        std::system_error(ec, fmt::format("{} in {}", what, osd_data)));
+    });
+}
+
+}
+
 seastar::future<> OSD::mkfs(
   FuturizedStore &store,
   unsigned whoami,
@@ -312,50 +340,77 @@ seastar::future<> OSD::mkfs(
   DEBUG("starting store mkfs");
   co_await store.start();
 
-  DEBUG("calling store mkfs");
-  co_await store.mkfs(osd_uuid).handle_error(
-    crimson::stateful_ec::assert_failure(fmt::format(
-      "{} error creating empty object store in {}",
-       FNAME, local_conf().get_val<std::string>("osd_data")).c_str())
-  );
+  // Every exit past start() must go through stop(): destroying a started
+  // seastar::sharded<> asserts, which would turn the error exit back into
+  // an abort.
+  bool mounted = false;
+  std::exception_ptr failure;
+  try {
+    DEBUG("calling store mkfs");
+    co_await store.mkfs(osd_uuid).handle_error(
+      mkfs_step_failed("error creating empty object store")
+    );
 
-  DEBUG("mounting store mkfs");
-  co_await store.mount().handle_error(
-    crimson::stateful_ec::assert_failure(fmt::format(
-      "{} error mounting object store in {}",
-      FNAME, local_conf().get_val<std::string>("osd_data")).c_str())
-  );
+    DEBUG("mounting store mkfs");
+    co_await store.mount().handle_error(
+      mkfs_step_failed("error mounting object store")
+    );
+    // set only once the whole mount succeeded, and cleared before umount():
+    // SeaStore::umount() closes every device unconditionally, and closing a
+    // seastar::file that was never opened (or was already closed) dereferences
+    // a null impl. stop() alone is safe after a partial mount or umount; the
+    // destructors close whatever is still open.
+    mounted = true;
 
-  {
-    auto meta_coll = co_await open_or_create_meta_coll(store);
+    {
+      auto meta_coll = co_await open_or_create_meta_coll(store);
 
-    OSDSuperblock superblock;
-    superblock.cluster_fsid = cluster_fsid;
-    superblock.osd_fsid = store.get_fsid();
-    superblock.whoami = whoami;
-    superblock.compat_features = get_osd_initial_compat_set();
-    co_await _write_superblock(
-      store, std::move(meta_coll), std::move(superblock));
+      OSDSuperblock superblock;
+      superblock.cluster_fsid = cluster_fsid;
+      superblock.osd_fsid = store.get_fsid();
+      superblock.whoami = whoami;
+      superblock.compat_features = get_osd_initial_compat_set();
+      co_await _write_superblock(
+        store, std::move(meta_coll), std::move(superblock));
+    }
+
+    co_await store.write_meta("ceph_fsid", cluster_fsid.to_string());
+
+    co_await store.write_meta("magic", CEPH_OSD_ONDISK_MAGIC);
+
+    co_await store.write_meta("whoami", std::to_string(whoami));
+
+    co_await _write_key_meta(store);
+
+    co_await store.write_meta("osdspec_affinity", osdspec_affinity);
+
+    co_await store.write_meta("ready", "ready");
+
+    INFO("created object store {} for osd.{} fsid {}\n",
+         local_conf().get_val<std::string>("osd_data"),
+         whoami, cluster_fsid);
+    mounted = false;
+    co_await store.umount();
+  } catch (...) {
+    failure = std::current_exception();
   }
 
-  co_await store.write_meta("ceph_fsid", cluster_fsid.to_string());
-
-  co_await store.write_meta("magic", CEPH_OSD_ONDISK_MAGIC);
-
-  co_await store.write_meta("whoami", std::to_string(whoami));
-
-  co_await _write_key_meta(store);
-
-  co_await store.write_meta("osdspec_affinity", osdspec_affinity);
-
-  co_await store.write_meta("ready", "ready");
-
-  INFO("created object store {} for osd.{} fsid {}\n",
-       local_conf().get_val<std::string>("osd_data"),
-       whoami, cluster_fsid);
-  co_await store.umount();
-
-  co_await store.stop();
+  if (failure && mounted) {
+    co_await store.umount().handle_exception([FNAME](auto ep) {
+      ERROR("umount after a failed mkfs also failed: {}", ep);
+    });
+  }
+  co_await store.stop().handle_exception([FNAME, failure](auto ep) {
+    if (!failure) {
+      return seastar::make_exception_future<>(ep);
+    }
+    // keep the original error: it is the one the operator needs to see
+    ERROR("stop after a failed mkfs also failed: {}", ep);
+    return seastar::make_ready_future<>();
+  });
+  if (failure) {
+    std::rethrow_exception(failure);
+  }
 }
 
 seastar::future<> OSD::_write_superblock(
@@ -607,14 +662,13 @@ seastar::future<> OSD::start()
     return _add_me_to_crush();
   });
   co_await _add_device_class();
-  if (is_rotational.has_value()) {
-    co_await shard_services.invoke_on_all([this](auto &local_service) {
-      local_service.local_state.initialize_scheduler(local_service.get_cct(), *is_rotational);
-    });
-  } else {
+  if (!is_rotational.has_value()) {
     WARN("no device class set, defaulting is_rotational to false");
     is_rotational = false;
   }
+  co_await shard_services.invoke_on_all([this](auto &local_service) {
+    local_service.local_state.initialize_scheduler(local_service.get_cct(), *is_rotational);
+  });
   monc->sub_want("osd_pg_creates", last_pg_create_epoch, 0);
   monc->sub_want("mgrmap", 0, 0);
   monc->sub_want("osdmap", 0, 0);
@@ -626,6 +680,7 @@ seastar::future<> OSD::start()
     DEBUG("replacing unkwnown addrs of cluster messenger");
     cluster_msgr->set_myaddrs(addrs);
   }
+  co_await start_cluster_lanes(osd_required);
   co_await heartbeat->start(pick_addresses(CEPH_PICK_ADDRESS_PUBLIC),
                             pick_addresses(CEPH_PICK_ADDRESS_CLUSTER));
   // create the admin-socket server, and the objects that register
@@ -634,6 +689,18 @@ seastar::future<> OSD::start()
   co_await log_client.set_fsid(monc->get_fsid());
   DEBUG("starting boot");
   co_await start_boot();
+}
+
+seastar::future<> OSD::start_cluster_lanes(uint64_t osd_required)
+{
+  LOG_PREFIX(OSD::start_cluster_lanes);
+  INFO("starting a cluster messenger on each reactor");
+  co_await shard_services.invoke_on_all(
+    [this, osd_required, addrs=cluster_msgr->get_myaddrs()]
+    (auto &local_service) {
+    return local_service.start_cluster_lane(
+      nonce, addrs, osd_required, *this, monc.get(), monc.get());
+  });
 }
 
 seastar::future<> OSD::start_boot()
@@ -717,6 +784,14 @@ seastar::future<> OSD::_send_boot()
   auto [ret, type] = co_await store.read_meta("type");
   if (ret == 0) {
     m->metadata["osd_objectstore"] = type;
+  }
+  auto data_backend = co_await store.get_data_backend_type_name();
+  if (!data_backend.empty()) {
+    m->metadata["seastore_data_backend"] = data_backend;
+  }
+  auto cache_backend = co_await store.get_cache_backend_type_name();
+  if (!cache_backend.empty()) {
+    m->metadata["seastore_cache_backend"] = cache_backend;
   }
   co_await monc->send_message(std::move(m));
 }
@@ -812,6 +887,7 @@ seastar::future<> OSD::start_asok_admin()
     asok->register_command(make_asok_hook<SendBeaconHook>(*this));
     asok->register_command(make_asok_hook<RunOSDBenchHook>(*this));
     asok->register_command(make_asok_hook<FlushPgStatsHook>(*this));
+    asok->register_command(make_asok_hook<GetLatestOSDMapHook>(*this));
     asok->register_command(
       make_asok_hook<DumpPGStateHistory>(std::as_const(pg_shard_manager)));
     asok->register_command(make_asok_hook<DumpMetricsHook>());
@@ -864,6 +940,9 @@ seastar::future<> OSD::stop()
     DEBUG("prepared to stop");
     public_msgr->stop();
     cluster_msgr->stop();
+    co_await shard_services.invoke_on_all([](auto &local_service) {
+      local_service.stop_cluster_lane();
+    });
     auto gate_close_fut = gate.close_all();
     co_await asok->stop();
     co_await heartbeat->stop();
@@ -873,6 +952,9 @@ seastar::future<> OSD::stop()
     co_await pg_shard_manager.stop_pgs();
     co_await monc->stop();
     co_await mgrc->stop();
+    co_await shard_services.invoke_on_all([](auto &local_service) {
+      return local_service.shutdown_cluster_lane();
+    });
     co_await shard_services.stop();
     co_await osd_states.stop();
     co_await osd_singleton_state.stop();
@@ -956,6 +1038,9 @@ OSD::do_ms_dispatch(
     return handle_osd_map(boost::static_pointer_cast<MOSDMap>(m));
   case CEPH_MSG_OSD_OP:
     return handle_osd_op(conn, boost::static_pointer_cast<MOSDOp>(m));
+  case CEPH_MSG_PING:
+    // clients ping connections with laggy ops, only to detect their reset
+    return seastar::now();
   case MSG_OSD_PG_CREATE2:
     return handle_pg_create(
       conn, boost::static_pointer_cast<MOSDPGCreate2>(m));
@@ -993,6 +1078,8 @@ OSD::do_ms_dispatch(
   case MSG_OSD_BACKFILL_RESERVE:
     [[fallthrough]];
   case MSG_OSD_RECOVERY_RESERVE:
+    [[fallthrough]];
+  case MSG_OSD_POOLMIGRATION_RESERVE:
     [[fallthrough]];
   case MSG_OSD_PG_LOG:
     return handle_peering_op(conn, boost::static_pointer_cast<MOSDPeeringOp>(m));
@@ -1040,9 +1127,24 @@ OSD::do_ms_dispatch(
 
 void OSD::ms_handle_reset(crimson::net::ConnectionRef conn, bool is_replace)
 {
-  // TODO: cleanup the session attached to this connection
+  // Runs on the connection's home core. Disconnect every watch reachable over
+  // this connection so notifies buffer (and are replayed on reconnect) and the
+  // watch timeout can eventually reap it -- mirrors classic
+  // WatchConState::reset() driven from OSD::ms_handle_reset(). Fire-and-forget:
+  // the reset() fans out one cross-core hop per watch; keep `conn` alive until
+  // it finishes.
   LOG_PREFIX(OSD::ms_handle_reset);
   WARN("{}", *conn);
+  if (!conn->has_user_private()) {
+    INFO("{} has no user private - nothing to reset", *conn);
+    return;
+  }
+  auto& priv = get_osd_priv(&*conn);
+  if (!priv.watch_conn_state) {
+    INFO("{} has no watch connection state - nothing to reset", *conn);
+    return;
+  }
+  std::ignore = priv.watch_conn_state->reset(&*conn).finally([conn] {});
 }
 
 void OSD::ms_handle_remote_reset(crimson::net::ConnectionRef conn)
@@ -1093,6 +1195,32 @@ void OSD::handle_conf_change(
   }
 }
 
+void OSD::check_debug_levels()
+{
+  auto threshold = local_conf().get_val<int64_t>(
+    "high_debug_level_threshold");
+  if (threshold <= 0) {
+    return;
+  }
+  auto timeout = local_conf().get_val<std::chrono::seconds>(
+    "high_debug_level_reset_timeout");
+  auto actions = debug_level_guard.check(
+    local_conf()->subsys, threshold, timeout);
+  for (auto& a : actions) {
+    auto val = std::to_string(a.to_log) + "/" + std::to_string(a.to_gather);
+    LOG_PREFIX(OSD::check_debug_levels);
+    ERROR("Auto-reverted {} from {} to {} after {}s",
+	  a.name, a.from_level, val, timeout.count());
+    gate.dispatch_in_background(
+      "debug_level_revert", *this, [name=a.name, val, FNAME] {
+	return local_conf().set_val(name, val).handle_exception(
+	  [name, val, FNAME](auto ep) {
+	    ERROR("failed to revert {} to {}: {}", name, val, ep);
+	  });
+      });
+  }
+}
+
 void OSD::update_stats()
 {
   gate.dispatch_in_background("statfs", *this, [this] {
@@ -1137,6 +1265,18 @@ seastar::future<uint64_t> OSD::send_pg_stats()
   // mgr client sends the report message in background
   mgrc->report();
   co_return osd_stat.seq;
+}
+
+seastar::future<epoch_t> OSD::wait_for_latest_osdmap()
+{
+  LOG_PREFIX(OSD::wait_for_latest_osdmap);
+  ceph_assert(seastar::this_shard_id() == PRIMARY_CORE);
+  const auto [newest, oldest] = co_await monc->get_version("osdmap");
+  DEBUG("newest osdmap: {}, mine: {}", newest, osdmap->get_epoch());
+  // the OSD-level gate is updated only after all PGs have advanced
+  co_return co_await
+    get_shard_services().local_state.osdmap_gate.wait_for_map_untracked(
+      newest, &get_shard_services());
 }
 
 seastar::future<> OSD::handle_osd_map(Ref<MOSDMap> m)
@@ -1262,8 +1402,12 @@ seastar::future<> OSD::committed_osd_maps(
       // osd_id came from old_map->get_all_osds(); if it was purged in the new
       // osdmap, osdmap->get_cluster_addrs(osd_id) would ceph_assert(exists()).
       // old_map is guaranteed to contain osd_id and holds its last-known addr.
-      co_await cluster_msgr->mark_down(
-        old_map->get_cluster_addrs(osd_id).front());
+      const auto addr = old_map->get_cluster_addrs(osd_id).front();
+      // its lanes connected to us from their own ports
+      co_await cluster_msgr->mark_down_all_ports(addr);
+      co_await shard_services.invoke_on_all([addr](auto &local_service) {
+        return local_service.mark_down_cluster_lane(addr);
+      });
     });
 
     co_await pg_shard_manager.update_map(std::move(o));
@@ -1535,6 +1679,13 @@ vector<DaemonHealthMetric> OSD::get_health_metrics()
     }
     oldest_secs = now - oldest_op->get_started();
     metrics.emplace_back(daemon_metric::SLOW_OPS, slow, oldest_secs);
+  }
+
+  {
+    auto threshold = local_conf().get_val<int64_t>("high_debug_level_threshold");
+    auto [count, max_level] = DebugLevelGuard::count_elevated(
+      local_conf()->subsys, threshold);
+    metrics.emplace_back(daemon_metric::HIGH_DEBUG_LEVEL, count, max_level);
   }
 
   return metrics;

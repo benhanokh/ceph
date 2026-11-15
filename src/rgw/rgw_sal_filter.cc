@@ -525,11 +525,14 @@ void FilterDriver::get_quota(RGWQuota& quota)
   return next->get_quota(quota);
 }
 
-void FilterDriver::get_ratelimit(RGWRateLimitInfo& bucket_ratelimit,
-				RGWRateLimitInfo& user_ratelimit,
-				RGWRateLimitInfo& anon_ratelimit)
+void FilterDriver::get_ratelimit(
+    RGWRateLimitInfo& bucket_ratelimit,
+    RGWRateLimitInfo& user_ratelimit,
+    RGWRateLimitInfo& account_ratelimit,
+    RGWRateLimitInfo& anon_ratelimit)
 {
-  return next->get_ratelimit(bucket_ratelimit, user_ratelimit, anon_ratelimit);
+  return next->get_ratelimit(
+      bucket_ratelimit, user_ratelimit, account_ratelimit, anon_ratelimit);
 }
 
 int FilterDriver::set_buckets_enabled(const DoutPrefixProvider* dpp,
@@ -1036,6 +1039,8 @@ int FilterObject::copy_object(const ACLOwner& owner,
 			      bool high_precision_time,
 			      const char* if_match,
 			      const char* if_nomatch,
+			      const char* dest_if_match,
+			      const char* dest_if_nomatch,
 			      AttrsMod attrs_mod,
 			      bool copy_if_newer,
 			      Attrs& attrs,
@@ -1057,7 +1062,8 @@ int FilterObject::copy_object(const ACLOwner& owner,
 			   nextBucket(src_bucket),
 			   dest_placement, src_mtime, mtime,
 			   mod_ptr, unmod_ptr, high_precision_time, if_match,
-			   if_nomatch, attrs_mod, copy_if_newer, attrs,
+			   if_nomatch, dest_if_match, dest_if_nomatch,
+			   attrs_mod, copy_if_newer, attrs,
 			   category, olh_epoch, delete_at, version_id, tag,
 			   etag, progress_cb, progress_data, dp_factory, dpp, y);
 }
@@ -1081,6 +1087,12 @@ int FilterObject::list_parts(const DoutPrefixProvider* dpp, CephContext* cct,
 int FilterObject::load_obj_state(const DoutPrefixProvider *dpp,
                                  optional_yield y, bool follow_olh) {
   return next->load_obj_state(dpp, y, follow_olh);
+}
+
+int FilterObject::update_olh(const DoutPrefixProvider* dpp, optional_yield y,
+                             uint32_t flags)
+{
+  return next->update_olh(dpp, y, flags);
 }
 
 int FilterObject::set_obj_attrs(const DoutPrefixProvider* dpp, Attrs* setattrs,

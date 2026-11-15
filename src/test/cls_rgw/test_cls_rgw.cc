@@ -159,6 +159,134 @@ TEST_P(TestClsRgw, index_multiple_obj_writers)
   }
 }
 
+// A skipped completion must not lower the entry's version. Three writers'
+// completions arrive at epochs 3, 1 and 2: epoch 1 is stale and skipped,
+// and epoch 2 must then be skipped too, leaving epoch 3's write listed.
+TEST_P(TestClsRgw, index_stale_complete_keeps_newest)
+{
+  string bucket_oid = str_int("bucket", 100);
+
+  ObjectWriteOperation op;
+  cls_rgw_bucket_init_index(op);
+  ASSERT_EQ(0, ioctx.operate(bucket_oid, &op));
+
+  cls_rgw_obj_key obj = str_int("obj", 0);
+  string loc = str_int("loc", 0);
+  const int epochs[] = {3, 1, 2};
+  for (int e : epochs) {
+    index_prepare(ioctx, bucket_oid, CLS_RGW_OP_ADD, str_int("tag", e), obj, loc);
+  }
+  for (int e : epochs) {
+    rgw_bucket_dir_entry_meta meta;
+    meta.category = RGWObjCategory::None;
+    meta.size = 1024 * e;
+    index_complete(ioctx, bucket_oid, CLS_RGW_OP_ADD, str_int("tag", e), e, obj, meta);
+  }
+  test_stats(ioctx, bucket_oid, RGWObjCategory::None, 1, 1024 * 3);
+}
+
+// The null version of a key with an olh, as in a bucket whose versioning
+// is suspended, lives in the null instance entry behind the key's version
+// marker. A stale completion there must not lower its version either.
+TEST_P(TestClsRgw, index_stale_complete_keeps_newest_null_version)
+{
+  string bucket_oid = str_int("bucket", 110);
+
+  ObjectWriteOperation op;
+  cls_rgw_bucket_init_index(op);
+  ASSERT_EQ(0, ioctx.operate(bucket_oid, &op));
+
+  string loc = str_int("loc", 0);
+  // linking a version turns the key's plain entry into a version marker
+  cls_rgw_obj_key version("obj", "v1");
+  index_prepare(ioctx, bucket_oid, CLS_RGW_OP_ADD, "tag-v1", version, loc);
+  rgw_bucket_dir_entry_meta vmeta;
+  vmeta.category = RGWObjCategory::None;
+  vmeta.size = 512;
+  index_complete(ioctx, bucket_oid, CLS_RGW_OP_ADD, "tag-v1", 1, version, vmeta);
+
+  cls_rgw_obj_key null_version("obj");
+  const int epochs[] = {3, 1, 2};
+  for (int e : epochs) {
+    index_prepare(ioctx, bucket_oid, CLS_RGW_OP_ADD, str_int("tag", e), null_version, loc);
+  }
+  for (int e : epochs) {
+    rgw_bucket_dir_entry_meta meta;
+    meta.category = RGWObjCategory::None;
+    meta.size = 1024 * e;
+    index_complete(ioctx, bucket_oid, CLS_RGW_OP_ADD, str_int("tag", e), e, null_version, meta);
+  }
+  test_stats(ioctx, bucket_oid, RGWObjCategory::None, 2, 512 + 1024 * 3);
+}
+
+// A canceled op must not reset the entry's version either: after epoch 2's
+// write, a cancel, and a stale completion at epoch 1, epoch 2's write
+// stays listed.
+TEST_P(TestClsRgw, index_cancel_keeps_newest)
+{
+  string bucket_oid = str_int("bucket", 101);
+
+  ObjectWriteOperation op;
+  cls_rgw_bucket_init_index(op);
+  ASSERT_EQ(0, ioctx.operate(bucket_oid, &op));
+
+  cls_rgw_obj_key obj = str_int("obj", 0);
+  string loc = str_int("loc", 0);
+  index_prepare(ioctx, bucket_oid, CLS_RGW_OP_ADD, "tag-new", obj, loc);
+  index_prepare(ioctx, bucket_oid, CLS_RGW_OP_ADD, "tag-cancel", obj, loc);
+  index_prepare(ioctx, bucket_oid, CLS_RGW_OP_ADD, "tag-old", obj, loc);
+
+  rgw_bucket_dir_entry_meta meta;
+  meta.category = RGWObjCategory::None;
+  meta.size = 2048;
+  index_complete(ioctx, bucket_oid, CLS_RGW_OP_ADD, "tag-new", 2, obj, meta);
+  rgw_bucket_dir_entry_meta cancel_meta;
+  index_complete(ioctx, bucket_oid, CLS_RGW_OP_CANCEL, "tag-cancel", 0, obj, cancel_meta);
+  rgw_bucket_dir_entry_meta old_meta;
+  old_meta.category = RGWObjCategory::None;
+  old_meta.size = 1024;
+  index_complete(ioctx, bucket_oid, CLS_RGW_OP_ADD, "tag-old", 1, obj, old_meta);
+
+  test_stats(ioctx, bucket_oid, RGWObjCategory::None, 1, 2048);
+}
+
+// A delete, a put and a delete, whose completions arrive at epochs 4, 2
+// and 3: the put (epoch 3) is older than the last delete (epoch 4), so no
+// entry may remain.
+TEST_P(TestClsRgw, index_stale_complete_after_delete)
+{
+  string bucket_oid = str_int("bucket", 102);
+
+  ObjectWriteOperation op;
+  cls_rgw_bucket_init_index(op);
+  ASSERT_EQ(0, ioctx.operate(bucket_oid, &op));
+
+  cls_rgw_obj_key obj = str_int("obj", 0);
+  string loc = str_int("loc", 0);
+  {
+    // the object exists at epoch 1
+    index_prepare(ioctx, bucket_oid, CLS_RGW_OP_ADD, "tag-init", obj, loc);
+    rgw_bucket_dir_entry_meta meta;
+    meta.category = RGWObjCategory::None;
+    meta.size = 1024;
+    index_complete(ioctx, bucket_oid, CLS_RGW_OP_ADD, "tag-init", 1, obj, meta);
+  }
+  index_prepare(ioctx, bucket_oid, CLS_RGW_OP_DEL, "tag-del1", obj, loc);
+  index_prepare(ioctx, bucket_oid, CLS_RGW_OP_ADD, "tag-put", obj, loc);
+  index_prepare(ioctx, bucket_oid, CLS_RGW_OP_DEL, "tag-del2", obj, loc);
+
+  rgw_bucket_dir_entry_meta del_meta;
+  del_meta.category = RGWObjCategory::None;
+  index_complete(ioctx, bucket_oid, CLS_RGW_OP_DEL, "tag-del2", 4, obj, del_meta);
+  index_complete(ioctx, bucket_oid, CLS_RGW_OP_DEL, "tag-del1", 2, obj, del_meta);
+  rgw_bucket_dir_entry_meta put_meta;
+  put_meta.category = RGWObjCategory::None;
+  put_meta.size = 2048;
+  index_complete(ioctx, bucket_oid, CLS_RGW_OP_ADD, "tag-put", 3, obj, put_meta);
+
+  test_stats(ioctx, bucket_oid, RGWObjCategory::None, 0, 0);
+}
+
 TEST_P(TestClsRgw, index_remove_object)
 {
   string bucket_oid = str_int("bucket", 2);
@@ -575,6 +703,131 @@ TEST_P(TestClsRgw, index_list_delimited)
   ASSERT_EQ("u-4", id_entry_map.crbegin()->first);
 }
 
+// link the null version of an object or delete marker
+static void link_null_version(librados::IoCtx& ioctx, const string& oid,
+                              const string& name, const string& olh_tag,
+                              bool delete_marker,
+                              const rgw_bucket_dir_entry_meta& meta)
+{
+  bufferlist olh_tag_bl;
+  olh_tag_bl.append(olh_tag);
+  rgw_zone_set zone_set;
+  ASSERT_EQ(0, cls_rgw_bucket_link_olh(ioctx, oid, cls_rgw_obj_key(name),
+                                       olh_tag_bl, delete_marker, olh_tag,
+                                       &meta, 0, ceph::real_time{}, true,
+                                       true, zone_set));
+}
+
+static void list_one(librados::IoCtx& ioctx, const string& oid,
+                     const cls_rgw_obj_key& start_key,
+                     rgw_bucket_dir_entry& entry)
+{
+  rgw_cls_list_ret listing;
+  list_entries(ioctx, oid, 1, listing, start_key);
+  ASSERT_EQ(1u, listing.dir.m.size());
+  entry = listing.dir.m.begin()->second;
+}
+
+// a listing resumes after a null version, object or delete marker, when
+// the start key names it "null", as s3 clients do with NextVersionIdMarker
+TEST_P(TestClsRgw, index_list_resume_after_null_version)
+{
+  string bucket_oid = str_int("bucket", 120);
+
+  ObjectWriteOperation op;
+  cls_rgw_bucket_init_index(op);
+  ASSERT_EQ(0, ioctx.operate(bucket_oid, &op));
+
+  string loc = str_int("loc", 0);
+  rgw_bucket_dir_entry_meta meta;
+  meta.category = RGWObjCategory::None;
+  meta.size = 1024;
+  meta.mtime = ceph::real_clock::now();
+
+  // objects "a" and "b"
+  //   - PUT after versioning was suspended
+  // so each is a lone "null" version
+  for (const string name : {"a", "b"}) {
+    string tag = "tag-" + name;
+    index_prepare(ioctx, bucket_oid, CLS_RGW_OP_ADD, tag, name, loc);
+    index_complete(ioctx, bucket_oid, CLS_RGW_OP_ADD, tag, 1, name, meta);
+    ASSERT_NO_FATAL_FAILURE(
+        link_null_version(ioctx, bucket_oid, name, tag, false, meta));
+  }
+
+  // for object "c"
+  //   - PUT when versioning enabled -> v1
+  //   - DELETE after suspend
+  // so "c" has a "null" DM on top of v1
+  {
+    cls_rgw_obj_key version("c", "v1");
+    index_prepare(ioctx, bucket_oid, CLS_RGW_OP_ADD, "tag-c", version, loc);
+    index_complete(ioctx, bucket_oid, CLS_RGW_OP_ADD, "tag-c", 1, version, meta);
+    ASSERT_NO_FATAL_FAILURE(
+        link_null_version(ioctx, bucket_oid, "c", "tag-c", true, {}));
+  }
+
+  // object "d"
+  //   - DELETE after suspend
+  // so "d" has a lone DM only
+  ASSERT_NO_FATAL_FAILURE(
+      link_null_version(ioctx, bucket_oid, "d", "tag-d", true, {}));
+
+  // objects "e" and "f" are plain entries
+  // PUT before versioning was enabled
+  for (const string name : {"e", "f"}) {
+    string tag = "tag-" + name;
+    index_prepare(ioctx, bucket_oid, CLS_RGW_OP_ADD, tag, name, loc);
+    index_complete(ioctx, bucket_oid, CLS_RGW_OP_ADD, tag, 1, name, meta);
+  }
+
+  // so at this point the index lists, in order (version markers are not
+  // listed, and the versions of a name sort newest first):
+  /*
+     key       version   entry                              flags
+     a                   version marker                       8
+     a         null      a, null version, current             3
+     b                   version marker                       8
+     b         null      b, null version, current             3
+     c                   version marker                       8
+     c         null      c, null delete marker, current       7
+     c         v1        c[v1], hidden behind the marker      1   * the victim
+     d                   version marker                       8
+     d         null      d, lone null delete marker           7
+     e                   plain entry                          0
+     f                   plain entry                          0
+  */
+  // to resume after a "null" version, the listing looks up its instance
+  // entry; a null delete marker keeps that entry under a different key
+  // than a null object does
+
+  rgw_bucket_dir_entry entry;
+
+  // assume each page has 1 entry
+  // start listing with no key -> from the first entry
+  ASSERT_NO_FATAL_FAILURE(list_one(ioctx, bucket_oid, {}, entry));
+  ASSERT_EQ(cls_rgw_obj_key("a"), entry.key);
+  ASSERT_TRUE(entry.flags & rgw_bucket_dir_entry::FLAG_VER);
+  ASSERT_TRUE(entry.is_current());
+
+  ASSERT_NO_FATAL_FAILURE(list_one(ioctx, bucket_oid, {"a", "null"}, entry));
+  EXPECT_EQ(cls_rgw_obj_key("b"), entry.key);
+
+  ASSERT_NO_FATAL_FAILURE(list_one(ioctx, bucket_oid, {"b", "null"}, entry));
+  ASSERT_EQ(cls_rgw_obj_key("c"), entry.key);
+  ASSERT_TRUE(entry.is_delete_marker());
+
+  // after the null delete marker comes the version it hides
+  ASSERT_NO_FATAL_FAILURE(list_one(ioctx, bucket_oid, {"c", "null"}, entry));
+  EXPECT_EQ(cls_rgw_obj_key("c", "v1"), entry.key);
+
+  ASSERT_NO_FATAL_FAILURE(list_one(ioctx, bucket_oid, {"d", "null"}, entry));
+  EXPECT_EQ(cls_rgw_obj_key("e"), entry.key);
+
+  // "null" past an unversioned entry moves on to the next name
+  ASSERT_NO_FATAL_FAILURE(list_one(ioctx, bucket_oid, {"e", "null"}, entry));
+  EXPECT_EQ(cls_rgw_obj_key("f"), entry.key);
+}
 
 TEST_P(TestClsRgw, bi_list)
 {

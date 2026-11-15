@@ -24,11 +24,7 @@ def test_mocked_fs_authorizer():
         fsauth.authorize_entity('cephfs', 'client.smb.kaboom')
 
 
-def test_mocked_fs_path_resolver(monkeypatch):
-    # we have to "re-patch" whatever cephfs module gets mocked with because
-    # the ObjectNotFound attribute is not an exception in the test environment
-    monkeypatch.setattr('cephfs.ObjectNotFound', KeyError)
-
+def test_mocked_fs_path_resolver():
     def mmcmd(cmd):
         if cmd['prefix'] == 'fs subvolume getpath':
             if cmd['vol_name'] == 'cephfs' and cmd['sub_name'] == 'beta':
@@ -68,6 +64,34 @@ def test_mocked_fs_path_resolver(monkeypatch):
     )
     with pytest.raises(FileNotFoundError):
         fspr.resolve_exists('cephfs', 'alpha', 'beta', '/zowie')
+
+    # resolve_case_sensitivity
+    m.connection_pool.get_fs_handle.return_value.statx.side_effect = None
+    m.connection_pool.get_fs_handle.return_value.statx.return_value = {
+        'mode': 0o41777
+    }
+    m.connection_pool.get_fs_handle.return_value.getxattr.return_value = b'0'
+    found, sensitive = fspr.resolve_case_sensitivity(
+        'cephfs', 'alpha', 'beta', '/zowie'
+    )
+    assert found
+    assert not sensitive
+
+    m.connection_pool.get_fs_handle.return_value.getxattr.return_value = b'1'
+    found, sensitive = fspr.resolve_case_sensitivity(
+        'cephfs', 'alpha', 'beta', '/zowie'
+    )
+    assert found
+    assert sensitive
+
+    m.connection_pool.get_fs_handle.return_value.getxattr.side_effect = (
+        mock.MagicMock(side_effect=OSError('empty'))
+    )
+    found, sensitive = fspr.resolve_case_sensitivity(
+        'cephfs', 'alpha', 'beta', '/zowie'
+    )
+    assert not found
+    assert sensitive
 
 
 class TestTTLCache(unittest.TestCase):
@@ -120,9 +144,7 @@ class TestTTLCache(unittest.TestCase):
         self.assertIsNone(self.cache.get(('key1', 'key2', 'key3')))
 
 
-def test_caching_fs_path_resolver(monkeypatch):
-    monkeypatch.setattr('cephfs.ObjectNotFound', KeyError)
-
+def test_caching_fs_path_resolver():
     def mmcmd(cmd):
         if cmd['prefix'] == 'fs subvolume getpath':
             if (

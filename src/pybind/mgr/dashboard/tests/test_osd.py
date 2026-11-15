@@ -9,7 +9,7 @@ from ceph.deployment.service_spec import PlacementSpec
 
 from .. import mgr
 from ..controllers._version import APIVersion
-from ..controllers.osd import Osd, OsdUi
+from ..controllers.osd import Osd, OsdFlagsController, OsdUi
 from ..services.osd import OsdDeploymentOptions
 from ..tests import ControllerTestCase
 from ..tools import NotificationQueue, TaskManager
@@ -283,6 +283,40 @@ class OsdTest(ControllerTestCase):
             self.assertEqual(len(self.json_body()), 2, 'It should display two OSDs without failure')
             self.assertStatus(200)
 
+    def test_osd_list_host_with_intermediate_crush_bucket(self):
+        osd_ids = [0, 1]
+        tree_nodes = OsdHelper.gen_osdmap_tree_nodes(osd_ids)
+
+        host = next(node for node in tree_nodes if node['type'] == 'host')
+        host['children'] = [-4]
+
+        tree_nodes.insert(2, {
+            'id': -4,
+            'name': 'ceph-1-dg1',
+            'type': 'diskgroup',
+            'type_id': 1,
+            'pool_weights': {},
+            'children': osd_ids
+        })
+
+        osd_map = {
+            int(osd_id): osd
+            for osd_id, osd in OsdHelper.gen_osdmap(osd_ids).items()
+        }
+        with mock.patch.object(OsdHelper, 'gen_osdmap', return_value=osd_map), \
+                mock.patch.object(OsdHelper, 'gen_osdmap_tree_nodes',
+                                  return_value=tree_nodes):
+            with self._mock_osd_list(osd_stat_ids=osd_ids,
+                                     osdmap_tree_node_ids=osd_ids,
+                                     osdmap_ids=osd_ids):
+                self._get('/api/osd', version=APIVersion(1, 1))
+                self.assertStatus(200)
+                result = self.json_body()
+                self.assertEqual(len(result), len(osd_ids))
+                for osd in result:
+                    self.assertEqual(osd['host']['id'], -3)
+                    self.assertEqual(osd['host']['name'], 'ceph-1')
+
     @mock.patch('dashboard.controllers.osd.CephService')
     def test_osd_scrub(self, ceph_service):
         self._task_post('/api/osd/1/scrub', {'deep': True})
@@ -530,3 +564,25 @@ class OsdTest(ControllerTestCase):
         removing_osds = osd.get_removing_osds()
 
         self.assertEqual(removing_osds, [7, 8])
+
+
+class OsdFlagsTest(ControllerTestCase):
+    FLAGS = ['pglog_hardlimit', 'purged_snapdirs', 'recovery_deletes',
+             'sortbitwise']
+
+    @classmethod
+    def setup_server(cls):
+        cls.setup_controllers([OsdFlagsController])
+
+    @mock.patch('dashboard.controllers.osd.CephService')
+    def test_stretch_zones_is_not_a_flag(self, ceph_service):
+        osd_map = {'flags_set': self.FLAGS + ['stretch_zones']}
+        with mock.patch.object(mgr, 'get', return_value=osd_map):
+            self._get('/api/osd/flags')
+            self.assertStatus(200)
+            self.assertJsonBody(self.FLAGS)
+            self._put('/api/osd/flags', {'flags': self.FLAGS + ['noout']})
+            self.assertStatus(200)
+            self.assertJsonBody(sorted(self.FLAGS + ['noout']))
+        ceph_service.send_command.assert_called_once_with(
+            'mon', 'osd set', '', key='noout')

@@ -781,6 +781,10 @@ def ceph_bootstrap(ctx, config):
             cmd += ['--skip-monitoring-stack']
         if config.get('single_host_defaults'):
             cmd += ['--single-host-defaults']
+        if config.get('allow_mismatched_release'):
+            cmd += ['--allow-mismatched-release']
+        if config.get('log_to_file'):
+            cmd += ['--log-to-file']
         if not config.get('avoid_pacific_features', False):
             cmd += ['--skip-admin-label']
         # bootstrap makes the keyring root 0600, so +r it for our purposes
@@ -1519,14 +1523,24 @@ def ceph_clients(ctx, config):
 
 @contextlib.contextmanager
 def watchdog_setup(ctx, config):
-    ctx.ceph[config['cluster']].thrashers = []
-    ctx.ceph[config['cluster']].watched_processes = []
-    if 'watchdog_setup' in config:
-        ctx.ceph[config['cluster']].watchdog = DaemonWatchdog(ctx, config)
-        ctx.ceph[config['cluster']].watchdog.start()
-    else:
-        ctx.ceph[config['cluster']].watchdog = None
-    yield
+    cluster = config['cluster']
+    thrashers = []
+    ctx.ceph[cluster].thrashers = thrashers
+    ctx.ceph[cluster].watched_processes = []
+    watchdog = DaemonWatchdog(ctx, config)
+    ctx.ceph[cluster].watchdog = watchdog
+    watchdog.start()
+    try:
+        yield
+    finally:
+        log.info("Tearing down thrashers...")
+        for thrasher in thrashers:
+            thrasher.stop()
+        for thrasher in thrashers:
+            thrasher.join()
+        log.info("Tearing down watchdog...")
+        watchdog.stop()
+        watchdog.join()
 
 @contextlib.contextmanager
 def ceph_initial():
@@ -1568,10 +1582,11 @@ def stop(ctx, config):
         ctx.daemons.get_daemon(type_, id_, cluster).stop()
         clusters.add(cluster)
     
-    if ctx.ceph[cluster].watchdog:
-        for cluster in clusters:
-            ctx.ceph[cluster].watchdog.stop()
-            ctx.ceph[cluster].watchdog.join()
+    for cluster in clusters:
+        watchdog = ctx.ceph[cluster].watchdog
+        if watchdog:
+            watchdog.stop()
+            watchdog.join()
 
     yield
 
@@ -1960,9 +1975,6 @@ def initialize_config(ctx, config):
     cluster_name = config['cluster']
     testdir = teuthology.get_testdir(ctx)
 
-    ctx.ceph[cluster_name].thrashers = []
-    # fixme: setup watchdog, ala ceph.py
-
     ctx.ceph[cluster_name].roleless = False  # see below
 
     first_ceph_cluster = False
@@ -2184,8 +2196,8 @@ def task(ctx, config):
             lambda: ceph_monitoring('grafana', ctx=ctx, config=config),
             lambda: ceph_clients(ctx=ctx, config=config),
             lambda: create_rbd_pool(ctx=ctx, config=config),
-            lambda: conf_epoch(ctx=ctx, config=config),
             lambda: watchdog_setup(ctx=ctx, config=config),
+            lambda: conf_epoch(ctx=ctx, config=config),
     ):
         try:
             if config.get('wait-for-healthy', True):
@@ -2196,4 +2208,46 @@ def task(ctx, config):
 
         finally:
             log.info('Teardown begin')
+
+
+            if hasattr(ctx.ceph[cluster_name], 'bootstrap_remote'):
+                log.info('Tearing down any agents...')
+                try:
+                    _shell(
+                        ctx,
+                        cluster_name,
+                        ctx.ceph[cluster_name].bootstrap_remote,
+                        ['ceph', 'config', 'set', 'mgr', 'mgr/cephadm/use_agent', 'false'],
+                        check_status=False,
+                    )
+
+                    log.info('Waiting for agent daemons to be removed (up to 5m)...')
+                    with contextutil.safe_while(
+                        sleep=5,
+                        tries=60,
+                        action='waiting for cephadm agent daemons to stop',
+                    ) as proceed:
+                        while proceed():
+                            r = _shell(
+                                ctx,
+                                cluster_name,
+                                ctx.ceph[cluster_name].bootstrap_remote,
+                                ['ceph', 'orch', 'ps', '--daemon_type', 'agent', '--refresh', '-f', 'json'],
+                                stdout=StringIO(),
+                                check_status=False,
+                            )
+                            if r.exitstatus:
+                                log.warning("'ceph orch ps' command failed with error code {}. Stopping test...".format(r))
+                                return
+                            try:
+                                daemons = json.loads(r.stdout.getvalue())
+                                if not daemons:
+                                    log.info('All agent daemons successfully removed.')
+                                    break
+                                log.info(f'Still waiting for {len(daemons)} agent daemon(s) to be removed...')
+                            except (ValueError, json.JSONDecodeError):
+                                log.warning('Failed to parse orch ps output, will retry...')
+                except Exception as e:
+                    log.warning(f'Encountered exception while waiting for agent teardown: {e}')
+
 

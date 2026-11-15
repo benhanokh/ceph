@@ -219,12 +219,12 @@ export class RbdFormComponent extends CdForm implements OnInit {
         mirroring: new UntypedFormControl(false),
         schedule: new UntypedFormControl('', {
           validators: [
-            Validators.pattern(/^([0-9]+)d|([0-9]+)h|([0-9]+)m$/),
+            Validators.pattern(/^[0-9]+[wdhm]$/),
             CdValidators.requiredIf({
               mirroringMode: this.rbdMirrorModes.snapshot,
               mirroring: true
             })
-          ] // check schedule interval to be in format - 1d or 1h or 1m
+          ] // check schedule interval to be in format - 1w or 1d or 1h or 1m
         }),
         mirroringMode: new UntypedFormControl(''),
         stripingUnit: new UntypedFormControl(this.defaultStripingUnit),
@@ -432,7 +432,7 @@ export class RbdFormComponent extends CdForm implements OnInit {
     const dataPools = [];
     for (const pool of data) {
       if (this.rbdService.isRBDPool(pool)) {
-        if (pool.type === 'replicated') {
+        if (this.rbdService.isRBDCapablePool(pool)) {
           pools.push(pool);
           dataPools.push(pool);
         } else if (pool.type === 'erasure' && pool.flags_names.indexOf('ec_overwrites') !== -1) {

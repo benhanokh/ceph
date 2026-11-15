@@ -94,6 +94,7 @@ cpdef enum:
     CEPH_SNAP_MD_OP_CREATE = (1 << 0)
     CEPH_SNAP_MD_OP_EXCL   = (1 << 1)
     CEPH_SNAP_MD_OP_REMOVE = (1 << 2)
+    CEPH_SNAP_MD_OP_UPDATE = (1 << 3)
 
 
 # XXX: errno definitions, hard-coded numbers here are errnos defined by Linux
@@ -415,9 +416,54 @@ cdef class SnapDiffHandle(object):
         self.lib.require_state("mounted")
         with nogil:
             ret = ceph_close_snapdiff(&self.handle)
+        self.opened = 0
         if ret < 0:
             raise make_ex(ret, "closesnapdiff failed")
+
+cdef class SnapDiffHandle2(object):
+    cdef LibCephFS lib
+    cdef ceph_snapdiff_info2 *handle
+    cdef int opened
+
+    def __cinit__(self, _lib):
         self.opened = 0
+        self.lib = _lib
+        self.handle = NULL
+
+    def __dealloc__(self):
+        self.close()
+
+    def readdir(self):
+        self.lib.require_state("mounted")
+
+        cdef:
+            ceph_snapdiff_entry_t difent
+        with nogil:
+            ret = ceph_readdir_snapdiff2(self.handle, &difent)
+        if ret < 0:
+            raise make_ex(ret, "ceph_readdir_snapdiff2 failed, ret {}"
+                .format(ret))
+        if ret == 0:
+            return None
+
+        return DirEntry(d_ino=difent.dir_entry.d_ino,
+                        d_off=DIRENT_D_OFF(&difent.dir_entry),
+                        d_reclen=difent.dir_entry.d_reclen,
+                        d_type=difent.dir_entry.d_type,
+                        d_name=difent.dir_entry.d_name,
+                        d_snapid=difent.snapid)
+
+    def close(self):
+        if (not self.opened):
+            return
+        self.lib.require_state("mounted")
+        with nogil:
+            ret = ceph_close_snapdiff2(self.handle)
+        self.opened = 0
+        self.handle = NULL
+        if ret < 0:
+            raise make_ex(ret, "closesnapdiff2 failed")
+
 
 
 def cstr(val, name, encoding="utf-8", opt=False) -> bytes:
@@ -1088,7 +1134,7 @@ cdef class LibCephFS(object):
 
         return handle.close()
 
-    def opensnapdiff(self, root_path, rel_path, snap1name, snap2name, diff_mask) -> SnapDiffHandle:
+    def opensnapdiff(self, root_path, rel_path, snap1name, snap2name) -> SnapDiffHandle:
         """
         Open the given directory.
 
@@ -1108,11 +1154,48 @@ cdef class LibCephFS(object):
             char* _relp = relp
             char* _snap1 = snap1
             char* _snap2 = snap2
-            unsigned _diff_mask = diff_mask
         with nogil:
-            ret = ceph_open_snapdiff(self.cluster, _root, _relp, _snap1, _snap2, _diff_mask, &h.handle);
+            ret = ceph_open_snapdiff(self.cluster, _root, _relp, _snap1, _snap2, &h.handle);
         if ret < 0:
             raise make_ex(ret, "open_snapdiff failed for {} vs. {}"
+                .format(snap1.decode('utf-8'), snap2.decode('utf-8')))
+        h.opened = 1
+        return h
+
+    def opensnapdiff2(self, root_path, rel_path, snap1name, snap2name, diff_mask) -> SnapDiffHandle2:
+        """
+        Open the given directory and initialize a v2 snapdiff stream.
+
+        :param root_path: root path for snapshots-in-question
+        :param rel_path: subpath under the root to build delta for
+        :param snap1name: the first snapshot name
+        :param snap2name: the second snapshot name
+        :param diff_mask: integer mask to modify snapdiff behavior
+        :returns: the open directory stream handle (SnapDiffHandle2)
+        """
+        self.require_state("mounted")
+
+        h = SnapDiffHandle2(self)
+        root = cstr(root_path, 'root')
+        relp = cstr(rel_path, 'relp')
+        snap1 = cstr(snap1name, 'snap1')
+        snap2 = cstr(snap2name, 'snap2')
+
+        if not isinstance(diff_mask, int):
+            raise TypeError('diff_mask must be an int')
+
+        cdef:
+            char* _root = root
+            char* _relp = relp
+            char* _snap1 = snap1
+            char* _snap2 = snap2
+            unsigned _diff_mask = diff_mask
+
+        with nogil:
+            ret = ceph_open_snapdiff2(self.cluster, _root, _relp, _snap1, _snap2, _diff_mask, &h.handle)
+
+        if ret < 0:
+            raise make_ex(ret, "open_snapdiff2 failed for {} vs. {}"
                 .format(snap1.decode('utf-8'), snap2.decode('utf-8')))
         h.opened = 1
         return h
@@ -3703,6 +3786,9 @@ class CptreeDir:
         self.dst_fd = self.fs.openat(self.parent_dir_dst_fd, self.dst_rel_path,
                                      os.O_RDONLY | os.O_DIRECTORY, 0o755)
 
+        # Filename ciphertext was produced with this directory's nonce.
+        copy_fscrypt_xattrs(self.fs, self.src_fd, self.dst_fd)
+
         self.src_handle = self.fs.fdopendir(self.src_fd)
 
         # List of dir entries to be ignored instead of copying them.
@@ -3817,28 +3903,29 @@ def copy_reg_file(fs, src_fd, dst_fd, file_name, should_sync_attrs=False):
         src_file_fd = fs.openat(src_fd, file_name, os.O_RDONLY, 0o755)
         dst_file_fd = fs.openat(dst_fd, file_name, os.O_CREAT | os.O_TRUNC |
                                 os.O_WRONLY, 0o755)
-    except Exception:
-        if src_file_fd:
+
+        while True:
+            data = fs.read(src_file_fd, -1, 1 * 1024 * 1024)
+            if not len(data):
+                break
+
+            written = 0
+            while written < len(data):
+                written += fs.write(dst_file_fd, data[written:], -1)
+
+        # The bytes just written are the source ciphertext. Keep the nonce
+        # that decrypts them, then the logical size.
+        copy_fscrypt_xattrs(fs, src_file_fd, dst_file_fd)
+
+        if should_sync_attrs:
+            sync_attrs(fs, src_fd, dst_fd, file_name)
+
+        fs.fsync(dst_file_fd, 0)
+    finally:
+        if src_file_fd is not None:
             fs.close(src_file_fd)
-        if dst_file_fd:
+        if dst_file_fd is not None:
             fs.close(dst_file_fd)
-        raise
-
-    while True:
-        data = fs.read(src_file_fd, -1, 1 * 1024 * 1024)
-        if not len(data):
-            break
-
-        written = 0
-        while written < len(data):
-            written += fs.write(dst_file_fd, data[written:], -1)
-
-    if should_sync_attrs:
-        sync_attrs(fs, src_fd, dst_fd, file_name)
-
-    fs.fsync(dst_file_fd, 0)
-    fs.close(src_file_fd)
-    fs.close(dst_file_fd)
 
 
 def copy_sym_link(fs, src_fd, dst_fd, de_name, should_sync_attrs=False):
@@ -3863,5 +3950,36 @@ def copy_sym_link(fs, src_fd, dst_fd, de_name, should_sync_attrs=False):
                  f'symlink: {e}')
         raise
 
+    src_sl_fd = dst_sl_fd = None
+    try:
+        src_sl_fd = fs.openat(src_fd, de_name, os.O_PATH | os.O_NOFOLLOW, 0)
+        dst_sl_fd = fs.openat(dst_fd, de_name, os.O_PATH | os.O_NOFOLLOW, 0)
+        copy_fscrypt_xattrs(fs, src_sl_fd, dst_sl_fd)
+    finally:
+        if src_sl_fd is not None:
+            fs.close(src_sl_fd)
+        if dst_sl_fd is not None:
+            fs.close(dst_sl_fd)
+
     if should_sync_attrs:
         sync_attrs(fs, src_fd, dst_fd, de_name, src_stx_b)
+
+
+# Ciphertext copied by cptree decrypts only with the source nonce. auth is
+# applied before file so the logical-size update does not discard the blocks.
+_FSCRYPT_CLONE_XATTRS = (
+    'ceph.fscrypt.auth',
+    'ceph.fscrypt.file',
+    'ceph.alternate_name',
+)
+
+
+def copy_fscrypt_xattrs(fs, src_fd, dst_fd):
+    for name in _FSCRYPT_CLONE_XATTRS:
+        try:
+            # Getter uses a 256-byte buffer. alternate_name is at most 255.
+            value = fs.fgetxattr(src_fd, name, 256)
+        except NoData:
+            continue
+        if value:
+            fs.fsetxattr(dst_fd, name, value, 0)

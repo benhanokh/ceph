@@ -127,6 +127,7 @@
 #define MSG_OSD_BACKFILL_RESERVE 99
 #define MSG_OSD_RECOVERY_RESERVE 150
 #define MSG_OSD_FORCE_RECOVERY 151
+#define MSG_OSD_POOLMIGRATION_RESERVE 152
 
 #define MSG_OSD_PG_PUSH        105
 #define MSG_OSD_PG_PULL        106
@@ -156,6 +157,8 @@
 
 #define MSG_OSD_PG_LEASE        133
 #define MSG_OSD_PG_LEASE_ACK    134
+
+#define MSG_OSD_PG_MIGRATED_POOL 137
 
 // *** MDS ***
 
@@ -256,6 +259,7 @@
 
 // *** gw daemons -> nvmeof mon  ***
 #define MSG_MNVMEOF_GW_BEACON     0x801
+
 
 // ======================================================
 

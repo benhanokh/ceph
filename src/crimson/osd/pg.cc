@@ -225,9 +225,9 @@ void PG::clear_publish_stats()
   pg_stats.reset();
 }
 
-pg_stat_t PG::get_stats() const
+std::optional<pg_stat_t> PG::get_stats() const
 {
-  return pg_stats.value_or(pg_stat_t{});
+  return pg_stats;
 }
 
 void PG::apply_stats(
@@ -400,7 +400,7 @@ void PG::on_replica_activate()
   scrubber.on_replica_activate();
 }
 
-void PG::on_activate_complete()
+void PG::on_activate_complete(HBHandle *handle)
 {
   /* Confusingly, on_activate_complete is invoked when the primary and replicas
    * have recorded the current interval.  At that point, the PG may either become
@@ -684,6 +684,10 @@ void PG::initiate_snap_trim()
 
 void PG::kick_snap_trim()
 {
+  // Scrub completion may try to resume snaptrim during PG shutdown.
+  if (stopping) {
+    return;
+  }
   if (peering_state.is_active() && peering_state.is_clean()
       && !snap_trimq.empty()
       && !peering_state.state_test(PG_STATE_SNAPTRIM)) {
@@ -1018,6 +1022,7 @@ PG::interruptible_future<PG::rep_op_fut_t>
 PG::submit_transaction(
   ObjectContextRef&& obc,
   ObjectContextRef&& new_clone,
+  ObjectContextRef&& rollback_to,
   ceph::os::Transaction&& txn,
   osd_op_params_t&& osd_op_p,
   std::vector<pg_log_entry_t>&& log_entries)
@@ -1034,6 +1039,9 @@ PG::submit_transaction(
 
   peering_state.pre_submit_op(obc->obs.oi.soid, log_entries, at_version);
   peering_state.update_trim_to();
+  // OpsExecuter captured pg_trim_to before update_trim_to() ran; use the
+  // fresh value so this op applies the trim it just computed
+  osd_op_p.pg_trim_to = peering_state.get_pg_trim_to();
 
   ceph_assert(!log_entries.empty());
   ceph_assert(log_entries.rbegin()->version >= projected_last_update);
@@ -1047,6 +1055,7 @@ PG::submit_transaction(
       peering_state.get_acting_recovery_backfill(),
       std::move(obc),
       std::move(new_clone),
+      std::move(rollback_to),
       std::move(txn),
       std::move(osd_op_p),
       peering_state.get_last_peering_reset(),
@@ -1220,6 +1229,7 @@ PG::run_executer_fut PG::run_executer(
     [FNAME, obc_data = duplicate_obc_data(obc), &ox, this](auto &obc) mutable {
       // First, revert the OBC state
       obc->update_from(obc_data);
+      ox.rollback_attr_cache();
       // Then clean up any prepared clone OBCs
       if (ox.has_cloning_ctx()) {
         const auto coid = ox.get_cloning_coid();
@@ -1701,6 +1711,7 @@ seastar::future<> PG::stop()
   co_await osdmap_gate.stop();
   co_await wait_for_active_blocker.stop();
   client_request_orderer.clear_and_cancel(*this);
+  scrubber.stop();
   co_await recovery_handler->stop();
   co_await recovery_backend->stop();
   co_await backend->stop();
@@ -1731,6 +1742,9 @@ void PG::on_change(ceph::os::Transaction &t) {
   auto _t = osdriver.get_transaction(&t);
   snap_mapper.flush_and_reset_backend(&_t);
   reset_pglog_based_recovery_op();
+  if (is_primary()) {
+    recovery_handler->cancel_backfill();
+  }
 }
 
 void PG::context_registry_on_change() {
@@ -2123,4 +2137,11 @@ void PG::merge_from(
   rctx.transaction.collection_set_bits(coll_ref->get_cid(), split_bits);
   snap_mapper.update_bits(split_bits);
 }
+
+std::optional<hobject_t> PG::consider_updating_migration_watermark(
+  std::set<hobject_t> &deleted) {
+  // TODO: Implement migration watermark logic
+  return std::nullopt;  // For now, return empty
+}
+
 }

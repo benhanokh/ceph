@@ -32,6 +32,7 @@
 #include "common/ceph_context.h"
 #include "common/ceph_mutex.h"
 #include "common/ceph_time.h"
+#include "common/ceph_time_fmt.h"
 #include "include/ceph_assert.h"
 #include "include/common_fwd.h"
 #include "common/perf_counters_collection.h"
@@ -435,6 +436,7 @@ bool WebCache<Key, Value>::remove_if(
         sieve_remove_unmutexed(_sieve_queue, _sieve_hand, search->second);
     _lookup.erase(search);
     _sieve_hand = hand_moved;
+    perf_set(Metric::size, _lookup.size());
     return true;
   }
   return false;

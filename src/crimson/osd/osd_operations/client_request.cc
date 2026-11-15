@@ -219,6 +219,13 @@ ClientRequest::interruptible_future<> ClientRequest::with_pg_process_interruptib
       pg.get_perf_logger().inc(l_osd_replica_read_redirect_conflict);
       co_await reply_op_error(pgref, -EAGAIN);
       co_return;
+    } else if (op_info.is_primary_only()) {
+      // some requests such as watch/notify/notify_ack can only be handled by the primary,
+      // fail these with EAGAIN to get the client to retry against the primary.
+      DEBUGDPP("{}.{}: op must be processed by primary, bouncing to primary",
+	       pg, *this, this_instance_id);
+      co_await reply_op_error(pgref, -EAGAIN);
+      co_return;
     } else {
       DEBUGDPP("{}.{}: serving replica read on oid {}",
 	       pg, *this, this_instance_id, m->get_hobj());
@@ -596,11 +603,12 @@ ClientRequest::do_process(
 	  break;
 	}
       }
-    } else if (result > 0 && op_info.may_write() && !op_info.allows_returnvec()) {
-      result = 0;
     } else if (result < 0 &&
 	     (m->ops.empty() ?
 	      0 : m->ops.back().op.flags & CEPH_OSD_OP_FLAG_FAILOK)) {
+      result = 0;
+    }
+    if (result > 0 && op_info.may_write() && !op_info.allows_returnvec()) {
       result = 0;
     }
     auto reply = crimson::make_message<MOSDOpReply>(

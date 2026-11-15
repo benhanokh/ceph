@@ -2,11 +2,11 @@
 #include "IoOp.h"
 
 #include <algorithm>
-#include <execution>
 #include <iterator>
 #include <random>
 
 using ObjectModel = ceph::io_exerciser::ObjectModel;
+using SingleSparseReadOp = ceph::io_exerciser::SingleSparseReadOp;
 
 ObjectModel::ObjectModel(const std::string& primary_oid, const std::string& secondary_oid,
                          uint64_t block_size, int seed, bool delete_objects)
@@ -86,8 +86,7 @@ void ObjectModel::applyIoOp(IoOp& op) {
           if (writeOp.offset[i] + writeOp.length[i] > primary_contents.size()) {
             primary_contents.resize(writeOp.offset[i] + writeOp.length[i]);
           }
-          std::generate(std::execution::seq,
-                        std::next(primary_contents.begin(), writeOp.offset[i]),
+          std::generate(std::next(primary_contents.begin(), writeOp.offset[i]),
                         std::next(primary_contents.begin(),
                                   writeOp.offset[i] + writeOp.length[i]),
                         generate_random);
@@ -145,7 +144,7 @@ void ObjectModel::applyIoOp(IoOp& op) {
       ceph_assert(writes.empty());
       primary_created = true;
       primary_contents.resize(static_cast<CreateOp&>(op).size);
-      std::generate(std::execution::seq, primary_contents.begin(), primary_contents.end(),
+      std::generate(primary_contents.begin(), primary_contents.end(),
                     generate_random);
       break;
 
@@ -159,7 +158,7 @@ void ObjectModel::applyIoOp(IoOp& op) {
       primary_contents.resize(new_size);
       // Yes, truncate CAN be used to make an object bigger!
       if (expand) {
-        std::generate(std::execution::seq, primary_contents.begin() + new_size, primary_contents.end(),
+        std::generate(primary_contents.begin() + new_size, primary_contents.end(),
                       generate_random);
       }
     } break;
@@ -179,6 +178,15 @@ void ObjectModel::applyIoOp(IoOp& op) {
     case OpType::Read: {
       SingleReadOp& readOp = static_cast<SingleReadOp&>(op);
       verify_and_record_read_op(readOp);
+    } break;
+    case OpType::SparseRead: {
+      // SparseRead skips primary_created/size assertions because it may target
+      // a pre-existing object of unknown size (e.g. interactive mode).
+      // Still track ranges for concurrent-io conflict detection.
+      SingleSparseReadOp& readOp = static_cast<SingleSparseReadOp&>(op);
+      ceph_assert(!writes.intersects(readOp.offset[0], readOp.length[0]));
+      reads.union_insert(readOp.offset[0], readOp.length[0]);
+      num_io++;
     } break;
     case OpType::Read2: {
       DoubleReadOp& readOp = static_cast<DoubleReadOp&>(op);
@@ -217,14 +225,8 @@ void ObjectModel::applyIoOp(IoOp& op) {
       ceph_assert(reads.empty());
       ceph_assert(writes.empty());
       SingleTruncateWriteOp& truncWriteOp = static_cast<SingleTruncateWriteOp&>(op);
-      auto new_size = truncWriteOp.size;
-      auto old_size = primary_contents.size();
-      bool expand = new_size > old_size;
-      primary_contents.resize(new_size);
-      if (expand) {
-        std::generate(std::execution::seq, primary_contents.begin() + old_size,
-                      primary_contents.end(), generate_random);
-      }
+      // Blocks that the truncate adds have seed 0, so they read as zeros.
+      primary_contents.resize(truncWriteOp.size);
       // Now apply the write operations
       for (int i = 0; i < 1; i++) {
         ceph_assert(!reads.intersects(truncWriteOp.offset[i], truncWriteOp.length[i]));
@@ -233,8 +235,7 @@ void ObjectModel::applyIoOp(IoOp& op) {
         if (truncWriteOp.offset[i] + truncWriteOp.length[i] > primary_contents.size()) {
           primary_contents.resize(truncWriteOp.offset[i] + truncWriteOp.length[i]);
         }
-        std::generate(std::execution::seq,
-                      std::next(primary_contents.begin(), truncWriteOp.offset[i]),
+        std::generate(std::next(primary_contents.begin(), truncWriteOp.offset[i]),
                       std::next(primary_contents.begin(),
                                 truncWriteOp.offset[i] + truncWriteOp.length[i]),
                       generate_random);
@@ -246,14 +247,8 @@ void ObjectModel::applyIoOp(IoOp& op) {
       ceph_assert(reads.empty());
       ceph_assert(writes.empty());
       DoubleTruncateWriteOp& truncWriteOp = static_cast<DoubleTruncateWriteOp&>(op);
-      auto new_size = truncWriteOp.size;
-      auto old_size = primary_contents.size();
-      bool expand = new_size > old_size;
-      primary_contents.resize(new_size);
-      if (expand) {
-        std::generate(std::execution::seq, primary_contents.begin() + old_size,
-                      primary_contents.end(), generate_random);
-      }
+      // Blocks that the truncate adds have seed 0, so they read as zeros.
+      primary_contents.resize(truncWriteOp.size);
       // Now apply the write operations
       for (int i = 0; i < 2; i++) {
         ceph_assert(!reads.intersects(truncWriteOp.offset[i], truncWriteOp.length[i]));
@@ -262,8 +257,7 @@ void ObjectModel::applyIoOp(IoOp& op) {
         if (truncWriteOp.offset[i] + truncWriteOp.length[i] > primary_contents.size()) {
           primary_contents.resize(truncWriteOp.offset[i] + truncWriteOp.length[i]);
         }
-        std::generate(std::execution::seq,
-                      std::next(primary_contents.begin(), truncWriteOp.offset[i]),
+        std::generate(std::next(primary_contents.begin(), truncWriteOp.offset[i]),
                       std::next(primary_contents.begin(),
                                 truncWriteOp.offset[i] + truncWriteOp.length[i]),
                       generate_random);
@@ -275,14 +269,8 @@ void ObjectModel::applyIoOp(IoOp& op) {
       ceph_assert(reads.empty());
       ceph_assert(writes.empty());
       TripleTruncateWriteOp& truncWriteOp = static_cast<TripleTruncateWriteOp&>(op);
-      auto new_size = truncWriteOp.size;
-      auto old_size = primary_contents.size();
-      bool expand = new_size > old_size;
-      primary_contents.resize(new_size);
-      if (expand) {
-        std::generate(std::execution::seq, primary_contents.begin() + old_size,
-                      primary_contents.end(), generate_random);
-      }
+      // Blocks that the truncate adds have seed 0, so they read as zeros.
+      primary_contents.resize(truncWriteOp.size);
       // Now apply the write operations
       for (int i = 0; i < 3; i++) {
         ceph_assert(!reads.intersects(truncWriteOp.offset[i], truncWriteOp.length[i]));
@@ -291,8 +279,7 @@ void ObjectModel::applyIoOp(IoOp& op) {
         if (truncWriteOp.offset[i] + truncWriteOp.length[i] > primary_contents.size()) {
           primary_contents.resize(truncWriteOp.offset[i] + truncWriteOp.length[i]);
         }
-        std::generate(std::execution::seq,
-                      std::next(primary_contents.begin(), truncWriteOp.offset[i]),
+        std::generate(std::next(primary_contents.begin(), truncWriteOp.offset[i]),
                       std::next(primary_contents.begin(),
                                 truncWriteOp.offset[i] + truncWriteOp.length[i]),
                       generate_random);

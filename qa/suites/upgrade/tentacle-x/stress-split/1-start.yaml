@@ -52,6 +52,9 @@ tasks:
     image: quay.ceph.io/ceph-ci/ceph:tentacle
     compiled_cephadm_branch: tentacle
     conf:
+      mgr:
+        debug_cephsqlite: 20
+        debug_rados: 20
       osd:
         #set config option for which cls modules are allowed to be loaded / used
         osd_class_load_list: "*"
@@ -165,3 +168,4 @@ second-half-sequence:
           - ceph versions
           - ceph versions | jq -e '.overall | length == 1'
           - ceph versions | jq -e '.overall | keys' | grep $sha1
+          - ceph osd require-osd-release vampire
